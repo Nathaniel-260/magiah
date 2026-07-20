@@ -32,6 +32,26 @@ suspected correction can be **verified against the corpus itself**.
 Every finding gets a confidence score; the report is sorted so genuine errors
 concentrate at the top and you can stop reviewing when precision drops.
 
+### False-positive suppression
+
+Beyond the statistical verification above, Magiah automatically avoids the
+common failure modes of naive edit-distance flagging:
+
+* **Stacked prefixes** — `דלאליעזר` (= ד+ל+אליעזר) is legitimate morphology,
+  so an "extra first letter" that is a valid prefix (ו ה ב ל מ ש כ ד א) is
+  never proposed as an error; likewise an "extra last letter" that is a valid
+  inflection suffix (ה ו י ם ן ת).
+* **Abbreviations** — tokens with gershayim (`רמב"ם`) and words followed by a
+  geresh (`וכוננ'` = וכוננה) are recognized and skipped.
+* **Foreign-language passages** — lines where too many words are uncommon
+  (e.g. Judeo-Arabic in תפסיר רס"ג) are skipped entirely (`foreign_ratio`).
+* **Optional whitelist** (`--whitelist words.txt`, repeatable) — words listed
+  are never flagged. Suppression only: the whitelist never *creates* findings,
+  so an incomplete dictionary can't hurt Aramaic or rabbinic vocabulary. Works
+  well with the [hspell](http://hspell.ivrix.org.il/)-derived inflected word
+  lists from [hebrew_wordlists](https://github.com/eyaler/hebrew_wordlists)
+  (AGPL-licensed data, hence downloaded separately rather than bundled).
+
 ### Pipeline
 
 ```
@@ -85,9 +105,9 @@ lexicon.
 
 | File | Contents |
 |---|---|
-| `errors_ranked.csv` | every suspect occurrence: word, error type, suggested correction, confidence rank, context-verification hits, book/source, snippet |
+| `errors_<type>.csv` | one ranked CSV per error class (`missing_space`, `edit1_sub`, `edit1_ins`, `edit1_del`, `edit1_swap`, `nonfinal_end`, `final_midword`): word, suggested correction, confidence rank, context-verification hits, book/source, snippet |
 | `space_errors.csv` | extra-space findings |
-| `report.db` | the same as a queryable SQLite database |
+| `report.db` | everything as a queryable SQLite database |
 
 ```sql
 -- highest-confidence findings

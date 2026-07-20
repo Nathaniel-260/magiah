@@ -15,8 +15,12 @@ class Config:
     exp_prefilter: float = 5e-4   # expected-count prefilter for split candidates
     split_obs_min: int = 3   # min adjacent observations to confirm a split
     split_obs_min_short: int = 20  # ... when the shortest part has 2 letters
+    foreign_ratio: float = 0.35  # skip lines with this share of uncommon words
+                                 # (Judeo-Arabic / badly garbled passages)
     workers: int = 3
     n_chunks: int = 24
+    whitelist: tuple = ()    # paths of word-list files; listed words are never
+                             # flagged (suppression only — never creates flags)
 
     def to_dict(self):
         return asdict(self)

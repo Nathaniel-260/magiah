@@ -24,8 +24,8 @@ from multiprocessing import Pool
 
 from .config import Config
 from .corpus import make_corpus
-from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, TO_FINAL,
-                        is_abbrev, tokenize)
+from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
+                        SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
 LEXICON_F = 'lexicon.pkl'
 FLAGGED_F = 'flagged.pkl'
@@ -93,16 +93,18 @@ def build_lexicon(spec, cfg, out_dir):
 # ---------------------------------------------------------------------------
 
 def _dld1(a, b):
-    """Damerau-Levenshtein distance-1 check. Returns (kind, ch_a, ch_b) or None."""
+    """Damerau-Levenshtein distance-1 check.
+    Returns (kind, ch_a, ch_b, pos) or None; pos is the edit position in the
+    longer string (for sub/swap: in either)."""
     la, lb = len(a), len(b)
     if la == lb:
         diff = [i for i in range(la) if a[i] != b[i]]
         if len(diff) == 1:
             i = diff[0]
-            return ('sub', a[i], b[i])
+            return ('sub', a[i], b[i], i)
         if (len(diff) == 2 and diff[1] == diff[0] + 1
                 and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]]):
-            return ('swap', a[diff[0]], a[diff[1]])
+            return ('swap', a[diff[0]], a[diff[1]], diff[0])
         return None
     if abs(la - lb) != 1:
         return None
@@ -110,8 +112,8 @@ def _dld1(a, b):
     long, short = (a, b) if la > lb else (b, a)
     for i in range(len(short)):
         if long[i] != short[i]:
-            return (kind, long[i], None) if long[i + 1:] == short[i:] else None
-    return (kind, long[-1], None)
+            return (kind, long[i], None, i) if long[i + 1:] == short[i:] else None
+    return (kind, long[-1], None, len(long) - 1)
 
 
 def _segment(w, freq, cfg):
@@ -158,6 +160,15 @@ def detect(spec, cfg, out_dir):
     N = sum(freq.values())
     print(f'[detect] lexicon: {len(freq):,} types, {N:,} tokens', flush=True)
 
+    # optional whitelist: words listed here are never flagged (suppression
+    # only — the corpus remains the sole source of correction candidates)
+    whitelist = set()
+    for path in (cfg.whitelist or ()):
+        with open(path, encoding='utf-8') as f:
+            whitelist.update(line.strip() for line in f if line.strip())
+    if whitelist:
+        print(f'[detect] whitelist: {len(whitelist):,} words', flush=True)
+
     common = {w: f for w, f in freq.items()
               if f >= cfg.common_min and not is_abbrev(w) and 2 <= len(w) <= 18}
     del_index = {}
@@ -182,6 +193,8 @@ def detect(spec, cfg, out_dir):
 
     n_scanned = 0
     for w, fw in freq.items():
+        if w in whitelist:
+            continue
         # non-final letter at word end (checked up to medium frequency)
         if len(w) >= 3 and w[-1] in TO_FINAL and not is_abbrev(w) and fw <= 20:
             wf = w[:-1] + TO_FINAL[w[-1]]
@@ -243,7 +256,25 @@ def detect(spec, cfg, out_dir):
             r = _dld1(w, c)
             if r is None:
                 continue
-            kind, ch_a, ch_b = r
+            kind, ch_a, ch_b, pos = r
+            if kind == 'ins':
+                # a doubled letter (למללך, נגמרר) is always suspicious — the
+                # morphology exemptions below never apply to it
+                doubled = ((pos > 0 and w[pos - 1] == ch_a)
+                           or (pos + 1 < len(w) and w[pos + 1] == ch_a))
+                # "extra" letter within the leading prefix cluster (דלאליעזר =
+                # ד+ל+אליעזר, ובהבעל = ו+ב+הבעל) or a trailing inflection
+                # suffix (מזדעזעה) — legitimate morphology, not a typo
+                if (not doubled and pos <= 2 and ch_a in PREFIX_LETTERS
+                        and all(c in PREFIX_LETTERS for c in w[:pos])):
+                    continue
+                if not doubled and pos == len(w) - 1 and ch_a in SUFFIX_LETTERS:
+                    continue
+            elif kind == 'sub' and pos == 0 \
+                    and ch_a in PREFIX_LETTERS and ch_b in PREFIX_LETTERS:
+                # א/ה/ד... swapped at word start is usually Hebrew vs Aramaic
+                # prefix variation (אידועים = אַ+ידועים), not a typo
+                continue
             score = math.log10(fc / fw)
             if kind == 'sub' and (ch_a, ch_b) in CONFUSABLE:
                 score += 2
@@ -312,10 +343,23 @@ def _locate_chunk(chunk):
     for uid, content in _W['corpus'].iter_texts(chunk):
         text = clean(content)
         toks = list(TOKEN_RE.finditer(text))
+        # skip foreign-language / heavily garbled lines: too many of their
+        # words are uncommon for point-fixes to be meaningful. Tokens of 1-2
+        # letters are ignored — they are frequent in any language and would
+        # dilute the ratio.
+        real = [m.group() for m in toks if len(m.group()) >= 3]
+        if len(real) >= 5:
+            uncommon = sum(1 for t in real if freq.get(t, 0) < cfg.common_min)
+            if uncommon > cfg.foreign_ratio * len(real):
+                continue
         for k, m in enumerate(toks):
             w = m.group()
             if w in flagged:
                 s, e = m.start(), m.end()
+                # a trailing geresh marks an abbreviation (וכוננ' = וכוננה),
+                # not a broken word
+                if e < len(text) and text[e] in '\'"':
+                    continue
                 prev = toks[k - 1].group() if k else ''
                 nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
                 occ.append((w, uid, prev, nxt,
@@ -439,16 +483,24 @@ RANK_SQL = '''score + CASE WHEN errtype LIKE 'edit1%' THEN
 def report(cfg, out_dir, top=0):
     con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
     limit = f'LIMIT {top}' if top else ''
-    p1 = os.path.join(out_dir, 'errors_ranked.csv')
-    with open(p1, 'w', newline='', encoding='utf-8-sig') as f:
-        wr = csv.writer(f)
-        wr.writerow(['word', 'errtype', 'suggestion', 'rank', 'ctx_hits',
-                     'source', 'ref', 'unit', 'snippet'])
-        for row in con.execute(f'''
-                SELECT word, errtype, suggestion, ROUND({RANK_SQL}, 2),
-                       ctx_hits, source, ref, unit, snippet
-                FROM occurrences_full ORDER BY {RANK_SQL} DESC {limit}'''):
-            wr.writerow(row)
+    # one ranked CSV per error type
+    types = [r[0] for r in con.execute(
+        'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
+    for t in types:
+        path = os.path.join(out_dir, f'errors_{t}.csv')
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            wr = csv.writer(f)
+            wr.writerow(['word', 'suggestion', 'rank', 'ctx_hits',
+                         'source', 'ref', 'unit', 'snippet'])
+            for row in con.execute(f'''
+                    SELECT word, suggestion, ROUND({RANK_SQL}, 2),
+                           ctx_hits, source, ref, unit, snippet
+                    FROM occurrences_full WHERE errtype = ?
+                    ORDER BY {RANK_SQL} DESC {limit}''', (t,)):
+                wr.writerow(row)
+        n = con.execute('SELECT COUNT(*) FROM occurrences_full '
+                        'WHERE errtype = ?', (t,)).fetchone()[0]
+        print(f'[report] {n:,} rows -> {path}', flush=True)
     p2 = os.path.join(out_dir, 'space_errors.csv')
     with open(p2, 'w', newline='', encoding='utf-8-sig') as f:
         wr = csv.writer(f)
@@ -459,8 +511,6 @@ def report(cfg, out_dir, top=0):
                        snippet
                 FROM space_errors_full ORDER BY join_freq DESC {limit}'''):
             wr.writerow(row)
-    n1 = con.execute('SELECT COUNT(*) FROM occurrences_full').fetchone()[0]
     n2 = con.execute('SELECT COUNT(*) FROM space_errors_full').fetchone()[0]
     con.close()
-    print(f'[report] {n1:,} occurrences -> {p1}', flush=True)
     print(f'[report] {n2:,} space errors -> {p2}', flush=True)

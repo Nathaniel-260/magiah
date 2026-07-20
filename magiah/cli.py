@@ -65,6 +65,9 @@ def main(argv=None):
     ap.add_argument('--out', default='magiah_out', help='output directory')
     ap.add_argument('--top', type=int, default=0,
                     help='report: export only the N highest-ranked rows')
+    ap.add_argument('--whitelist', action='append', metavar='FILE',
+                    help='word-list file (one word per line); listed words are '
+                         'never flagged. May be given multiple times.')
     tune = ap.add_argument_group('thresholds')
     for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
               'workers', 'n_chunks'):
@@ -84,6 +87,8 @@ def main(argv=None):
         v = getattr(args, f)
         if v is not None:
             setattr(cfg, f, v)
+    if args.whitelist:
+        cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
     _save_run_config(out_dir, spec, cfg)
 
     if args.command in ('lexicon', 'all'):

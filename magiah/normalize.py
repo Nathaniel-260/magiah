@@ -18,6 +18,8 @@ for _cp in (0x05C0, 0x05C3, 0x05C6):     # paseq, sof pasuq, inverted nun
 for _cp in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
             0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0xFEFF, 0x034F):
     _STRIP[_cp] = None                   # zero-width / bidi controls
+for _cp in (0x0307, 0x0323):
+    _STRIP[_cp] = None                   # combining dots (Judeo-Arabic ג̇ ד̇ כ̇)
 _STRIP[0x00A0] = ' '
 _STRIP[0x05F3] = "'"                     # geresh
 _STRIP[0x05F4] = '"'                     # gershayim
@@ -31,6 +33,10 @@ TAG_RE = re.compile(r'<[^>]*>')
 TOKEN_RE = re.compile(r'[א-ת]+(?:["\'][א-ת]+)*')
 
 FINALS = 'םןץףך'
+# Letters that legitimately stack as prefixes (Hebrew ו,ה,ב,ל,מ,ש,כ + Aramaic ד,א)
+PREFIX_LETTERS = 'ובהלמשכדא'
+# Letters that end legitimate inflected forms (plural/possessive/feminine)
+SUFFIX_LETTERS = 'הויםןת'
 TO_FINAL = {'כ': 'ך', 'מ': 'ם', 'נ': 'ן', 'פ': 'ף', 'צ': 'ץ'}
 FROM_FINAL = {v: k for k, v in TO_FINAL.items()}
 
