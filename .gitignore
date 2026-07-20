@@ -1,0 +1,14 @@
+# pipeline artifacts
+magiah_out/
+*.pkl
+*.db
+*.csv
+*_log.txt
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
