@@ -340,7 +340,7 @@ def _locate_chunk(chunk):
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
     occ, joins = [], []
     from .normalize import TOKEN_RE, clean
-    for uid, content in _W['corpus'].iter_texts(chunk):
+    for uid, doc, content in _W['corpus'].iter_texts_docs(chunk):
         text = clean(content)
         toks = list(TOKEN_RE.finditer(text))
         # skip foreign-language / heavily garbled lines: too many of their
@@ -356,19 +356,26 @@ def _locate_chunk(chunk):
             w = m.group()
             if w in flagged:
                 s, e = m.start(), m.end()
-                # a trailing geresh marks an abbreviation (וכוננ' = וכוננה),
-                # not a broken word
-                if e < len(text) and text[e] in '\'"':
+                # a trailing geresh marks an abbreviation (וכוננ' = וכוננה);
+                # an adjacent bracket/asterisk marks editorial notation
+                # (קיצ[ו]ר, תקינ(?)) — neither is a broken word
+                if e < len(text) and text[e] in '\'"([{*&':
+                    continue
+                if s > 0 and text[s - 1] in ')]}*&':
                     continue
                 prev = toks[k - 1].group() if k else ''
                 nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
-                occ.append((w, uid, prev, nxt,
+                occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
             # extra space: adjacent pair whose concatenation is a frequent word
             if k + 1 < len(toks) and not is_abbrev(w):
                 nx = toks[k + 1]
                 b = nx.group()
-                if nx.start() - m.end() <= 1 and not is_abbrev(b):
+                # the gap must be pure whitespace — a bracket, hyphen or
+                # asterisk between the tokens means editorial markup
+                # (בחשבונ(י)ך, ל-נקותם), not an accidental space
+                if (nx.start() - m.end() <= 1 and not is_abbrev(b)
+                        and not text[m.end():nx.start()].strip()):
                     mn = min(freq.get(w, 0), freq.get(b, 0))
                     if mn <= 3:
                         fj = freq.get(w + b, 0)
@@ -380,16 +387,24 @@ def _locate_chunk(chunk):
 
 
 def _ctx_count_chunk(chunk):
+    """One corpus pass that feeds both verification signals:
+    * ctx: how often does (neighbor, correction) occur as an adjacent pair?
+    * local: how often does each proposed correction occur in the same book
+      as the flagged word?"""
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
-    counts = Counter()
-    for _, text in _W['corpus'].iter_texts(chunk):
+    book_need = _W['book_need']
+    counts, local = Counter(), Counter()
+    for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
-        for i in range(len(toks) - 1):
-            if toks[i] in first:
-                p = (toks[i], toks[i + 1])
+        need = book_need.get(doc)
+        for i, t in enumerate(toks):
+            if need is not None and t in need:
+                local[(doc, t)] += 1
+            if t in first and i + 1 < len(toks):
+                p = (t, toks[i + 1])
                 if p in pairs:
                     counts[p] += 1
-    return counts
+    return counts, local
 
 
 def locate(spec, cfg, out_dir):
@@ -411,10 +426,25 @@ def locate(spec, cfg, out_dir):
                   f'space={len(all_joins):,}  ({time.time()-t0:.0f}s)',
                   flush=True)
 
-    # context verification for edit-distance-1 suggestions: does the corrected
-    # word occur next to the same neighbors anywhere else in the corpus?
-    ctx_pairs = set()
-    for w, uid, prev, nxt, _ in all_occ:
+    # words whose (very few) occurrences all sit in a single book are usually
+    # the author's own idiosyncratic spelling, not typos
+    LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
+                   'nonfinal_end')
+    w_count, w_docs = Counter(), {}
+    for w, _, doc, _, _, _ in all_occ:
+        w_count[w] += 1
+        w_docs.setdefault(w, set()).add(doc)
+    repeat_words = {w for w, n in w_count.items()
+                    if n >= 2 and len(w_docs[w]) == 1
+                    and flagged[w][1] in LOCAL_TYPES}
+    print(f'[locate] same-book-repeat words suppressed: {len(repeat_words):,}',
+          flush=True)
+
+    # context verification for edit-distance-1 suggestions (does the corrected
+    # word occur next to the same neighbors elsewhere?) + book-local counts
+    # (does the corrected word occur in this very book?)
+    ctx_pairs, book_need = set(), {}
+    for w, uid, doc, prev, nxt, _ in all_occ:
         fr = flagged[w]
         if fr[1].startswith('edit1'):
             sugg = fr[2]
@@ -422,16 +452,23 @@ def locate(spec, cfg, out_dir):
                 ctx_pairs.add((prev, sugg))
             if nxt:
                 ctx_pairs.add((sugg, nxt))
+        if fr[1] in LOCAL_TYPES and fr[2]:
+            book_need.setdefault(doc, set()).add(fr[2])
     print(f'[locate] context pairs to verify: {len(ctx_pairs):,}', flush=True)
-    ctx_counts = Counter()
-    if ctx_pairs:
+    ctx_counts, local_counts = Counter(), Counter()
+    if ctx_pairs or book_need:
         ctx_path = os.path.join(out_dir, 'ctx_pairs.pkl')
         with open(ctx_path, 'wb') as f:
             pickle.dump(ctx_pairs, f, protocol=4)
-        with _pool(spec, cfg, {'ctx_pairs': ctx_path}) as pool:
-            for i, c in enumerate(
+        need_path = os.path.join(out_dir, 'book_need.pkl')
+        with open(need_path, 'wb') as f:
+            pickle.dump(book_need, f, protocol=4)
+        with _pool(spec, cfg, {'ctx_pairs': ctx_path,
+                               'book_need': need_path}) as pool:
+            for i, (c, lc) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
+                local_counts.update(lc)
                 if i % 6 == 0:
                     print(f'  [context] chunk {i}/{len(chunks)} '
                           f'({time.time()-t0:.0f}s)', flush=True)
@@ -444,7 +481,8 @@ def locate(spec, cfg, out_dir):
     con.executescript('''
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
-        CREATE TABLE occurrences(word TEXT, unit TEXT, ctx_hits INT,
+        CREATE TABLE occurrences(word TEXT, unit TEXT, doc TEXT, ctx_hits INT,
+                                 sugg_local INT, book_repeat INT,
                                  snippet TEXT);
         CREATE TABLE space_errors(unit TEXT, part1 TEXT, part2 TEXT,
                                   joined TEXT, join_freq INT, snippet TEXT);
@@ -452,15 +490,17 @@ def locate(spec, cfg, out_dir):
     con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
                     [(w, *v) for w, v in flagged.items()])
     rows = []
-    for w, uid, prev, nxt, snip in all_occ:
+    for w, uid, doc, prev, nxt, snip in all_occ:
         fr = flagged[w]
         hits = 0
         if fr[1].startswith('edit1'):
             sugg = fr[2]
             hits = (ctx_counts.get((prev, sugg), 0)
                     + ctx_counts.get((sugg, nxt), 0))
-        rows.append((w, uid, hits, snip))
-    con.executemany('INSERT INTO occurrences VALUES(?,?,?,?)', rows)
+        local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
+        rows.append((w, uid, doc, hits, local,
+                     1 if w in repeat_words else 0, snip))
+    con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?)', rows)
     con.executemany('INSERT INTO space_errors VALUES(?,?,?,?,?,?)', all_joins)
     con.commit()
     corpus.enrich(con)
@@ -473,11 +513,22 @@ def locate(spec, cfg, out_dir):
 # stage 4: report
 # ---------------------------------------------------------------------------
 
-# edit1 findings whose correction was seen in the same context get a boost;
-# unverified edit1 findings are demoted.
-RANK_SQL = '''score + CASE WHEN errtype LIKE 'edit1%' THEN
-                 CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
-              ELSE 0 END'''
+# Ranking combines the base score with three corpus-evidence signals:
+# * ctx_hits    — the correction was seen next to the same neighbors (edit1)
+# * sugg_local  — the correction is used inside the very same book
+# * book_repeat — all occurrences of the word sit in one book (idiosyncratic
+#                 spelling, not a typo) — strong demotion
+RANK_SQL = '''score
+              + CASE WHEN errtype LIKE 'edit1%' THEN
+                  CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                ELSE 0 END
+              + CASE WHEN sugg_local >= 10 THEN 1.5
+                     WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
+              - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END'''
+
+# a finding is "verified" when the context or the book itself supports the
+# proposed correction and the word is not an in-book spelling convention
+VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 
 
 def report(cfg, out_dir, top=0):
@@ -486,21 +537,35 @@ def report(cfg, out_dir, top=0):
     # one ranked CSV per error type
     types = [r[0] for r in con.execute(
         'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
+    cols = ('word, suggestion, ROUND({rank}, 2), ctx_hits, sugg_local, '
+            'source, ref, unit, snippet').format(rank=RANK_SQL)
+    header = ['word', 'suggestion', 'rank', 'ctx_hits', 'sugg_local',
+              'source', 'ref', 'unit', 'snippet']
     for t in types:
-        path = os.path.join(out_dir, f'errors_{t}.csv')
-        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-            wr = csv.writer(f)
-            wr.writerow(['word', 'suggestion', 'rank', 'ctx_hits',
-                         'source', 'ref', 'unit', 'snippet'])
-            for row in con.execute(f'''
-                    SELECT word, suggestion, ROUND({RANK_SQL}, 2),
-                           ctx_hits, source, ref, unit, snippet
-                    FROM occurrences_full WHERE errtype = ?
-                    ORDER BY {RANK_SQL} DESC {limit}''', (t,)):
-                wr.writerow(row)
-        n = con.execute('SELECT COUNT(*) FROM occurrences_full '
-                        'WHERE errtype = ?', (t,)).fetchone()[0]
-        print(f'[report] {n:,} rows -> {path}', flush=True)
+        variants = [(f'errors_{t}.csv', 'errtype = ?')]
+        if t.startswith('edit1'):
+            # edit1 is the noisiest class — also export the high-precision
+            # subset where corpus evidence supports the correction
+            variants.append((f'errors_{t}_verified.csv',
+                             f'errtype = ? AND {VERIFIED_SQL}'))
+        for fname, where in variants:
+            path = os.path.join(out_dir, fname)
+            try:
+                out = open(path, 'w', newline='', encoding='utf-8-sig')
+            except PermissionError:
+                print(f'[report] SKIPPED (file open in another program): '
+                      f'{path}', flush=True)
+                continue
+            with out as f:
+                wr = csv.writer(f)
+                wr.writerow(header)
+                n = 0
+                for row in con.execute(f'''
+                        SELECT {cols} FROM occurrences_full WHERE {where}
+                        ORDER BY {RANK_SQL} DESC {limit}''', (t,)):
+                    wr.writerow(row)
+                    n += 1
+            print(f'[report] {n:,} rows -> {path}', flush=True)
     p2 = os.path.join(out_dir, 'space_errors.csv')
     with open(p2, 'w', newline='', encoding='utf-8-sig') as f:
         wr = csv.writer(f)

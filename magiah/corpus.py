@@ -46,14 +46,34 @@ class SqliteCorpus:
 
     def iter_texts(self, chunk):
         """Yield (unit_id, text) for one chunk. unit_id is a string."""
+        for uid, _, text in self.iter_texts_docs(chunk):
+            yield uid, text
+
+    def _doc_col(self):
+        return self.spec.get('doc_col') or (
+            'bookId' if self.spec.get('preset') == 'otzaria' else None)
+
+    def iter_texts_docs(self, chunk):
+        """Yield (unit_id, doc_id, text); doc_id groups units into documents
+        (books). Empty string when the table has no document column."""
         lo, hi = chunk
+        doc_col = self._doc_col()
         con = sqlite3.connect(self.path)
         try:
-            for uid, text in con.execute(
-                    f'SELECT {self.id_col}, {self.text_col} FROM {self.table} '
-                    f'WHERE {self.id_col}>=? AND {self.id_col}<? '
-                    f'AND {self.text_col} IS NOT NULL', (lo, hi)):
-                yield str(uid), text
+            if doc_col:
+                for uid, doc, text in con.execute(
+                        f'SELECT {self.id_col}, {doc_col}, {self.text_col} '
+                        f'FROM {self.table} '
+                        f'WHERE {self.id_col}>=? AND {self.id_col}<? '
+                        f'AND {self.text_col} IS NOT NULL', (lo, hi)):
+                    yield str(uid), str(doc), text
+            else:
+                for uid, text in con.execute(
+                        f'SELECT {self.id_col}, {self.text_col} '
+                        f'FROM {self.table} '
+                        f'WHERE {self.id_col}>=? AND {self.id_col}<? '
+                        f'AND {self.text_col} IS NOT NULL', (lo, hi)):
+                    yield str(uid), '', text
         finally:
             con.close()
 
@@ -66,6 +86,7 @@ class SqliteCorpus:
         con.executescript('''
             CREATE TABLE occurrences_full AS
               SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
+                     o.sugg_local, o.book_repeat,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet
               FROM occurrences o
               JOIN errors e ON e.word = o.word
@@ -102,11 +123,15 @@ class TextDirCorpus:
         return [files[i::n] for i in range(n)]
 
     def iter_texts(self, chunk):
+        for uid, _, text in self.iter_texts_docs(chunk):
+            yield uid, text
+
+    def iter_texts_docs(self, chunk):
         for fp in chunk:
             rel = os.path.relpath(fp, self.path)
             with open(fp, encoding=self.encoding, errors='replace') as f:
                 for lineno, text in enumerate(f, 1):
-                    yield f'{rel}:{lineno}', text
+                    yield f'{rel}:{lineno}', rel, text
 
     def enrich(self, con):
         _default_enrich(con)
@@ -116,7 +141,8 @@ def _default_enrich(con):
     con.executescript('''
         CREATE TABLE occurrences_full AS
           SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
-                 '' AS source, '' AS ref, o.unit, o.snippet
+                 o.sugg_local, o.book_repeat,
+                 o.doc AS source, '' AS ref, o.unit, o.snippet
           FROM occurrences o JOIN errors e ON e.word = o.word;
         CREATE TABLE space_errors_full AS
           SELECT part1, part2, joined, join_freq,

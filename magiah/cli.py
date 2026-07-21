@@ -19,7 +19,8 @@ def _build_spec(args):
                 'preset': 'otzaria'}
     if getattr(args, 'sqlite', None):
         return {'type': 'sqlite', 'path': args.sqlite, 'table': args.table,
-                'id_col': args.id_col, 'text_col': args.text_col}
+                'id_col': args.id_col, 'text_col': args.text_col,
+                'doc_col': args.doc_col}
     if getattr(args, 'textdir', None):
         return {'type': 'textdir', 'path': args.textdir}
     return None
@@ -60,6 +61,9 @@ def main(argv=None):
     src.add_argument('--table', default='line')
     src.add_argument('--id-col', default='id')
     src.add_argument('--text-col', default='content')
+    src.add_argument('--doc-col', default=None,
+                     help='column grouping rows into documents/books '
+                          '(enables book-local verification)')
     src.add_argument('--textdir', metavar='DIR',
                      help='directory tree of UTF-8 .txt files')
     ap.add_argument('--out', default='magiah_out', help='output directory')

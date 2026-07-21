@@ -7,6 +7,7 @@ gershayim, e.g. רמב"ם) are preserved as single tokens.
 """
 import html
 import re
+import unicodedata
 
 # --- character stripping table ---------------------------------------------
 _STRIP = {}
@@ -20,6 +21,19 @@ for _cp in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
     _STRIP[_cp] = None                   # zero-width / bidi controls
 for _cp in (0x0307, 0x0323):
     _STRIP[_cp] = None                   # combining dots (Judeo-Arabic ג̇ ד̇ כ̇)
+# Curly/typographic quotes act as geresh/gershayim in many printings (לבבכ’)
+for _cp in (0x2018, 0x2019, 0x05F3):
+    _STRIP[_cp] = "'"
+for _cp in (0x201C, 0x201D, 0x05F4):
+    _STRIP[_cp] = '"'
+# Alphabetic presentation forms (U+FB1D-U+FB4F): precomposed letter+point
+# glyphs (וּ שׁ הּ) used by nikud-heavy books. Decompose to the base letter so
+# words like טמנוּ do not break in the middle.
+for _cp in range(0xFB1D, 0xFB50):
+    _base = ''.join(c for c in unicodedata.normalize('NFKD', chr(_cp))
+                    if 'א' <= c <= 'ת')
+    if _base:
+        _STRIP[_cp] = _base
 _STRIP[0x00A0] = ' '
 _STRIP[0x05F3] = "'"                     # geresh
 _STRIP[0x05F4] = '"'                     # gershayim
