@@ -7,7 +7,8 @@ decisions.db immediately. Rejected words feed the next ``detect`` run as a
 whitelist, and accepted fixes can be exported to approved_fixes.csv.
 
 Keyboard: י/Y = accept, נ/N = reject occurrence, ד/D = reject the word
-everywhere, space = skip.
+everywhere, ע/I = ignore forever (undecided, never shown again),
+space = skip for now.
 """
 import json
 import os
@@ -38,11 +39,14 @@ PAGE = '''<!DOCTYPE html>
  .sugg{color:#1e7e34;font-weight:bold}
  .meta{color:#666;font-size:13px;margin-top:6px}
  .snippet{font-size:17px;line-height:1.7;background:#faf8f2;border-radius:6px;
-          padding:10px 12px;margin-top:10px}
+          padding:10px 12px;margin-top:10px;border-inline-start:4px solid #c0392b}
+ .snippet.fixed{background:#f0f7ee;border-inline-start-color:#28a745;margin-top:6px}
+ .sniplabel{font-size:12px;color:#888;margin-top:10px}
+ .snippet{margin-top:2px}
  .btns{margin-top:12px;display:flex;gap:10px}
  .btns button{font-size:15px;padding:8px 18px;cursor:pointer;border:none;color:#fff}
  .ok{background:#28a745}.no{background:#dc3545}.noall{background:#8b0000}
- .skip{background:#6c757d}
+ .skip{background:#6c757d}.ign{background:#4a4a6a}
  .done{color:#28a745;font-size:22px;text-align:center;margin-top:40px}
  kbd{background:#eee;border-radius:3px;padding:1px 5px;font-size:12px;color:#333}
  .keys{color:#555;font-size:13px;margin-top:8px}
@@ -50,6 +54,10 @@ PAGE = '''<!DOCTYPE html>
 <header><h1>מַגִּיהַּ — סקירה</h1>
  סוג: <select id="errtype"></select>
  מקור: <select id="origin"></select>
+ סדר: <select id="order">
+   <option value="score">לפי ציון (גבוה תחילה)</option>
+   <option value="random">אקראי — ערבוב ציונים</option>
+ </select>
  <button onclick="doExport()">יצוא החלטות</button>
  <span id="stats"></span>
 </header>
@@ -57,26 +65,32 @@ PAGE = '''<!DOCTYPE html>
 <div class="keys">קיצורים: <kbd>י</kbd>/<kbd>Y</kbd> אישור &nbsp;
 <kbd>נ</kbd>/<kbd>N</kbd> דחיית מופע &nbsp; <kbd>ד</kbd>/<kbd>D</kbd> דחיית
 המילה בכל מקום &nbsp; <kbd>ת</kbd>/<kbd>T</kbd> תיקון אחר &nbsp;
-<kbd>רווח</kbd> דילוג</div></main>
+<kbd>ע</kbd>/<kbd>I</kbd> התעלם לתמיד (לא יודע) &nbsp;
+<kbd>רווח</kbd> דילוג זמני</div></main>
 <script>
 let queue=[], cur=null, decided=0;
 async function meta(keepSelection){
   const et=document.getElementById('errtype'), og=document.getElementById('origin');
   const prevEt=et.value, prevOg=og.value;
   const m=await (await fetch('api/meta?origin='+encodeURIComponent(prevOg||''))).json();
-  et.innerHTML=m.errtypes.map(t=>`<option value="${t[0]}">${t[0]} (${t[1].toLocaleString()})</option>`).join('');
-  if(keepSelection&&prevEt&&[...et.options].some(o=>o.value===prevEt))et.value=prevEt;
+  const total=m.errtypes.reduce((s,t)=>s+t[1],0);
+  et.innerHTML=`<option value="">כל השגיאות (${total.toLocaleString()})</option>`+
+    m.errtypes.map(t=>`<option value="${t[0]}">${t[0]} (${t[1].toLocaleString()})</option>`).join('');
+  if(keepSelection&&[...et.options].some(o=>o.value===prevEt))et.value=prevEt;
   if(og.options.length<=1){
     og.innerHTML='<option value="">הכול</option>'+m.origins.map(o=>`<option>${o}</option>`).join('');
     if(keepSelection)og.value=prevOg;
   }
   et.onchange=()=>{queue=[];next();};
   og.onchange=async()=>{queue=[];await meta(true);next();};
+  const ord=document.getElementById('order');
+  ord.onchange=()=>{queue=[];next();};
 }
 async function fill(){
   const et=document.getElementById('errtype').value,
-        og=document.getElementById('origin').value;
-  const r=await fetch(`api/rows?errtype=${encodeURIComponent(et)}&origin=${encodeURIComponent(og)}`);
+        og=document.getElementById('origin').value,
+        ord=document.getElementById('order').value;
+  const r=await fetch(`api/rows?errtype=${encodeURIComponent(et)}&origin=${encodeURIComponent(og)}&order=${ord}`);
   queue=await r.json();
 }
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
@@ -86,19 +100,26 @@ async function next(){
   const c=document.getElementById('card');
   document.getElementById('stats').textContent=`הוחלטו בסשן: ${decided}`;
   if(!cur){c.innerHTML='<div class="done">✔ אין עוד ממצאים בסינון הזה</div>';return;}
-  const snip=esc(cur.snippet).replace(new RegExp(esc(cur.word).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&'),'g'),
+  const wre=new RegExp(esc(cur.word).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&'),'g');
+  const snip=esc(cur.snippet).replace(wre,
       `<span class="word">${esc(cur.word)}</span>`);
+  const fixed=cur.suggestion?esc(cur.snippet).replace(wre,
+      `<span class="sugg">${esc(cur.suggestion)}</span>`):'';
   c.innerHTML=`<div class="card">
    <div style="font-size:20px"><span class="word">${esc(cur.word)}</span>
      ← <span class="sugg">${esc(cur.suggestion||'?')}</span>
      <span style="color:#888;font-size:14px">(ציון ${cur.rank})</span></div>
    <div class="meta">${esc(cur.source)} · ${esc(cur.ref||'')} · ${esc(cur.errtype)}
      · הקשר מאומת: ${cur.ctx_hits} · בספר: ${cur.sugg_local}</div>
+   <div class="sniplabel">במקור:</div>
    <div class="snippet">${snip}</div>
+   ${fixed?`<div class="sniplabel">אחרי התיקון:</div>
+   <div class="snippet fixed">${fixed}</div>`:''}
    <div class="btns">
     <button class="ok" onclick="decide('accept')">✔ שגיאה — אשר (י)</button>
     <button class="no" onclick="decide('reject')">✘ לא שגיאה (נ)</button>
     <button class="noall" onclick="decide('reject_word')">✘✘ דחה מילה בכל מקום (ד)</button>
+    <button class="ign" onclick="decide('ignore')">? התעלם לתמיד (ע)</button>
     <button class="skip" onclick="decide('skip')">דלג (רווח)</button>
    </div>
    <div class="btns">
@@ -112,9 +133,10 @@ async function decide(v){
   if(!cur)return;
   if(v!=='skip'){
     decided++;
+    const verdict=v==='accept'?'accept':v==='ignore'?'ignore':'reject';
     await fetch('api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({word:cur.word,unit:v==='reject_word'?'*':cur.unit,
-                           errtype:cur.errtype,verdict:v==='accept'?'accept':'reject',
+                           errtype:cur.errtype,verdict:verdict,
                            suggestion:cur.suggestion,source:cur.source,ref:cur.ref})});
     if(decided%10===0)meta(true);
   }
@@ -146,6 +168,7 @@ document.addEventListener('keydown',e=>{
   else if(k==='d'||k==='ד')decide('reject_word');
   else if(k==='t'||k==='ת'){e.preventDefault();
     const i=document.getElementById('alt');if(i)i.focus();}
+  else if(k==='i'||k==='ע')decide('ignore');
   else if(k===' '){e.preventDefault();decide('skip');}
 });
 meta().then(next);
@@ -210,17 +233,23 @@ class _Handler(BaseHTTPRequestHandler):
                 q = urllib.parse.parse_qs(url.query)
                 et = q.get('errtype', [''])[0]
                 og = q.get('origin', [''])[0]
-                where = f'errtype = ? AND {self.UNDECIDED}'
-                params = [et]
+                order = q.get('order', ['score'])[0]
+                where = self.UNDECIDED
+                params = []
+                if et:
+                    where += ' AND errtype = ?'
+                    params.append(et)
                 if og:
                     where += ' AND origin = ?'
                     params.append(og)
+                order_sql = ('RANDOM()' if order == 'random'
+                             else f'{RANK_SQL} DESC')
                 rows = con.execute(f'''
                     SELECT word, suggestion, ROUND({RANK_SQL},2) AS rank,
                            ctx_hits, sugg_local, errtype, source, ref, unit,
                            snippet
                     FROM occurrences_full o WHERE {where}
-                    ORDER BY {RANK_SQL} DESC LIMIT 50''', params)
+                    ORDER BY {order_sql} LIMIT 50''', params)
                 cols = ['word', 'suggestion', 'rank', 'ctx_hits', 'sugg_local',
                         'errtype', 'source', 'ref', 'unit', 'snippet']
                 self._json([dict(zip(cols, r)) for r in rows])
