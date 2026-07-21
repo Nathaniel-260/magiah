@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "magiah"
-version = "0.1.0"
+version = "0.6.0"
 description = "Corpus-based typo detection for Hebrew/Aramaic texts - no dictionaries, no AI"
 readme = "README.md"
 requires-python = ">=3.9"
