@@ -116,6 +116,25 @@ def _dld1(a, b):
     return (kind, long[-1], None, len(long) - 1)
 
 
+# Possessive/plural suffixes, longest first. A rare word that is a frequent
+# stem plus one of these is legitimate inflection (שמחזקם = שמחזק+ם), not a
+# typo.
+_SUFFIXES = ('כם', 'כן', 'הם', 'הן', 'נו', 'יו', 'יה', 'ות', 'ים', 'ין',
+             'ם', 'ן', 'ו', 'ה', 'י', 'ך')
+
+
+def _frequent_stem(w, freq, thresh):
+    for suf in _SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            stem = w[:-len(suf)]
+            if freq.get(stem, 0) >= thresh:
+                return True
+            if stem[-1] in TO_FINAL and \
+                    freq.get(stem[:-1] + TO_FINAL[stem[-1]], 0) >= thresh:
+                return True
+    return False
+
+
 def _segment(w, freq, cfg):
     """Split w into a sequence of frequent parts (missing-space candidate).
     Dynamic programming, minimizing the number of parts."""
@@ -178,6 +197,15 @@ def detect(spec, cfg, out_dir):
     print(f'[detect] common={len(common):,}  del-index={len(del_index):,}  '
           f'({time.time()-t0:.0f}s)', flush=True)
 
+    # abbreviations that lost their gershayim: map רמבם -> רמב"ם
+    abbrev_map = {}
+    for a, fa in freq.items():
+        if fa >= cfg.common_min and is_abbrev(a):
+            k = a.replace('"', '').replace("'", '')
+            if len(k) >= 2 and (k not in abbrev_map
+                                or freq[abbrev_map[k]] < fa):
+                abbrev_map[k] = a
+
     errors = {}       # word -> (freq, errtype, suggestion, sugg_freq, score)
     split_cands = {}  # word -> (parts_tuple, strong)
 
@@ -236,7 +264,18 @@ def detect(spec, cfg, out_dir):
                 if exp >= cfg.exp_prefilter:
                     add_split(w, parts, False)
 
-        # 3) edit distance 1 from a frequent word
+        # 3) abbreviation that lost its gershayim (רמבם -> רמב"ם)
+        ab = abbrev_map.get(w)
+        if ab and freq[ab] >= cfg.ed1_ratio * fw:
+            record(w, fw, 'lost_quotes', ab, freq[ab],
+                   5 + math.log10(freq[ab] / fw))
+
+        # 4) frequent stem + inflection suffix — legitimate morphology, so
+        # letter-level flagging is skipped entirely
+        if _frequent_stem(w, freq, cfg.common_min):
+            continue
+
+        # 5) edit distance 1 from a frequent word
         cands = set()
         if w in del_index:
             cands.update(del_index[w])
@@ -246,7 +285,7 @@ def detect(spec, cfg, out_dir):
                 cands.update(del_index[d])
             if freq.get(d, 0) >= cfg.common_min and len(d) >= 2:
                 cands.add(d)
-        best_c, best_score, best_kind = None, 0.0, ''
+        best_c, best_score, best_kind, best_ch = None, 0.0, '', ''
         for c in cands:
             if c == w:
                 continue
@@ -283,9 +322,15 @@ def detect(spec, cfg, out_dir):
             elif kind == 'swap':
                 score += 1
             if score > best_score:
-                best_c, best_score, best_kind = c, score, kind
+                best_c, best_score, best_kind, best_ch = c, score, kind, ch_a
         if best_c:
-            record(w, fw, f'edit1_{best_kind}', best_c, freq[best_c], best_score)
+            # extra/missing ו or י is usually ktiv male/chaser variation, not
+            # a typo — reported separately so the user can decide policy
+            if best_kind in ('ins', 'del') and best_ch in 'וי':
+                errtype = 'spelling_variant'
+            else:
+                errtype = f'edit1_{best_kind}'
+            record(w, fw, errtype, best_c, freq[best_c], best_score)
 
     # --- verify split candidates against the corpus -----------------------
     cand_list = [(w, parts) for w, (parts, _) in split_cands.items()]
@@ -440,7 +485,7 @@ def locate(spec, cfg, out_dir):
     # words whose (very few) occurrences all sit in a single book are usually
     # the author's own idiosyncratic spelling, not typos
     LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
-                   'nonfinal_end')
+                   'nonfinal_end', 'spelling_variant', 'lost_quotes')
     w_count, w_docs = Counter(), {}
     for w, _, doc, _, _, _ in all_occ:
         w_count[w] += 1
@@ -457,7 +502,7 @@ def locate(spec, cfg, out_dir):
     ctx_pairs, book_need = set(), {}
     for w, uid, doc, prev, nxt, _ in all_occ:
         fr = flagged[w]
-        if fr[1].startswith('edit1'):
+        if fr[1].startswith('edit1') or fr[1] == 'spelling_variant':
             sugg = fr[2]
             if prev:
                 ctx_pairs.add((prev, sugg))
@@ -504,7 +549,7 @@ def locate(spec, cfg, out_dir):
     for w, uid, doc, prev, nxt, snip in all_occ:
         fr = flagged[w]
         hits = 0
-        if fr[1].startswith('edit1'):
+        if fr[1].startswith('edit1') or fr[1] == 'spelling_variant':
             sugg = fr[2]
             hits = (ctx_counts.get((prev, sugg), 0)
                     + ctx_counts.get((sugg, nxt), 0))

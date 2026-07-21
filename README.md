@@ -28,6 +28,8 @@ suspected correction can be **verified against the corpus itself**.
 | **Wrong / missing / extra / swapped letter** | `היעמנו` → `הימנו` | Damerau-Levenshtein distance 1 from a word ≥50× more frequent, boosted for visually-confusable letter pairs (ד/ר, ה/ח, ו/י…), then **context-verified**: the corrected word must appear next to the same neighboring words elsewhere |
 | **Final letter mid-word** | `שלוםעליכם` | deterministic rule of Hebrew orthography (ם ן ץ ף ך) |
 | **Non-final letter at word end** | `אדמ` → `אדם` | the final-form variant must be ≥50× more frequent |
+| **Abbreviation that lost its gershayim** | `רמבם` → `רמב"ם` | the quoted form must be a frequent abbreviation in the corpus |
+| **Spelling variant** (reported separately) | `חבותיו` ↔ `חובותיו` | an extra/missing ו or י is usually ktiv male/chaser variation, not a typo — exported to its own file so *you* decide the policy |
 
 Every finding gets a confidence score; the report is sorted so genuine errors
 concentrate at the top and you can stop reviewing when precision drops.
