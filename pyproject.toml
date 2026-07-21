@@ -22,7 +22,7 @@ classifiers = [
 magiah = "magiah.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/amitaymo/magiah"
+Homepage = "https://github.com/Nathaniel-260/magiah"
 
 [tool.setuptools.packages.find]
 include = ["magiah*"]
