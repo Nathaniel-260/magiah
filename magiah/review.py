@@ -60,12 +60,18 @@ PAGE = '''<!DOCTYPE html>
 <kbd>רווח</kbd> דילוג</div></main>
 <script>
 let queue=[], cur=null, decided=0;
-async function meta(){
-  const m=await (await fetch('api/meta')).json();
+async function meta(keepSelection){
   const et=document.getElementById('errtype'), og=document.getElementById('origin');
+  const prevEt=et.value, prevOg=og.value;
+  const m=await (await fetch('api/meta?origin='+encodeURIComponent(prevOg||''))).json();
   et.innerHTML=m.errtypes.map(t=>`<option value="${t[0]}">${t[0]} (${t[1].toLocaleString()})</option>`).join('');
-  og.innerHTML='<option value="">הכול</option>'+m.origins.map(o=>`<option>${o}</option>`).join('');
-  et.onchange=og.onchange=()=>{queue=[];next();};
+  if(keepSelection&&prevEt&&[...et.options].some(o=>o.value===prevEt))et.value=prevEt;
+  if(og.options.length<=1){
+    og.innerHTML='<option value="">הכול</option>'+m.origins.map(o=>`<option>${o}</option>`).join('');
+    if(keepSelection)og.value=prevOg;
+  }
+  et.onchange=()=>{queue=[];next();};
+  og.onchange=async()=>{queue=[];await meta(true);next();};
 }
 async function fill(){
   const et=document.getElementById('errtype').value,
@@ -97,12 +103,10 @@ async function next(){
    </div>
    <div class="btns">
     <input id="alt" placeholder="תיקון אחר... (ת ואז Enter)" dir="rtl"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();decideAlt();}"
       style="flex:1;font-size:16px;padding:7px 10px;border:1px solid #bbb;border-radius:6px">
     <button class="ok" style="background:#0b6e4f" onclick="decideAlt()">✔ אשר עם התיקון שלי</button>
    </div></div>`;
-  document.getElementById('alt').addEventListener('keydown',e=>{
-    if(e.key==='Enter')decideAlt();
-    e.stopPropagation();});
 }
 async function decide(v){
   if(!cur)return;
@@ -112,6 +116,7 @@ async function decide(v){
       body:JSON.stringify({word:cur.word,unit:v==='reject_word'?'*':cur.unit,
                            errtype:cur.errtype,verdict:v==='accept'?'accept':'reject',
                            suggestion:cur.suggestion,source:cur.source,ref:cur.ref})});
+    if(decided%10===0)meta(true);
   }
   next();
 }
@@ -178,6 +183,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -185,10 +191,15 @@ class _Handler(BaseHTTPRequestHandler):
         con = self._db()
         try:
             if url.path == '/api/meta':
+                q = urllib.parse.parse_qs(url.query)
+                og = q.get('origin', [''])[0]
+                owhere, oparams = ('', ())
+                if og:
+                    owhere, oparams = ' AND origin = ?', (og,)
                 ets = con.execute(f'''
                     SELECT errtype, COUNT(*) FROM occurrences_full o
-                    WHERE {self.UNDECIDED} GROUP BY errtype
-                    ORDER BY COUNT(*) DESC''').fetchall()
+                    WHERE {self.UNDECIDED}{owhere} GROUP BY errtype
+                    ORDER BY COUNT(*) DESC''', oparams).fetchall()
                 origins = [r[0] for r in con.execute(
                     "SELECT DISTINCT origin FROM occurrences_full "
                     "WHERE origin != '' ORDER BY origin")]
