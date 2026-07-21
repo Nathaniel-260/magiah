@@ -52,7 +52,9 @@ def main(argv=None):
                     'dictionary.')
     ap.add_argument('command',
                     choices=['lexicon', 'calibrate', 'detect', 'locate',
-                             'report', 'all'])
+                             'report', 'review', 'all'])
+    ap.add_argument('--port', type=int, default=8765,
+                    help='review: local server port')
     src = ap.add_argument_group('corpus source (remembered in run_config.json)')
     src.add_argument('--otzaria', action='store_true',
                      help=f'use the Otzaria library ({OTZARIA_DB})')
@@ -100,6 +102,10 @@ def main(argv=None):
         core.build_lexicon(spec, cfg, out_dir)
     if args.command == 'calibrate':
         core.calibrate(cfg, out_dir)
+    if args.command == 'review':
+        from . import review
+        review.serve(out_dir, port=args.port)
+        return
     if args.command in ('detect', 'all'):
         core.detect(spec, cfg, out_dir)
     if args.command in ('locate', 'all'):

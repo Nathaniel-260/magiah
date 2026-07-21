@@ -187,7 +187,6 @@ def calibrate(cfg, out_dir):
         r = _dld1(w, s)
         if r and r[0] == 'sub':
             pairs[r[1] + r[2]] += 1
-    con.close()
     path = os.path.join(out_dir, 'confusion_learned.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(dict(pairs), f, ensure_ascii=False, indent=1)
@@ -195,6 +194,32 @@ def calibrate(cfg, out_dir):
           f'{sum(pairs.values()):,} confirmed findings -> {path}', flush=True)
     for p, c in pairs.most_common(15):
         print(f'    {p[0]} -> {p[1]}: {c:,}', flush=True)
+
+    # per-book OCR profiles: a book with many confirmed substitutions of the
+    # same letter pair has a proven systematic OCR fault; the next `locate`
+    # rescans such books with heightened sensitivity for exactly those pairs
+    profiles = {}
+    try:
+        it = con.execute(
+            "SELECT word, suggestion, doc FROM occurrences_full "
+            "WHERE errtype = 'edit1_sub' AND score >= 4 "
+            "AND (ctx_hits > 0 OR sugg_local >= 3)")
+    except sqlite3.OperationalError:      # older report.db without doc
+        it = ()
+    for w, s, doc in it:
+        r = _dld1(w, s)
+        if r and r[0] == 'sub':
+            profiles.setdefault(doc, Counter())[r[1] + r[2]] += 1
+    profiles = {d: {p: c for p, c in cnt.items() if c >= cfg.ocr_pair_min}
+                for d, cnt in profiles.items()}
+    profiles = {d: ps for d, ps in profiles.items() if ps}
+    con.close()
+    ppath = os.path.join(out_dir, 'ocr_profiles.pkl')
+    with open(ppath, 'wb') as f:
+        pickle.dump(profiles, f, protocol=4)
+    n_pairs = sum(len(v) for v in profiles.values())
+    print(f'[calibrate] OCR profiles: {len(profiles)} books, '
+          f'{n_pairs} systematic pairs -> {ppath}', flush=True)
 
 
 def detect(spec, cfg, out_dir):
@@ -212,6 +237,21 @@ def detect(spec, cfg, out_dir):
             whitelist.update(line.strip() for line in f if line.strip())
     if whitelist:
         print(f'[detect] whitelist: {len(whitelist):,} words', flush=True)
+
+    # words the user rejected in the review interface are never flagged again
+    dec_path = os.path.join(out_dir, 'decisions.db')
+    if os.path.exists(dec_path):
+        dcon = sqlite3.connect(dec_path)
+        try:
+            rejected = {r[0] for r in dcon.execute(
+                "SELECT DISTINCT word FROM decisions WHERE verdict='reject'")}
+        except sqlite3.OperationalError:
+            rejected = set()
+        dcon.close()
+        if rejected:
+            whitelist |= rejected
+            print(f'[detect] review rejections honored: {len(rejected):,} '
+                  f'words', flush=True)
 
     # substitution weights learned by `magiah calibrate` (if it was run)
     learned = {}
@@ -491,7 +531,8 @@ NAME_TRIGGERS = frozenset((
 
 def _locate_chunk(chunk):
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
-    occ, joins = [], []
+    profiles = _W.get('ocr_profiles') or {}
+    occ, joins, ocr = [], [], []
     from .normalize import TOKEN_RE, clean
     for uid, doc, content in _W['corpus'].iter_texts_docs(chunk):
         text = clean(content)
@@ -532,8 +573,32 @@ def _locate_chunk(chunk):
                         joined_idx.update((k, k + 1))
 
         # pass 2 — occurrences of flagged word types
+        prof = profiles.get(doc)
         for k, m in enumerate(toks):
             w = m.group()
+            # OCR-profile layer: in books with a proven systematic
+            # substitution, scan even words above the global rarity cutoff
+            # for exactly the profiled letter pairs
+            if (prof and w not in flagged and 3 <= len(w) <= 15
+                    and not is_abbrev(w)):
+                fw = freq.get(w, 0)
+                if 1 <= fw <= cfg.ocr_rare_max:
+                    hit = None
+                    for pair in prof:
+                        a, b = pair[0], pair[1]
+                        i0 = w.find(a)
+                        while i0 != -1:
+                            w2 = w[:i0] + b + w[i0 + 1:]
+                            f2 = freq.get(w2, 0)
+                            if (f2 >= cfg.common_min
+                                    and f2 >= cfg.ocr_ratio * fw
+                                    and (hit is None or f2 > hit[1])):
+                                hit = (w2, f2)
+                            i0 = w.find(a, i0 + 1)
+                    if hit:
+                        s, e = m.start(), m.end()
+                        ocr.append((w, fw, hit[0], hit[1], uid, doc,
+                                    text[max(0, s - 45):e + 45].strip()))
             if w in flagged and k not in joined_idx:
                 s, e = m.start(), m.end()
                 # a trailing geresh marks an abbreviation (וכוננ' = וכוננה);
@@ -553,7 +618,7 @@ def _locate_chunk(chunk):
                     continue
                 occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
-    return occ, joins
+    return occ, joins, ocr
 
 
 def _ctx_count_chunk(chunk):
@@ -584,17 +649,21 @@ def locate(spec, cfg, out_dir):
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
 
-    all_occ, all_joins = [], []
+    all_occ, all_joins, all_ocr = [], [], []
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
+    prof_path = os.path.join(out_dir, 'ocr_profiles.pkl')
+    if os.path.exists(prof_path):
+        loads['ocr_profiles'] = prof_path
     with _pool(spec, cfg, loads) as pool:
-        for i, (occ, joins) in enumerate(
+        for i, (occ, joins, ocr) in enumerate(
                 pool.imap_unordered(_locate_chunk, chunks), 1):
             all_occ.extend(occ)
             all_joins.extend(joins)
+            all_ocr.extend(ocr)
             print(f'  [locate] chunk {i}/{len(chunks)}  occ={len(all_occ):,}  '
-                  f'space={len(all_joins):,}  ({time.time()-t0:.0f}s)',
-                  flush=True)
+                  f'space={len(all_joins):,}  ocr={len(all_ocr):,}  '
+                  f'({time.time()-t0:.0f}s)', flush=True)
 
     # --- Tanach reference check (Otzaria only) ----------------------------
     # Occurrences whose context matches a biblical verse are compared against
@@ -711,6 +780,16 @@ def locate(spec, cfg, out_dir):
         rows.append((w, uid, doc, hits, local,
                      1 if w in repeat_words else 0, tan, tsugg, snip))
     con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)', rows)
+    # OCR-profile findings: word-level entry + occurrence rows
+    for w, fw, sugg, fs, uid, doc, snip in all_ocr:
+        if w not in flagged:
+            con.execute('INSERT OR IGNORE INTO errors VALUES(?,?,?,?,?,?)',
+                        (w, fw, 'ocr_profile', sugg, fs,
+                         2 + math.log10(fs / max(fw, 1))))
+            con.execute('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)',
+                        (w, uid, doc, 0, 0, 0, 0, '', snip))
+    if all_ocr:
+        print(f'[locate] ocr-profile findings: {len(all_ocr):,}', flush=True)
     con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?)',
                     tanach_matches)
     con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?)',

@@ -91,7 +91,7 @@ class SqliteCorpus:
                      e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
                      o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet,
-                     COALESCE(sr.name, 'Unknown') AS origin
+                     COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc
               FROM occurrences o
               JOIN errors e ON e.word = o.word
               JOIN src.line l ON l.id = CAST(o.unit AS INTEGER)
@@ -167,7 +167,7 @@ def _default_enrich(con):
           SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
                  o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet,
-                 '' AS origin
+                 '' AS origin, o.doc AS doc
           FROM occurrences o JOIN errors e ON e.word = o.word;
         CREATE TABLE space_errors_full AS
           SELECT part1, part2, joined, join_freq,

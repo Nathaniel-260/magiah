@@ -17,6 +17,10 @@ class Config:
     split_obs_min_short: int = 20  # ... when the shortest part has 2 letters
     foreign_ratio: float = 0.35  # skip lines with this share of uncommon words
                                  # (Judeo-Arabic / badly garbled passages)
+    ocr_pair_min: int = 8    # confirmed substitutions of one letter pair in a
+                             # single book to establish an OCR profile
+    ocr_rare_max: int = 5    # profiled books: scan words up to this frequency
+    ocr_ratio: int = 20      # ... requiring correction/word frequency ratio
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
