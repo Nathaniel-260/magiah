@@ -124,6 +124,7 @@ class SqliteCorpus:
             DROP TABLE space_errors;
             DROP TABLE tanach_matches;
             DROP TABLE tanach_errors;
+            CREATE INDEX ix_occ_word_unit ON occurrences_full(word, unit);
         ''')
         con.commit()
 

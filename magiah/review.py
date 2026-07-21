@@ -133,7 +133,9 @@ async function decideAlt(){
 }
 async function doExport(){
   const r=await (await fetch('api/export')).json();
-  alert(`נוצרו: ${r.fixes} תיקונים מאושרים -> approved_fixes.csv\\n`+
+  alert(`נוצרה תיקיית to_send:\\n`+
+        `${r.fixes} תיקונים מאושרים — קובץ מאוחד + קובץ לכל מאגר `+
+        `(${r.origins.join(', ')})\\n`+
         `${r.rejected} מילים דחויות -> rejected_words.txt`);
 }
 document.addEventListener('keydown',e=>{
@@ -224,21 +226,47 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json([dict(zip(cols, r)) for r in rows])
             elif url.path == '/api/export':
                 import csv
+                import re as _re
+                con.execute('CREATE INDEX IF NOT EXISTS ix_occ_word_unit '
+                            'ON occurrences_full(word, unit)')
+                # enrich each approved decision with origin + snippet so the
+                # fix can be routed to the right source repository
                 fixes = con.execute('''
-                    SELECT word, suggestion, source, ref, unit
-                    FROM dec.decisions WHERE verdict='accept' ''').fetchall()
-                p1 = os.path.join(self.out_dir, 'approved_fixes.csv')
+                    SELECT d.word, d.suggestion, o.errtype, o.source, o.ref,
+                           d.unit, COALESCE(o.origin, ''), o.snippet
+                    FROM dec.decisions d
+                    LEFT JOIN occurrences_full o
+                      ON o.word = d.word AND o.unit = d.unit
+                    WHERE d.verdict = 'accept'
+                    ORDER BY COALESCE(o.origin, ''), o.source''').fetchall()
+                hdr = ['word', 'suggestion', 'errtype', 'book', 'ref',
+                       'line_id', 'origin', 'snippet']
+                send_dir = os.path.join(self.out_dir, 'to_send')
+                os.makedirs(send_dir, exist_ok=True)
+                p1 = os.path.join(send_dir, 'approved_fixes_all.csv')
                 with open(p1, 'w', newline='', encoding='utf-8-sig') as f:
                     wr = csv.writer(f)
-                    wr.writerow(['word', 'suggestion', 'source', 'ref', 'unit'])
+                    wr.writerow(hdr)
                     wr.writerows(fixes)
+                by_origin = {}
+                for row in fixes:
+                    by_origin.setdefault(row[6] or 'Unknown', []).append(row)
+                for org, rows in by_origin.items():
+                    safe = _re.sub(r'[^\w.\-]+', '_', org)
+                    p = os.path.join(send_dir, f'approved_fixes_{safe}.csv')
+                    with open(p, 'w', newline='', encoding='utf-8-sig') as f:
+                        wr = csv.writer(f)
+                        wr.writerow(hdr)
+                        wr.writerows(rows)
                 rej = [r[0] for r in con.execute(
                     "SELECT DISTINCT word FROM dec.decisions "
                     "WHERE verdict='reject'")]
-                p2 = os.path.join(self.out_dir, 'rejected_words.txt')
+                p2 = os.path.join(send_dir, 'rejected_words.txt')
                 with open(p2, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(rej))
-                self._json({'fixes': len(fixes), 'rejected': len(rej)})
+                self._json({'fixes': len(fixes), 'rejected': len(rej),
+                            'origins': sorted(by_origin),
+                            'dir': send_dir})
             else:
                 self._json({'error': 'not found'}, 404)
         finally:
