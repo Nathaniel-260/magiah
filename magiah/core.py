@@ -597,8 +597,12 @@ def _locate_chunk(chunk):
                             i0 = w.find(a, i0 + 1)
                     if hit:
                         s, e = m.start(), m.end()
-                        ocr.append((w, fw, hit[0], hit[1], uid, doc,
-                                    text[max(0, s - 45):e + 45].strip()))
+                        # skip abbreviations (trailing geresh) and editorial
+                        # notation, as in the flagged-word path
+                        if not (e < len(text) and text[e] in '\'"([{*&') \
+                                and not (s > 0 and text[s - 1] in ')]}*&'):
+                            ocr.append((w, fw, hit[0], hit[1], uid, doc,
+                                        text[max(0, s - 45):e + 45].strip()))
             if w in flagged and k not in joined_idx:
                 s, e = m.start(), m.end()
                 # a trailing geresh marks an abbreviation (וכוננ' = וכוננה);
