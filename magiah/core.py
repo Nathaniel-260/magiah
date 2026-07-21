@@ -17,6 +17,7 @@ import csv
 import math
 import os
 import pickle
+import re
 import sqlite3
 import time
 from collections import Counter
@@ -745,10 +746,19 @@ RANK_SQL = '''score
 VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 
 
-def report(cfg, out_dir, top=0):
-    con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
+def _open_report(path):
+    try:
+        return open(path, 'w', newline='', encoding='utf-8-sig')
+    except PermissionError:
+        print(f'[report] SKIPPED (file open in another program): {path}',
+              flush=True)
+        return None
+
+
+def _write_reports(con, dest_dir, extra_where, params, top):
+    """Write the full set of report CSVs into dest_dir, optionally filtered
+    (extra_where/params) to a single source repository."""
     limit = f'LIMIT {top}' if top else ''
-    # one ranked CSV per error type
     types = [r[0] for r in con.execute(
         'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
     cols = ('word, suggestion, ROUND({rank}, 2), ctx_hits, sugg_local, '
@@ -756,19 +766,16 @@ def report(cfg, out_dir, top=0):
     header = ['word', 'suggestion', 'rank', 'ctx_hits', 'sugg_local',
               'source', 'ref', 'unit', 'snippet']
     for t in types:
-        variants = [(f'errors_{t}.csv', 'errtype = ?')]
+        variants = [(f'errors_{t}.csv', f'errtype = ?{extra_where}')]
         if t.startswith('edit1'):
             # edit1 is the noisiest class — also export the high-precision
             # subset where corpus evidence supports the correction
             variants.append((f'errors_{t}_verified.csv',
-                             f'errtype = ? AND {VERIFIED_SQL}'))
+                             f'errtype = ? AND {VERIFIED_SQL}{extra_where}'))
         for fname, where in variants:
-            path = os.path.join(out_dir, fname)
-            try:
-                out = open(path, 'w', newline='', encoding='utf-8-sig')
-            except PermissionError:
-                print(f'[report] SKIPPED (file open in another program): '
-                      f'{path}', flush=True)
+            path = os.path.join(dest_dir, fname)
+            out = _open_report(path)
+            if out is None:
                 continue
             with out as f:
                 wr = csv.writer(f)
@@ -776,44 +783,69 @@ def report(cfg, out_dir, top=0):
                 n = 0
                 for row in con.execute(f'''
                         SELECT {cols} FROM occurrences_full WHERE {where}
-                        ORDER BY {RANK_SQL} DESC {limit}''', (t,)):
+                        ORDER BY {RANK_SQL} DESC {limit}''', (t, *params)):
                     wr.writerow(row)
                     n += 1
             print(f'[report] {n:,} rows -> {path}', flush=True)
     # Tanach review files (Otzaria corpora)
-    for tbl, fname, hdr in (
+    for tbl, fname, sel, hdr in (
             ('tanach_matches_full', 'tanach_matches.csv',
+             'word, source, ref, unit, snippet',
              ['word', 'source', 'ref', 'unit', 'snippet']),
             ('tanach_errors_full', 'tanach_edition_errors.csv',
+             'word, canonical, source, ref, unit, snippet',
              ['word', 'canonical', 'source', 'ref', 'unit', 'snippet'])):
         try:
-            n = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+            con.execute(f'SELECT 1 FROM {tbl} LIMIT 1')
         except sqlite3.OperationalError:
             continue
-        path = os.path.join(out_dir, fname)
-        try:
-            out = open(path, 'w', newline='', encoding='utf-8-sig')
-        except PermissionError:
-            print(f'[report] SKIPPED (file open in another program): {path}',
-                  flush=True)
+        path = os.path.join(dest_dir, fname)
+        out = _open_report(path)
+        if out is None:
             continue
         with out as f:
             wr = csv.writer(f)
             wr.writerow(hdr)
-            for row in con.execute(f'SELECT * FROM {tbl}'):
+            n = 0
+            for row in con.execute(
+                    f'SELECT {sel} FROM {tbl} WHERE 1=1{extra_where}',
+                    params):
                 wr.writerow(row)
+                n += 1
         print(f'[report] {n:,} rows -> {path}', flush=True)
 
-    p2 = os.path.join(out_dir, 'space_errors.csv')
-    with open(p2, 'w', newline='', encoding='utf-8-sig') as f:
-        wr = csv.writer(f)
-        wr.writerow(['part1', 'part2', 'joined', 'join_freq',
-                     'source', 'ref', 'unit', 'snippet'])
-        for row in con.execute(f'''
-                SELECT part1, part2, joined, join_freq, source, ref, unit,
-                       snippet
-                FROM space_errors_full ORDER BY join_freq DESC {limit}'''):
-            wr.writerow(row)
-    n2 = con.execute('SELECT COUNT(*) FROM space_errors_full').fetchone()[0]
+    path = os.path.join(dest_dir, 'space_errors.csv')
+    out = _open_report(path)
+    if out is not None:
+        with out as f:
+            wr = csv.writer(f)
+            wr.writerow(['part1', 'part2', 'joined', 'join_freq',
+                         'source', 'ref', 'unit', 'snippet'])
+            n = 0
+            for row in con.execute(f'''
+                    SELECT part1, part2, joined, join_freq, source, ref,
+                           unit, snippet
+                    FROM space_errors_full WHERE 1=1{extra_where}
+                    ORDER BY join_freq DESC {limit}''', params):
+                wr.writerow(row)
+                n += 1
+        print(f'[report] {n:,} space errors -> {path}', flush=True)
+
+
+def report(cfg, out_dir, top=0):
+    con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
+    _write_reports(con, out_dir, '', (), top)
+    # a separate folder per source repository (Sefaria, Dicta, wikisource...)
+    try:
+        origins = [r[0] for r in con.execute(
+            "SELECT DISTINCT origin FROM occurrences_full "
+            "WHERE origin IS NOT NULL AND origin != '' ORDER BY origin")]
+    except sqlite3.OperationalError:
+        origins = []
+    for org in origins:
+        safe = re.sub(r'[^\w.\-]+', '_', org)
+        d = os.path.join(out_dir, 'by_source', safe)
+        os.makedirs(d, exist_ok=True)
+        print(f'[report] ===== {org} =====', flush=True)
+        _write_reports(con, d, ' AND origin = ?', (org,), top)
     con.close()
-    print(f'[report] {n2:,} space errors -> {p2}', flush=True)

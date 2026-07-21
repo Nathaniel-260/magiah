@@ -90,29 +90,36 @@ class SqliteCorpus:
                           ELSE e.suggestion END AS suggestion,
                      e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
                      o.tanach,
-                     b.title AS source, l.heRef AS ref, o.unit, o.snippet
+                     b.title AS source, l.heRef AS ref, o.unit, o.snippet,
+                     COALESCE(sr.name, 'Unknown') AS origin
               FROM occurrences o
               JOIN errors e ON e.word = o.word
               JOIN src.line l ON l.id = CAST(o.unit AS INTEGER)
-              JOIN src.book b ON b.id = l.bookId;
+              JOIN src.book b ON b.id = l.bookId
+              LEFT JOIN src.source sr ON sr.id = b.sourceId;
             CREATE TABLE space_errors_full AS
               SELECT s.part1, s.part2, s.joined, s.join_freq,
-                     b.title AS source, l.heRef AS ref, s.unit, s.snippet
+                     b.title AS source, l.heRef AS ref, s.unit, s.snippet,
+                     COALESCE(sr.name, 'Unknown') AS origin
               FROM space_errors s
               JOIN src.line l ON l.id = CAST(s.unit AS INTEGER)
-              JOIN src.book b ON b.id = l.bookId;
+              JOIN src.book b ON b.id = l.bookId
+              LEFT JOIN src.source sr ON sr.id = b.sourceId;
             CREATE TABLE tanach_matches_full AS
               SELECT t.word, b.title AS source, l.heRef AS ref, t.unit,
-                     t.snippet
+                     t.snippet, COALESCE(sr.name, 'Unknown') AS origin
               FROM tanach_matches t
               JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
-              JOIN src.book b ON b.id = l.bookId;
+              JOIN src.book b ON b.id = l.bookId
+              LEFT JOIN src.source sr ON sr.id = b.sourceId;
             CREATE TABLE tanach_errors_full AS
               SELECT t.word, t.canonical, b.title AS source, l.heRef AS ref,
-                     t.unit, t.snippet
+                     t.unit, t.snippet,
+                     COALESCE(sr.name, 'Unknown') AS origin
               FROM tanach_errors t
               JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
-              JOIN src.book b ON b.id = l.bookId;
+              JOIN src.book b ON b.id = l.bookId
+              LEFT JOIN src.source sr ON sr.id = b.sourceId;
             DROP TABLE occurrences;
             DROP TABLE space_errors;
             DROP TABLE tanach_matches;
@@ -159,17 +166,20 @@ def _default_enrich(con):
         CREATE TABLE occurrences_full AS
           SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
                  o.sugg_local, o.book_repeat, o.tanach,
-                 o.doc AS source, '' AS ref, o.unit, o.snippet
+                 o.doc AS source, '' AS ref, o.unit, o.snippet,
+                 '' AS origin
           FROM occurrences o JOIN errors e ON e.word = o.word;
         CREATE TABLE space_errors_full AS
           SELECT part1, part2, joined, join_freq,
-                 '' AS source, '' AS ref, unit, snippet
+                 '' AS source, '' AS ref, unit, snippet, '' AS origin
           FROM space_errors;
         CREATE TABLE tanach_matches_full AS
-          SELECT word, doc AS source, '' AS ref, unit, snippet
+          SELECT word, doc AS source, '' AS ref, unit, snippet,
+                 '' AS origin
           FROM tanach_matches;
         CREATE TABLE tanach_errors_full AS
-          SELECT word, canonical, '' AS source, '' AS ref, unit, snippet
+          SELECT word, canonical, '' AS source, '' AS ref, unit, snippet,
+                 '' AS origin
           FROM tanach_errors;
         DROP TABLE occurrences;
         DROP TABLE space_errors;
