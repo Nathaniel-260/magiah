@@ -56,7 +56,8 @@ PAGE = '''<!DOCTYPE html>
 <main><div id="card"></div>
 <div class="keys">קיצורים: <kbd>י</kbd>/<kbd>Y</kbd> אישור &nbsp;
 <kbd>נ</kbd>/<kbd>N</kbd> דחיית מופע &nbsp; <kbd>ד</kbd>/<kbd>D</kbd> דחיית
-המילה בכל מקום &nbsp; <kbd>רווח</kbd> דילוג</div></main>
+המילה בכל מקום &nbsp; <kbd>ת</kbd>/<kbd>T</kbd> תיקון אחר &nbsp;
+<kbd>רווח</kbd> דילוג</div></main>
 <script>
 let queue=[], cur=null, decided=0;
 async function meta(){
@@ -93,7 +94,15 @@ async function next(){
     <button class="no" onclick="decide('reject')">✘ לא שגיאה (נ)</button>
     <button class="noall" onclick="decide('reject_word')">✘✘ דחה מילה בכל מקום (ד)</button>
     <button class="skip" onclick="decide('skip')">דלג (רווח)</button>
+   </div>
+   <div class="btns">
+    <input id="alt" placeholder="תיקון אחר... (ת ואז Enter)" dir="rtl"
+      style="flex:1;font-size:16px;padding:7px 10px;border:1px solid #bbb;border-radius:6px">
+    <button class="ok" style="background:#0b6e4f" onclick="decideAlt()">✔ אשר עם התיקון שלי</button>
    </div></div>`;
+  document.getElementById('alt').addEventListener('keydown',e=>{
+    if(e.key==='Enter')decideAlt();
+    e.stopPropagation();});
 }
 async function decide(v){
   if(!cur)return;
@@ -106,17 +115,30 @@ async function decide(v){
   }
   next();
 }
+async function decideAlt(){
+  const inp=document.getElementById('alt');
+  const v=inp?inp.value.trim():'';
+  if(!cur||!v)return;
+  decided++;
+  await fetch('api/decide',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({word:cur.word,unit:cur.unit,errtype:cur.errtype,
+                         verdict:'accept',suggestion:v,
+                         source:cur.source,ref:cur.ref})});
+  next();
+}
 async function doExport(){
   const r=await (await fetch('api/export')).json();
   alert(`נוצרו: ${r.fixes} תיקונים מאושרים -> approved_fixes.csv\\n`+
         `${r.rejected} מילים דחויות -> rejected_words.txt`);
 }
 document.addEventListener('keydown',e=>{
-  if(e.target.tagName==='SELECT')return;
+  if(e.target.tagName==='SELECT'||e.target.tagName==='INPUT')return;
   const k=e.key.toLowerCase();
   if(k==='y'||k==='י')decide('accept');
   else if(k==='n'||k==='נ')decide('reject');
   else if(k==='d'||k==='ד')decide('reject_word');
+  else if(k==='t'||k==='ת'){e.preventDefault();
+    const i=document.getElementById('alt');if(i)i.focus();}
   else if(k===' '){e.preventDefault();decide('skip');}
 });
 meta().then(next);
