@@ -352,9 +352,36 @@ def _locate_chunk(chunk):
             uncommon = sum(1 for t in real if freq.get(t, 0) < cfg.common_min)
             if uncommon > cfg.foreign_ratio * len(real):
                 continue
+        # pass 1 — extra space: adjacent pair whose concatenation is a
+        # frequent word. Tokens explained this way are excluded from
+        # letter-level reporting below, so one textual error yields exactly
+        # one report row (הצ פרדעים -> extra-space only, not also edit1 on
+        # the פרדעים fragment).
+        joined_idx = set()
+        for k, m in enumerate(toks[:-1]):
+            w = m.group()
+            if is_abbrev(w):
+                continue
+            nx = toks[k + 1]
+            b = nx.group()
+            # the gap must be pure whitespace — a bracket, hyphen or
+            # asterisk between the tokens means editorial markup
+            # (בחשבונ(י)ך, ל-נקותם), not an accidental space
+            if (nx.start() - m.end() <= 1 and not is_abbrev(b)
+                    and not text[m.end():nx.start()].strip()):
+                mn = min(freq.get(w, 0), freq.get(b, 0))
+                if mn <= 3:
+                    fj = freq.get(w + b, 0)
+                    if fj >= cfg.join_min and fj >= 30 * max(1, mn):
+                        s = m.start()
+                        joins.append((uid, w, b, w + b, fj,
+                                      text[max(0, s - 45):nx.end() + 45].strip()))
+                        joined_idx.update((k, k + 1))
+
+        # pass 2 — occurrences of flagged word types
         for k, m in enumerate(toks):
             w = m.group()
-            if w in flagged:
+            if w in flagged and k not in joined_idx:
                 s, e = m.start(), m.end()
                 # a trailing geresh marks an abbreviation (וכוננ' = וכוננה);
                 # an adjacent bracket/asterisk marks editorial notation
@@ -367,22 +394,6 @@ def _locate_chunk(chunk):
                 nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
                 occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
-            # extra space: adjacent pair whose concatenation is a frequent word
-            if k + 1 < len(toks) and not is_abbrev(w):
-                nx = toks[k + 1]
-                b = nx.group()
-                # the gap must be pure whitespace — a bracket, hyphen or
-                # asterisk between the tokens means editorial markup
-                # (בחשבונ(י)ך, ל-נקותם), not an accidental space
-                if (nx.start() - m.end() <= 1 and not is_abbrev(b)
-                        and not text[m.end():nx.start()].strip()):
-                    mn = min(freq.get(w, 0), freq.get(b, 0))
-                    if mn <= 3:
-                        fj = freq.get(w + b, 0)
-                        if fj >= cfg.join_min and fj >= 30 * max(1, mn):
-                            s = m.start()
-                            joins.append((uid, w, b, w + b, fj,
-                                          text[max(0, s - 45):nx.end() + 45].strip()))
     return occ, joins
 
 
