@@ -172,6 +172,30 @@ def _split_verify_chunk(chunk):
     return counts
 
 
+def calibrate(cfg, out_dir):
+    """Learn a letter-substitution confusion matrix from the current report's
+    high-confidence, context-verified findings. The corpus teaches us which
+    substitutions actually happen (ד/ר, ט/מ...) and how often; the next
+    `detect` run uses these counts instead of the hand-written pair list."""
+    import json
+    con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
+    pairs = Counter()
+    for w, s in con.execute(
+            "SELECT DISTINCT word, suggestion FROM occurrences_full "
+            "WHERE errtype = 'edit1_sub' AND ctx_hits > 0 AND score >= 4"):
+        r = _dld1(w, s)
+        if r and r[0] == 'sub':
+            pairs[r[1] + r[2]] += 1
+    con.close()
+    path = os.path.join(out_dir, 'confusion_learned.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(dict(pairs), f, ensure_ascii=False, indent=1)
+    print(f'[calibrate] {len(pairs)} substitution pairs from '
+          f'{sum(pairs.values()):,} confirmed findings -> {path}', flush=True)
+    for p, c in pairs.most_common(15):
+        print(f'    {p[0]} -> {p[1]}: {c:,}', flush=True)
+
+
 def detect(spec, cfg, out_dir):
     t0 = time.time()
     with open(os.path.join(out_dir, LEXICON_F), 'rb') as f:
@@ -187,6 +211,16 @@ def detect(spec, cfg, out_dir):
             whitelist.update(line.strip() for line in f if line.strip())
     if whitelist:
         print(f'[detect] whitelist: {len(whitelist):,} words', flush=True)
+
+    # substitution weights learned by `magiah calibrate` (if it was run)
+    learned = {}
+    conf_path = os.path.join(out_dir, 'confusion_learned.json')
+    if os.path.exists(conf_path):
+        import json
+        with open(conf_path, encoding='utf-8') as f:
+            learned = json.load(f)
+        print(f'[detect] learned confusion matrix: {len(learned)} pairs',
+              flush=True)
 
     common = {w: f for w, f in freq.items()
               if f >= cfg.common_min and not is_abbrev(w) and 2 <= len(w) <= 18}
@@ -315,8 +349,12 @@ def detect(spec, cfg, out_dir):
                 # prefix variation (אידועים = אַ+ידועים), not a typo
                 continue
             score = math.log10(fc / fw)
-            if kind == 'sub' and (ch_a, ch_b) in CONFUSABLE:
-                score += 2
+            if kind == 'sub':
+                lc = learned.get(ch_a + ch_b, 0)
+                if lc:
+                    score += min(2.5, 0.5 + 0.8 * math.log10(1 + lc))
+                elif not learned and (ch_a, ch_b) in CONFUSABLE:
+                    score += 2
             elif kind in ('ins', 'del') and ch_a in 'וי':
                 score += 1
             elif kind == 'swap':
@@ -378,6 +416,75 @@ def detect(spec, cfg, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Tanach reference (Otzaria corpora): the DB holds many cantillated editions
+# of the same biblical books. The reference is self-validating — a reading
+# counts as canonical only when 2+ distinct editions agree, so an error inside
+# one Tanach edition cannot poison the reference; instead, minority readings
+# are reported separately as suspected edition errors.
+# ---------------------------------------------------------------------------
+
+def _within2(a, b):
+    """Levenshtein distance <= 2 (with adjacent transposition counted as 1)."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 2:
+        return False
+    prev2, prev, cur = None, list(range(lb + 1)), None
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            c = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + c)
+            if (i > 1 and j > 1 and a[i - 1] == b[j - 2]
+                    and a[i - 2] == b[j - 1]):
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[lb] <= 2
+
+
+def _build_verse_index(db_path):
+    """(prev, next) -> {middle: set(bookId)} over all cantillated editions."""
+    con = sqlite3.connect(db_path)
+    idx = {}
+    for book_id, content in con.execute(
+            'SELECT l.bookId, l.content FROM line l '
+            'JOIN book b ON b.id = l.bookId '
+            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
+        toks = tokenize(content)
+        for i in range(1, len(toks) - 1):
+            key = (toks[i - 1], toks[i + 1])
+            idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
+    con.close()
+    return idx
+
+
+def _tanach_edition_errors(db_path, vidx):
+    """Places where one Tanach edition deviates from 3+ agreeing editions."""
+    rows = []
+    con = sqlite3.connect(db_path)
+    for uid, content in con.execute(
+            'SELECT l.id, l.content FROM line l JOIN book b ON b.id = l.bookId '
+            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
+        toks = tokenize(content)
+        for i in range(1, len(toks) - 1):
+            m = toks[i]
+            entry = vidx.get((toks[i - 1], toks[i + 1]), {})
+            if len(entry.get(m, ())) == 1:      # this edition alone
+                canon = [x for x, bs in entry.items()
+                         if len(bs) >= 3 and _within2(m, x)]
+                if len(canon) == 1:
+                    snip = ' '.join(toks[max(0, i - 6):i + 7])
+                    rows.append((str(uid), m, canon[0], snip))
+    con.close()
+    return rows
+
+
+# stage-3 helper: a rare word right after a title is a person/place name
+NAME_TRIGGERS = frozenset((
+    'ר', 'רב', 'רבי', 'הרב', 'הגאון', 'מו"ה', 'מוה"ר', 'מהר"ר', 'כמוהר"ר',
+    'מהור"ר', 'אבד"ק', 'בק"ק', 'דק"ק', 'מק"ק', 'בכפר', 'בעיר', 'במדינת',
+    'לעיר', 'העיר'))
+
+# ---------------------------------------------------------------------------
 # stage 3: locate occurrences + extra-space + context verification
 # ---------------------------------------------------------------------------
 
@@ -437,6 +544,12 @@ def _locate_chunk(chunk):
                     continue
                 prev = toks[k - 1].group() if k else ''
                 nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
+                # a rare word right after a title (ר' פלוני, אבד"ק פלוני)
+                # is a person/place name, not a typo
+                if flagged[w][1] not in ('missing_space', 'final_midword') \
+                        and (prev in NAME_TRIGGERS
+                             or (k >= 2 and toks[k - 2].group() in NAME_TRIGGERS)):
+                    continue
                 occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
     return occ, joins
@@ -481,6 +594,41 @@ def locate(spec, cfg, out_dir):
             print(f'  [locate] chunk {i}/{len(chunks)}  occ={len(all_occ):,}  '
                   f'space={len(all_joins):,}  ({time.time()-t0:.0f}s)',
                   flush=True)
+
+    # --- Tanach reference check (Otzaria only) ----------------------------
+    # Occurrences whose context matches a biblical verse are compared against
+    # the reading agreed on by 2+ editions. Matches are NOT dropped — they go
+    # to a separate review file, because the reference itself might be wrong.
+    tanach_matches, tanach_errors_rows = [], []
+    tan_info = None
+    if spec.get('preset') == 'otzaria':
+        t1 = time.time()
+        vidx = _build_verse_index(spec['path'])
+        print(f'[tanach] verse index: {len(vidx):,} contexts '
+              f'({time.time()-t1:.0f}s)', flush=True)
+        kept, tan_info, n_fix = [], [], 0
+        for oc in all_occ:
+            w, uid, doc, prev, nxt, snip = oc
+            tan, tsugg = 0, ''
+            entry = vidx.get((prev, nxt))
+            if entry:
+                if len(entry.get(w, ())) >= 2:
+                    tanach_matches.append((w, uid, doc, snip))
+                    continue
+                canon = [m for m, bs in entry.items()
+                         if len(bs) >= 2 and m != w and _within2(w, m)]
+                if len(canon) == 1 and len(prev) >= 2 and len(nxt) >= 2:
+                    tan, tsugg = 2, canon[0]
+                    n_fix += 1
+            kept.append(oc)
+            tan_info.append((tan, tsugg))
+        all_occ = kept
+        print(f'[tanach] verse matches (separate review file): '
+              f'{len(tanach_matches):,}  MT-corrections: {n_fix:,}', flush=True)
+        tanach_errors_rows = _tanach_edition_errors(spec['path'], vidx)
+        print(f'[tanach] edition disagreements: {len(tanach_errors_rows):,}',
+              flush=True)
+        del vidx
 
     # words whose (very few) occurrences all sit in a single book are usually
     # the author's own idiosyncratic spelling, not typos
@@ -538,15 +686,19 @@ def locate(spec, cfg, out_dir):
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
         CREATE TABLE occurrences(word TEXT, unit TEXT, doc TEXT, ctx_hits INT,
-                                 sugg_local INT, book_repeat INT,
-                                 snippet TEXT);
+                                 sugg_local INT, book_repeat INT, tanach INT,
+                                 tanach_sugg TEXT, snippet TEXT);
         CREATE TABLE space_errors(unit TEXT, part1 TEXT, part2 TEXT,
                                   joined TEXT, join_freq INT, snippet TEXT);
+        CREATE TABLE tanach_matches(word TEXT, unit TEXT, doc TEXT,
+                                    snippet TEXT);
+        CREATE TABLE tanach_errors(unit TEXT, word TEXT, canonical TEXT,
+                                   snippet TEXT);
     ''')
     con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
                     [(w, *v) for w, v in flagged.items()])
     rows = []
-    for w, uid, doc, prev, nxt, snip in all_occ:
+    for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
         fr = flagged[w]
         hits = 0
         if fr[1].startswith('edit1') or fr[1] == 'spelling_variant':
@@ -554,9 +706,14 @@ def locate(spec, cfg, out_dir):
             hits = (ctx_counts.get((prev, sugg), 0)
                     + ctx_counts.get((sugg, nxt), 0))
         local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
+        tan, tsugg = tan_info[j] if tan_info else (0, '')
         rows.append((w, uid, doc, hits, local,
-                     1 if w in repeat_words else 0, snip))
-    con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?)', rows)
+                     1 if w in repeat_words else 0, tan, tsugg, snip))
+    con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)', rows)
+    con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?)',
+                    tanach_matches)
+    con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?)',
+                    tanach_errors_rows)
     con.executemany('INSERT INTO space_errors VALUES(?,?,?,?,?,?)', all_joins)
     con.commit()
     corpus.enrich(con)
@@ -580,7 +737,8 @@ RANK_SQL = '''score
                 ELSE 0 END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
-              - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END'''
+              - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
+              + CASE WHEN tanach = 2 THEN 4.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
 # proposed correction and the word is not an in-book spelling convention
@@ -622,6 +780,30 @@ def report(cfg, out_dir, top=0):
                     wr.writerow(row)
                     n += 1
             print(f'[report] {n:,} rows -> {path}', flush=True)
+    # Tanach review files (Otzaria corpora)
+    for tbl, fname, hdr in (
+            ('tanach_matches_full', 'tanach_matches.csv',
+             ['word', 'source', 'ref', 'unit', 'snippet']),
+            ('tanach_errors_full', 'tanach_edition_errors.csv',
+             ['word', 'canonical', 'source', 'ref', 'unit', 'snippet'])):
+        try:
+            n = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+        except sqlite3.OperationalError:
+            continue
+        path = os.path.join(out_dir, fname)
+        try:
+            out = open(path, 'w', newline='', encoding='utf-8-sig')
+        except PermissionError:
+            print(f'[report] SKIPPED (file open in another program): {path}',
+                  flush=True)
+            continue
+        with out as f:
+            wr = csv.writer(f)
+            wr.writerow(hdr)
+            for row in con.execute(f'SELECT * FROM {tbl}'):
+                wr.writerow(row)
+        print(f'[report] {n:,} rows -> {path}', flush=True)
+
     p2 = os.path.join(out_dir, 'space_errors.csv')
     with open(p2, 'w', newline='', encoding='utf-8-sig') as f:
         wr = csv.writer(f)

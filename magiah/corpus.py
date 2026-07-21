@@ -85,8 +85,11 @@ class SqliteCorpus:
         con.execute("ATTACH DATABASE ? AS src", (self.path,))
         con.executescript('''
             CREATE TABLE occurrences_full AS
-              SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
-                     o.sugg_local, o.book_repeat,
+              SELECT o.word, e.errtype,
+                     CASE WHEN o.tanach_sugg != '' THEN o.tanach_sugg
+                          ELSE e.suggestion END AS suggestion,
+                     e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
+                     o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet
               FROM occurrences o
               JOIN errors e ON e.word = o.word
@@ -98,8 +101,22 @@ class SqliteCorpus:
               FROM space_errors s
               JOIN src.line l ON l.id = CAST(s.unit AS INTEGER)
               JOIN src.book b ON b.id = l.bookId;
+            CREATE TABLE tanach_matches_full AS
+              SELECT t.word, b.title AS source, l.heRef AS ref, t.unit,
+                     t.snippet
+              FROM tanach_matches t
+              JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
+              JOIN src.book b ON b.id = l.bookId;
+            CREATE TABLE tanach_errors_full AS
+              SELECT t.word, t.canonical, b.title AS source, l.heRef AS ref,
+                     t.unit, t.snippet
+              FROM tanach_errors t
+              JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
+              JOIN src.book b ON b.id = l.bookId;
             DROP TABLE occurrences;
             DROP TABLE space_errors;
+            DROP TABLE tanach_matches;
+            DROP TABLE tanach_errors;
         ''')
         con.commit()
 
@@ -141,14 +158,22 @@ def _default_enrich(con):
     con.executescript('''
         CREATE TABLE occurrences_full AS
           SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
-                 o.sugg_local, o.book_repeat,
+                 o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet
           FROM occurrences o JOIN errors e ON e.word = o.word;
         CREATE TABLE space_errors_full AS
           SELECT part1, part2, joined, join_freq,
                  '' AS source, '' AS ref, unit, snippet
           FROM space_errors;
+        CREATE TABLE tanach_matches_full AS
+          SELECT word, doc AS source, '' AS ref, unit, snippet
+          FROM tanach_matches;
+        CREATE TABLE tanach_errors_full AS
+          SELECT word, canonical, '' AS source, '' AS ref, unit, snippet
+          FROM tanach_errors;
         DROP TABLE occurrences;
         DROP TABLE space_errors;
+        DROP TABLE tanach_matches;
+        DROP TABLE tanach_errors;
     ''')
     con.commit()

@@ -51,7 +51,8 @@ def main(argv=None):
                     'No external dictionaries, no AI — the corpus is its own '
                     'dictionary.')
     ap.add_argument('command',
-                    choices=['lexicon', 'detect', 'locate', 'report', 'all'])
+                    choices=['lexicon', 'calibrate', 'detect', 'locate',
+                             'report', 'all'])
     src = ap.add_argument_group('corpus source (remembered in run_config.json)')
     src.add_argument('--otzaria', action='store_true',
                      help=f'use the Otzaria library ({OTZARIA_DB})')
@@ -97,6 +98,8 @@ def main(argv=None):
 
     if args.command in ('lexicon', 'all'):
         core.build_lexicon(spec, cfg, out_dir)
+    if args.command == 'calibrate':
+        core.calibrate(cfg, out_dir)
     if args.command in ('detect', 'all'):
         core.detect(spec, cfg, out_dir)
     if args.command in ('locate', 'all'):
