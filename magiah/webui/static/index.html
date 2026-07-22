@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>מַגִּיהַּ — ממשק סקירת שגיאות</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='80' font-size='80'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<header id="topbar">
+  <button id="btnSidebar" class="tb-btn" title="סינון">☰</button>
+  <div class="brand">מַגִּיהַּ<small>סקירת שגיאות דפוס</small></div>
+  <input id="globalSearch" type="search" placeholder="חיפוש חופשי: מילה, תיקון, קטע, מראה מקום…" autocomplete="off">
+  <div id="progressPill" title="התקדמות בסינון הנוכחי">טוען…</div>
+  <div class="spacer"></div>
+  <button id="btnUndo" class="tb-btn" title="ביטול הפעולה האחרונה (Ctrl+Z)">↩ ביטול</button>
+  <details id="exportMenu">
+    <summary class="tb-btn">⬇ ייצוא</summary>
+    <div class="menu">
+      <button id="expXlsxCurrent">Excel — למאגר הנוכחי</button>
+      <button id="expXlsxAll">Excel — כל המאגרים</button>
+      <div class="sep"></div>
+      <button id="expFixes">ייצוא תיקונים ל־to_send</button>
+    </div>
+  </details>
+  <button id="btnScan" class="tb-btn" title="ניהול סריקה: רענון, ייבוא, איפוס, גיבויים">⚙ ניהול סריקה</button>
+  <button id="btnStats" class="tb-btn" data-goview="stats">📊 סטטיסטיקה</button>
+  <button id="btnHelp" class="tb-btn" data-goview="help">❓ עזרה</button>
+  <button id="btnTheme" class="tb-btn" title="מצב כהה / בהיר">🌙</button>
+</header>
+
+<div id="layout">
+
+  <aside id="sidebar">
+    <div class="f-group">
+      <label class="f-title" for="fOrigin">מאגר</label>
+      <select id="fOrigin"><option value="">כל המאגרים</option></select>
+    </div>
+
+    <div class="f-group">
+      <label class="f-title" for="fBookSearch">ספר</label>
+      <input id="fBookSearch" type="text" placeholder="חיפוש ספר…" autocomplete="off">
+      <div id="fBookList"><div class="empty">טוען רשימת ספרים…</div></div>
+    </div>
+
+    <div class="f-group">
+      <label class="f-title">סוג שגיאה</label>
+      <div id="fErrtypes"><span class="empty">טוען…</span></div>
+    </div>
+
+    <div class="f-group">
+      <label class="f-title">סטטוס</label>
+      <div id="fStatuses"></div>
+    </div>
+
+    <div class="f-group">
+      <label class="chk-row"><input type="checkbox" id="fVerified"> מאומתים בלבד <span class="info-i" data-tip="הצג רק ממצאים ברמת ודאות גבוהה — מומלץ להתחיל מהם">ⓘ</span></label>
+    </div>
+
+    <div class="f-group">
+      <label class="f-title" for="fMinRank">ציון מינימלי</label>
+      <div id="fMinRankRow">
+        <input id="fMinRank" type="range" min="0" max="30" step="0.5" value="0">
+        <input id="fMinRankVal" type="number" min="0" step="0.5" value="0">
+      </div>
+    </div>
+
+    <div class="f-group">
+      <label class="f-title" for="fSort">סדר מיון</label>
+      <select id="fSort">
+        <option value="rank:desc">ציון — מהגבוה לנמוך</option>
+        <option value="rank:asc">ציון — מהנמוך לגבוה</option>
+        <option value="random:desc">אקראי</option>
+        <option value="source:asc">לפי ספר</option>
+        <option value="word:asc">לפי מילה</option>
+      </select>
+    </div>
+
+    <button id="btnClearFilters">✕ ניקוי כל הסינונים</button>
+  </aside>
+
+  <main id="main">
+    <nav id="viewtabs">
+      <button data-view="table" class="active">📋 תצוגת טבלה</button>
+      <button data-view="cards">🗂 תצוגת כרטיסים</button>
+      <button data-view="fixer">🛠 מצב מתקן</button>
+      <span class="tab-hint" id="sessionCounter"></span>
+    </nav>
+
+    <!-- ===================== table view ===================== -->
+    <section id="view-table" class="view visible">
+      <div id="bulkBar">
+        <span class="bulk-count"></span>
+        <div class="bulk-actions"></div>
+        <label class="word-scope"><input type="checkbox" id="bulkWordScope"> החל על המילה בכל מקום</label>
+        <button class="bulk-clear" id="bulkClear">✕ ביטול בחירה</button>
+      </div>
+      <div class="card-panel">
+        <div id="tblWrap">
+          <table class="ftable">
+            <thead id="tblHead"></thead>
+            <tbody id="tblBody"></tbody>
+          </table>
+        </div>
+        <div id="pager"></div>
+      </div>
+    </section>
+
+    <!-- ===================== card view ===================== -->
+    <section id="view-cards" class="view">
+      <div class="cards-stage">
+        <div id="cardMeta"></div>
+        <div id="cardBox"></div>
+      </div>
+    </section>
+
+    <!-- ===================== fixer view ===================== -->
+    <section id="view-fixer" class="view">
+      <div id="fixerTop">
+        <select id="fixBook"><option value="">בחר ספר לתיקון…</option></select>
+        <label class="chk-row"><input type="checkbox" id="fixInclude"> כלול גם «דרוש בירור» ו«טרם נבדק»</label>
+        <div id="fixProgressWrap">
+          <div id="fixProgressText"></div>
+          <div class="pbar"><div id="fixProgressBar" style="width:0%"></div></div>
+        </div>
+      </div>
+      <div id="fixList"><div class="fixer-empty">בחר ספר מהרשימה — מוצגים רק ספרים שיש בהם ממצאים מאושרים שטרם תוקנו.</div></div>
+    </section>
+
+    <!-- ===================== stats view ===================== -->
+    <section id="view-stats" class="view">
+      <h2>📊 סטטיסטיקה והתקדמות</h2>
+      <div id="statsBody">טוען…</div>
+    </section>
+
+    <!-- ===================== help view ===================== -->
+    <section id="view-help" class="view">
+      <h2>❓ עזרה — מדריך למשתמש</h2>
+      <div id="helpBody">טוען…</div>
+    </section>
+  </main>
+</div>
+
+<!-- detail drawer -->
+<div id="drawerScrim"></div>
+<aside id="drawer" aria-label="פרטי ממצא">
+  <header>
+    <span>פרטי ממצא</span>
+    <button id="drawerClose" title="סגירה (Esc)">✕</button>
+  </header>
+  <div id="drawerBody"></div>
+</aside>
+
+<!-- scan-management modal -->
+<div id="scanScrim" class="modal-scrim"></div>
+<div id="scanModal" class="modal" role="dialog" aria-label="ניהול סריקה">
+  <header>
+    <span>⚙ ניהול סריקה</span>
+    <button id="scanClose" title="סגירה">✕</button>
+  </header>
+  <div class="modal-body">
+    <details id="scanRunSection">
+      <summary>▶ הרצת סריקה חדשה</summary>
+      <div class="scanrun">
+        <div class="f-group">
+          <label class="f-title">מקור הסריקה</label>
+          <div id="scanModes"><span class="empty">טוען…</span></div>
+        </div>
+        <div class="f-group" id="scanLibRow">
+          <label class="f-title" for="scanLibDir">תיקיית ריפו הספרייה (otzaria-library)</label>
+          <input id="scanLibDir" type="text" dir="ltr" autocomplete="off">
+        </div>
+        <div class="f-group" id="scanDbRow">
+          <label class="f-title" for="scanDbPath">קובץ seforim.db</label>
+          <input id="scanDbPath" type="text" dir="ltr" autocomplete="off">
+        </div>
+        <div class="f-group">
+          <label class="f-title">שלבים להרצה (ברירת מחדל: הכל)</label>
+          <div id="scanStages"></div>
+        </div>
+        <details id="scanAdvanced">
+          <summary>⚙ הגדרות מתקדמות — כל ספי הזיהוי</summary>
+          <div id="scanFields"></div>
+        </details>
+        <div class="scan-run-actions">
+          <button id="scanStart" class="btn primary">▶ התחל סריקה</button>
+          <button id="scanCancel" class="btn danger" hidden>⛔ בטל סריקה</button>
+          <button id="scanRefreshAfter" class="btn primary" hidden>🔄 רענן ממצאים</button>
+        </div>
+        <div id="scanStatusPanel" hidden>
+          <div id="scanStateLine"></div>
+          <pre id="scanLog"></pre>
+        </div>
+      </div>
+    </details>
+    <div class="scan-row">
+      <button id="scanRefresh" class="btn primary">🔄 רענן מסריקה חדשה</button>
+      <p>טוען מחדש את הממצאים מ־report.db לאחר הרצה חוזרת של הסריקה. החלטות על ממצאים שעדיין קיימים — נשמרות.</p>
+    </div>
+    <div class="scan-row">
+      <button id="scanImportLegacy" class="btn">📥 ייבוא החלטות ישנות</button>
+      <p>מייבא את ההחלטות מהכלי הישן (decisions.db). פעולה זו אינה אוטומטית — מצב ההתחלה הוא נקי.</p>
+    </div>
+    <div class="scan-row danger">
+      <button id="scanResetStatuses" class="btn warn">🧹 אפס החלטות (נשמר גיבוי)</button>
+      <p>מנקה את כל הסטטוסים, ההערות וההיסטוריה בממשק זה. גיבוי נשמר אוטומטית לפני האיפוס.</p>
+    </div>
+    <div class="scan-row danger">
+      <button id="scanResetAll" class="btn danger">⚠ אפס הכל (כולל decisions.db)</button>
+      <p>בנוסף לניקוי ההחלטות בממשק — מוחק גם את decisions.db, כך שסריקת detect הבאה לא תושפע מהחלטות ניסיוניות קודמות.</p>
+    </div>
+    <h4>גיבויים זמינים</h4>
+    <div id="backupsList">טוען…</div>
+  </div>
+</div>
+
+<!-- floating helpers -->
+<div id="stMenu"></div>
+<div id="tooltip"></div>
+<div id="toasts"></div>
+
+<style>
+/* modal styles (kept next to markup for clarity) */
+.modal-scrim { position: fixed; inset: 0; background: rgba(10,18,28,.4); z-index: 390; display: none; }
+.modal-scrim.visible { display: block; }
+.modal {
+  position: fixed; top: 8vh; inset-inline: 0; margin: 0 auto;
+  width: min(640px, 94vw); max-height: 84vh; overflow: hidden;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); z-index: 400; display: none; flex-direction: column;
+}
+.modal.visible { display: flex; }
+.modal > header { display: flex; justify-content: space-between; align-items: center; padding: 13px 16px; border-bottom: 1px solid var(--border); font-weight: 700; }
+.modal > header button { background: none; border: 0; font-size: 19px; cursor: pointer; color: var(--muted); }
+.modal-body { padding: 14px 18px; overflow-y: auto; }
+.scan-row { padding: 10px 0; border-bottom: 1px dashed var(--border); }
+.scan-row p { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+.btn.warn { border-color: var(--amber); color: var(--amber); }
+.btn.warn:hover { background: var(--amber-soft); color: var(--amber); }
+.btn.danger { border-color: var(--red); color: var(--red); }
+.btn.danger:hover { background: var(--red-soft); color: var(--red); }
+.modal-body h4 { margin: 14px 0 8px; color: var(--muted); }
+#backupsList .bk-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 2px; border-bottom: 1px solid var(--border); font-size: 13px; }
+#backupsList .bk-item code { direction: ltr; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: var(--muted); }
+
+/* §9d — run-scan panel */
+#scanRunSection { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 12px; background: var(--panel-2); }
+#scanRunSection > summary { cursor: pointer; font-weight: 700; padding: 10px 12px; list-style: none; }
+#scanRunSection > summary::-webkit-details-marker { display: none; }
+#scanRunSection[open] > summary { border-bottom: 1px solid var(--border); }
+#scanRunSection .scanrun { padding: 12px; }
+#scanModes label.chk-row { align-items: flex-start; }
+#scanModes .mode-desc { display: block; color: var(--faint); font-size: 11.5px; margin-top: 1px; }
+#scanStages { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+#scanAdvanced { margin: 10px 0; border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+#scanAdvanced > summary { cursor: pointer; padding: 8px 10px; color: var(--muted); font-size: 13px; }
+#scanFields { padding: 4px 10px 10px; max-height: 260px; overflow-y: auto; }
+.scan-field { display: grid; grid-template-columns: 1fr 110px; gap: 3px 10px; align-items: center; padding: 7px 0; border-bottom: 1px dashed var(--border); }
+.scan-field:last-child { border-bottom: 0; }
+.scan-field .sf-label { font-weight: 600; font-size: 13px; }
+.scan-field .sf-exp { grid-column: 1 / -1; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.scan-field input { width: 110px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); direction: ltr; text-align: center; }
+.scan-field textarea { grid-column: 1 / -1; width: 100%; min-height: 40px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); direction: ltr; font-size: 12px; }
+.scan-run-actions { display: flex; gap: 8px; margin: 10px 0 4px; flex-wrap: wrap; }
+#scanStatusPanel { margin-top: 10px; }
+#scanStateLine { font-weight: 700; margin-bottom: 6px; }
+#scanStateLine.run { color: var(--accent); }
+#scanStateLine.ok { color: var(--green); }
+#scanStateLine.err { color: var(--red); }
+#scanLog { direction: ltr; text-align: left; unicode-bidi: plaintext; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; max-height: 220px; overflow: auto; font-family: Consolas, "Courier New", monospace; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; margin: 0; }
+</style>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
