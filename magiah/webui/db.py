@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS owned_decisions(
 );
 '''
 
+# Tables SCHEMA creates; connect() only runs the script when one is missing.
+SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
+                 'owned_decisions'}
+
 # effective status: per-finding review wins, else the word rule, else pending
 EFF = "COALESCE(r.status, w.status, 'pending')"
 JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
@@ -155,20 +159,34 @@ def _uri(path, ro=False):
 
 def connect(outdir):
     """Open (and if needed create) ui_review.db. URI mode is enabled so that
-    ATTACH statements can attach report.db read-only."""
+    ATTACH statements can attach report.db read-only.
+
+    The schema is only applied when the database is new or missing a table:
+    executescript() takes a write lock and implicitly commits, so running it on
+    every connection made concurrent requests collide with "database is locked".
+    """
     path = os.path.join(outdir, UI_DB_F)
-    con = sqlite3.connect(_uri(path), uri=True, check_same_thread=False)
+    con = sqlite3.connect(_uri(path), uri=True, check_same_thread=False,
+                          timeout=30.0)
     con.row_factory = sqlite3.Row
-    con.executescript(SCHEMA)
+    con.execute('PRAGMA busy_timeout=30000')
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if not SCHEMA_TABLES <= have:
+        con.executescript(SCHEMA)
     return con
 
 
 def _decisions_con(outdir):
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F))
-    con.execute('''CREATE TABLE IF NOT EXISTS decisions(
-        word TEXT, unit TEXT, errtype TEXT, verdict TEXT,
-        suggestion TEXT, source TEXT, ref TEXT,
-        PRIMARY KEY(word, unit))''')
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=30.0)
+    con.execute('PRAGMA busy_timeout=30000')
+    if not con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                       "AND name='decisions'").fetchone():
+        con.execute('''CREATE TABLE IF NOT EXISTS decisions(
+            word TEXT, unit TEXT, errtype TEXT, verdict TEXT,
+            suggestion TEXT, source TEXT, ref TEXT,
+            PRIMARY KEY(word, unit))''')
+        con.commit()
     return con
 
 
