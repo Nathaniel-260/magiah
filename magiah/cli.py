@@ -8,11 +8,21 @@ import sys
 from . import core
 from .config import Config
 from .corpus import OTZARIA_DB
+from .corpus_hybrid import DEFAULT_LIBRARY
 
 RUN_CONFIG = 'run_config.json'
 
 
 def _build_spec(args):
+    library = getattr(args, 'library', None)
+    if library:
+        library = os.path.abspath(library)
+        if getattr(args, 'sqlite', None) or getattr(args, 'otzaria', False) \
+                or getattr(args, 'db', None):
+            # hybrid: repo text files + Sefaria-only books from seforim.db
+            return {'type': 'hybrid', 'path': library,
+                    'db': args.sqlite or args.db or OTZARIA_DB}
+        return {'type': 'library', 'path': library}
     if getattr(args, 'otzaria', False):
         return {'type': 'sqlite', 'path': args.db or OTZARIA_DB,
                 'table': 'line', 'id_col': 'id', 'text_col': 'content',
@@ -52,9 +62,10 @@ def main(argv=None):
                     'dictionary.')
     ap.add_argument('command',
                     choices=['lexicon', 'calibrate', 'detect', 'locate',
-                             'report', 'review', 'all'])
-    ap.add_argument('--port', type=int, default=8765,
-                    help='review: local server port')
+                             'report', 'review', 'ui', 'all'])
+    ap.add_argument('--port', type=int, default=None,
+                    help='review/ui: local server port '
+                         '(default: review 8765, ui 8766)')
     src = ap.add_argument_group('corpus source (remembered in run_config.json)')
     src.add_argument('--otzaria', action='store_true',
                      help=f'use the Otzaria library ({OTZARIA_DB})')
@@ -69,6 +80,12 @@ def main(argv=None):
                           '(enables book-local verification)')
     src.add_argument('--textdir', metavar='DIR',
                      help='directory tree of UTF-8 .txt files')
+    src.add_argument('--library', metavar='DIR', nargs='?',
+                     const=DEFAULT_LIBRARY, default=None,
+                     help='otzaria-library repo clone (one book per .txt); '
+                          'combined with --sqlite/--otzaria/--db it becomes '
+                          'a hybrid corpus: repo files + Sefaria books from '
+                          f'seforim.db (default dir: {DEFAULT_LIBRARY})')
     ap.add_argument('--out', default='magiah_out', help='output directory')
     ap.add_argument('--top', type=int, default=0,
                     help='report: export only the N highest-ranked rows')
@@ -83,6 +100,11 @@ def main(argv=None):
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
+
+    if args.command == 'ui':
+        from .webui import server as webui_server
+        webui_server.serve(out_dir, port=args.port or 8766)
+        return
 
     prev = _load_run_config(out_dir)
     spec = _build_spec(args) or (prev and prev['corpus'])
@@ -104,7 +126,7 @@ def main(argv=None):
         core.calibrate(cfg, out_dir)
     if args.command == 'review':
         from . import review
-        review.serve(out_dir, port=args.port)
+        review.serve(out_dir, port=args.port or 8765)
         return
     if args.command in ('detect', 'all'):
         core.detect(spec, cfg, out_dir)

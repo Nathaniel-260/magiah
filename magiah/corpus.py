@@ -21,6 +21,9 @@ def make_corpus(spec):
         return SqliteCorpus(spec)
     if spec['type'] == 'textdir':
         return TextDirCorpus(spec)
+    if spec['type'] in ('library', 'hybrid'):
+        from .corpus_hybrid import make_hybrid_corpus
+        return make_hybrid_corpus(spec)
     raise ValueError(f"unknown corpus type: {spec['type']}")
 
 
