@@ -217,6 +217,17 @@ def import_all(outdir, migrate_legacy=False):
     con = connect(outdir)
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
+        # A report.db can exist but hold no results: a 0-byte file left by an
+        # interrupted/out-of-order stage, or a scan that died before `locate`
+        # wrote its tables. Treat that exactly like "no scan yet" instead of
+        # letting a raw OperationalError escape (it used to stop the whole UI
+        # from starting).
+        if not con.execute("SELECT name FROM rep.sqlite_master "
+                           "WHERE type='table' AND name='occurrences_full'"
+                           ).fetchone():
+            con.execute('DETACH DATABASE rep')
+            raise FileNotFoundError(
+                hebrew.MESSAGES['report_incomplete'].format(outdir=outdir))
         cur = con.cursor()
         cur.execute('BEGIN')
         cur.execute('''CREATE TEMP TABLE imp(

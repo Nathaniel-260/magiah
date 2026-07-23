@@ -33,6 +33,45 @@ FLAGGED_F = 'flagged.pkl'
 SPLITS_F = 'split_cands.pkl'
 REPORT_DB_F = 'report.db'
 
+
+class StageError(Exception):
+    """A stage was run before the stage that produces its input.
+
+    Carries a ready-to-print Hebrew message; the CLI prints it and exits 1
+    instead of dumping a traceback, and the UI's scan log shows it as-is.
+    """
+
+
+# Hebrew name of the stage that produces each prerequisite, for the message.
+_STAGE_OF = {
+    LEXICON_F: ('lexicon', 'מילון'),
+    FLAGGED_F: ('detect', 'איתור'),
+    SPLITS_F: ('detect', 'איתור'),
+    REPORT_DB_F: ('locate', 'מיקום'),
+}
+
+
+def _require(out_dir, filename, stage):
+    """Fail cleanly when a prerequisite of `stage` is missing.
+
+    First-run guard: every stage except `lexicon` consumes a file produced by
+    an earlier stage. Without this the user gets a raw FileNotFoundError /
+    "no such table" traceback in English — and, for the report.db cases, a
+    0-byte report.db left behind by sqlite3.connect() that then blocks the UI
+    from starting at all.
+    """
+    path = os.path.join(out_dir, filename)
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    need_cmd, need_he = _STAGE_OF.get(filename, ('all', 'סריקה'))
+    raise StageError(
+        f'לא ניתן להריץ את שלב "{stage}": חסר הקובץ {filename}, '
+        f'שנוצר בשלב "{need_he}".\n'
+        f'יש להריץ קודם:  python -X utf8 -m magiah {need_cmd} '
+        f'--out "{out_dir}"\n'
+        f'או להריץ סריקה מלאה:  python -X utf8 -m magiah all '
+        f'--out "{out_dir}"')
+
 # ---------------------------------------------------------------------------
 # worker plumbing
 # ---------------------------------------------------------------------------
@@ -179,7 +218,7 @@ def calibrate(cfg, out_dir):
     substitutions actually happen (ד/ר, ט/מ...) and how often; the next
     `detect` run uses these counts instead of the hand-written pair list."""
     import json
-    con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
+    con = sqlite3.connect(_require(out_dir, REPORT_DB_F, 'כיול'))
     pairs = Counter()
     for w, s in con.execute(
             "SELECT DISTINCT word, suggestion FROM occurrences_full "
@@ -224,7 +263,7 @@ def calibrate(cfg, out_dir):
 
 def detect(spec, cfg, out_dir):
     t0 = time.time()
-    with open(os.path.join(out_dir, LEXICON_F), 'rb') as f:
+    with open(_require(out_dir, LEXICON_F, 'איתור'), 'rb') as f:
         freq = pickle.load(f)
     N = sum(freq.values())
     print(f'[detect] lexicon: {len(freq):,} types, {N:,} tokens', flush=True)
@@ -648,7 +687,7 @@ def _ctx_count_chunk(chunk):
 
 def locate(spec, cfg, out_dir):
     t0 = time.time()
-    with open(os.path.join(out_dir, FLAGGED_F), 'rb') as f:
+    with open(_require(out_dir, FLAGGED_F, 'מיקום'), 'rb') as f:
         flagged = pickle.load(f)
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
@@ -916,7 +955,7 @@ def _write_reports(con, dest_dir, extra_where, params, top):
 
 
 def report(cfg, out_dir, top=0):
-    con = sqlite3.connect(os.path.join(out_dir, REPORT_DB_F))
+    con = sqlite3.connect(_require(out_dir, REPORT_DB_F, 'דוחות'))
     _write_reports(con, out_dir, '', (), top)
     # a separate folder per source repository (Sefaria, Dicta, wikisource...)
     try:

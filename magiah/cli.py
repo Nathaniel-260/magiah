@@ -120,21 +120,27 @@ def main(argv=None):
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
     _save_run_config(out_dir, spec, cfg)
 
-    if args.command in ('lexicon', 'all'):
-        core.build_lexicon(spec, cfg, out_dir)
-    if args.command == 'calibrate':
-        core.calibrate(cfg, out_dir)
-    if args.command == 'review':
-        from . import review
-        review.serve(out_dir, port=args.port or 8765)
-        return
-    if args.command in ('detect', 'all'):
-        core.detect(spec, cfg, out_dir)
-    if args.command in ('locate', 'all'):
-        core.locate(spec, cfg, out_dir)
-    if args.command in ('report', 'all'):
-        core.report(cfg, out_dir, top=args.top)
+    try:
+        if args.command in ('lexicon', 'all'):
+            core.build_lexicon(spec, cfg, out_dir)
+        if args.command == 'calibrate':
+            core.calibrate(cfg, out_dir)
+        if args.command == 'review':
+            from . import review
+            review.serve(out_dir, port=args.port or 8765)
+            return
+        if args.command in ('detect', 'all'):
+            core.detect(spec, cfg, out_dir)
+        if args.command in ('locate', 'all'):
+            core.locate(spec, cfg, out_dir)
+        if args.command in ('report', 'all'):
+            core.report(cfg, out_dir, top=args.top)
+    except core.StageError as e:
+        # a stage was run before its prerequisite: print the Hebrew guidance
+        # (no traceback — this is a user error, not a crash)
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
