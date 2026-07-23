@@ -22,6 +22,10 @@ from ..corpus_hybrid import DEFAULT_LIBRARY
 from . import hebrew
 
 STAGE_ORDER = ['lexicon', 'calibrate', 'detect', 'locate', 'report']
+# What a scan runs when the caller does not choose stages. Mirrors the CLI's
+# `all`, which excludes calibrate: it learns from a previous scan's report.db,
+# so it only makes sense as a deliberate second pass.
+DEFAULT_STAGES = ['lexicon', 'detect', 'locate', 'report']
 RUN_CONFIG = 'run_config.json'
 LOG_FILE = 'scan_ui_log.txt'
 LOG_TAIL_LINES = 300
@@ -109,9 +113,18 @@ def start_scan(outdir, stages=None, config_overrides=None,
     Raises ValueError (Hebrew message) on any user error."""
     global _thread
     outdir = os.path.abspath(outdir)
-    stages = [s for s in STAGE_ORDER if s in (stages or STAGE_ORDER)]
+    stages = [s for s in STAGE_ORDER if s in (stages or DEFAULT_STAGES)]
     if not stages:
         raise ValueError(hebrew.SCAN_MESSAGES['no_stages'])
+    # calibrate learns from a previous scan's report.db; on a first run there
+    # is nothing to learn from, so drop it rather than fail the whole scan.
+    skipped_calibrate = False
+    if 'calibrate' in stages and not os.path.isfile(
+            os.path.join(outdir, 'report.db')):
+        stages = [s for s in stages if s != 'calibrate']
+        skipped_calibrate = True
+        if not stages:
+            raise ValueError(hebrew.SCAN_MESSAGES['calibrate_needs_report'])
     spec = _spec_from_corpus(corpus_overrides)
     if spec['type'] in ('library', 'hybrid') \
             and not os.path.isdir(spec['path']):
@@ -130,6 +143,8 @@ def start_scan(outdir, stages=None, config_overrides=None,
             json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
                       ensure_ascii=False, indent=2)
         _log.clear()
+        if skipped_calibrate:
+            _log.append('[webui] ' + hebrew.SCAN_MESSAGES['calibrate_skipped'])
         _cancel.clear()
         _state.update(state='running', stage=stages[0], stages=stages,
                       stage_index=0, returncode=None, error=None,
@@ -264,10 +279,16 @@ def scan_config(outdir):
             'type': ('list' if key == 'whitelist'
                      else 'float' if isinstance(default, float) else 'int'),
         })
+    have_report = os.path.isfile(os.path.join(outdir, 'report.db'))
     stages = [{'key': s,
                'hebrew': hebrew.STAGE_LABELS.get(s, {}).get('hebrew', s),
                'explanation': hebrew.STAGE_LABELS.get(s, {}).get(
-                   'explanation', '')}
+                   'explanation', ''),
+               # calibrate is a deliberate second pass: only pre-tick it once a
+               # report.db from an earlier scan exists for it to learn from
+               'default': s in DEFAULT_STAGES or (s == 'calibrate'
+                                                  and have_report),
+               'available': s != 'calibrate' or have_report}
               for s in STAGE_ORDER]
     return {
         'corpus': {'mode': mode, 'library_dir': library_dir or

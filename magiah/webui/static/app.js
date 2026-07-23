@@ -1365,7 +1365,8 @@ function renderScanForm() {
   stBox.replaceChildren();
   for (const s of (cfg.stages || [])) {
     const cb = el("input", { type: "checkbox", value: s.key });
-    cb.checked = true;
+    // calibrate needs a previous scan's report.db, so it is off by default
+    cb.checked = s.default !== false;
     stBox.append(el("label", { class: "chk-row", title: s.explanation || "" }, cb, el("span", null, s.hebrew)));
   }
   // advanced config fields
