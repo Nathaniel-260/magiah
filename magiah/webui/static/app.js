@@ -1715,6 +1715,30 @@ async function init() {
   updateProgress();
   updateSessionCounter();
   syncScanStatusOnce();   // resume live scan status if a scan is running
+  if (S.meta && S.meta.no_scan) showNoScanScreen();
+}
+
+/* No findings yet: invite the user to run a scan instead of showing an
+   empty table. Dismissing it leaves the normal (empty) UI behind. */
+function showNoScanScreen() {
+  if ($("#noScan")) return;
+  const box = el("div", { id: "noScan", class: "no-scan" },
+    el("div", { class: "no-scan-card" },
+      el("h2", null, "עדיין אין סריקה בתיקייה הזו"),
+      el("p", null,
+        "הממשק מציג ממצאים מסריקה קיימת, ובתיקייה שנבחרה עדיין אין קובץ " +
+        "report.db. אפשר להריץ סריקה עכשיו — בסיומה הממצאים ייטענו לממשק " +
+        "ללא צורך בהפעלה מחדש."),
+      el("div", { class: "no-scan-actions" },
+        el("button", { class: "primary", onclick: () => {
+          hideNoScanScreen(); openScanModal();
+          const d = $("#scanRunSection"); if (d) d.open = true;
+        } }, "▶ הרצת סריקה חדשה"),
+        el("button", { onclick: hideNoScanScreen }, "סגירה"))));
+  document.body.appendChild(box);
+}
+function hideNoScanScreen() {
+  const b = $("#noScan"); if (b) b.remove();
 }
 
 init();

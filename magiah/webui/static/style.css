@@ -831,3 +831,19 @@ table.stats td.rowtotal, table.stats th.rowtotal { font-weight: 700; background:
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- "no scan yet" welcome overlay ---- */
+.no-scan {
+  position: fixed; inset: 0; z-index: 120;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .45); padding: 20px;
+}
+.no-scan-card {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); padding: 26px 28px;
+  max-width: 560px; line-height: 1.7;
+}
+.no-scan-card h2 { margin: 0 0 12px; font-size: 1.25rem; }
+.no-scan-card p { margin: 0 0 18px; color: var(--muted); }
+.no-scan-actions { display: flex; gap: 10px; flex-wrap: wrap; }

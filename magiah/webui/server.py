@@ -253,9 +253,15 @@ def serve(outdir, port=8766, open_browser=True):
     fresh = not os.path.exists(ui_db)
     if fresh:
         print('[webui] ' + hebrew.MESSAGES['db_missing'], flush=True)
-        counts = db.import_all(outdir)
-        print(f"[webui] import done: {counts.get('total', 0):,} findings "
-              f"in {counts.get('seconds', 0)}s", flush=True)
+        try:
+            counts = db.import_all(outdir)
+            print(f"[webui] import done: {counts.get('total', 0):,} findings "
+                  f"in {counts.get('seconds', 0)}s", flush=True)
+        except FileNotFoundError:
+            # No scan in this folder yet. Still start the server: the UI opens
+            # in "no scan" mode where the user can launch one from the scan
+            # panel, then load the findings without restarting.
+            print('[webui] ' + hebrew.MESSAGES['no_scan_console'], flush=True)
     srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     url = f'http://127.0.0.1:{port}/'
     print(f'[webui] serving {url}  (Ctrl+C to stop)', flush=True)

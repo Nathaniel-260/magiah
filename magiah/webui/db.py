@@ -212,7 +212,8 @@ def import_all(outdir, migrate_legacy=False):
     t0 = time.time()
     report_path = os.path.join(outdir, REPORT_DB_F)
     if not os.path.exists(report_path):
-        raise FileNotFoundError(hebrew.MESSAGES['report_missing'])
+        raise FileNotFoundError(
+            hebrew.MESSAGES['report_missing'].format(outdir=outdir))
     con = connect(outdir)
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
@@ -497,8 +498,13 @@ def get_meta(con):
                for k in hebrew.COLUMN_ORDER]
     last_import = con.execute(
         "SELECT value FROM meta WHERE key='last_import'").fetchone()
+    # Sum the per-origin counts already computed above rather than running a
+    # second COUNT(*) over the whole findings table (a full scan on a ~300MB db).
+    total = sum(o['count'] for o in origins)
     return {'origins': origins, 'errtypes': errtypes, 'statuses': statuses,
-            'columns': columns,
+            'columns': columns, 'total': total,
+            # no findings yet -> the UI shows its "run a scan first" screen
+            'no_scan': total == 0,
             'last_import': last_import[0] if last_import else None}
 
 
