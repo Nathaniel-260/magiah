@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 
 from . import hebrew
-from .db import EFF, JOINS
+from .db import EFF, JOINS, UNIT_ORDER
 
 FIXES_HEADER = ['word', 'suggestion', 'errtype', 'book', 'ref', 'line_id',
                 'origin', 'snippet']
@@ -55,7 +55,8 @@ def export_fixes(con, outdir):
                COALESCE(f.origin, ''), COALESCE(f.snippet, '')
         FROM findings f {JOINS}
         WHERE {EFF} IN ('approved', 'fixed')
-        ORDER BY COALESCE(f.origin, ''), f.source, CAST(f.unit AS INTEGER)
+        ORDER BY COALESCE(f.origin, ''), f.source,
+                 ''' + UNIT_ORDER.format(u='f.unit') + '''
         ''').fetchall()
     locked = []
 

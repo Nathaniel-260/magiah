@@ -142,6 +142,14 @@ JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
 KEY_COLS = "family, COALESCE(word,''), COALESCE(unit,''), errtype, " \
            "COALESCE(ref,'')"
 
+# Reading-order sort key for a unit id. DB units are plain integers, but
+# file-based units are 'file:<relpath>:<lineno>' (§9c) — a plain
+# CAST(unit AS INTEGER) yields 0 for every one of those, which silently
+# destroys the ordering. Take the trailing digit run instead, so both
+# forms sort by their real line number.
+UNIT_ORDER = ("CAST(substr({u}, length(rtrim({u}, '0123456789')) + 1) "
+              'AS INTEGER)')
+
 FINDING_COLS = ['id', 'family', 'errtype', 'word', 'suggestion', 'score',
                 'rank', 'ctx_hits', 'sugg_local', 'book_repeat', 'tanach',
                 'verified', 'origin', 'source', 'ref', 'unit', 'doc',
@@ -575,7 +583,7 @@ def _findings_where(filters):
 SORTS = {
     'rank': 'f.rank {d}, f.id',
     'random': 'RANDOM()',
-    'source': 'f.source {d}, CAST(f.unit AS INTEGER) {d}',
+    'source': 'f.source {d}, ' + UNIT_ORDER.format(u='f.unit') + ' {d}',
     'word': 'f.word {d}, f.id',
 }
 
@@ -890,9 +898,7 @@ def get_fixlist(con, book=None, origin=None, statuses=None):
                r.custom_suggestion AS custom_suggestion
         FROM findings f {JOINS}
         WHERE {EFF} IN ({sph}){owhere} AND f.source = ?
-        ORDER BY CAST(substr(f.unit,
-                     length(rtrim(f.unit, '0123456789')) + 1) AS INTEGER)
-                 ASC, f.id ASC''',
+        ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
         params).fetchall()
     total = con.execute(f'''
         SELECT COUNT(*) FROM findings f {JOINS}
