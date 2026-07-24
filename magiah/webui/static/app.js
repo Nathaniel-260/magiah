@@ -326,10 +326,13 @@ function diffSpans(parts, kind) {
   return out;
 }
 
-/* A word rendered with its differing letters marked. `kind` = "err" | "fix". */
+/* A word rendered with its differing letters marked, against `other`.
+ * `kind` only picks the colour ("err" | "fix") — the marked letters always
+ * come from `word` itself, which is diffChars' FIRST return value. (Taking the
+ * second for "fix" marks the other word's letters: for יותבת→יושבת that
+ * highlighted ת in the correction instead of ש.) */
 function wordDiffNode(word, other, kind, cls) {
-  const [A, B] = diffChars(word, other);
-  const parts = kind === "err" ? A : B;
+  const parts = diffChars(word, other)[0];
   const b = el("bdi", { class: cls || null });
   b.append(...diffSpans(parts, kind));
   return b;
