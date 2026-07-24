@@ -180,13 +180,12 @@ a:hover { text-decoration: underline; }
   overflow-y: auto;
   padding: 16px 18px 40px;
 }
-/* The table view ends in a sticky pager, and a sticky element's bottom:0
-   resolves to the scroll container's PADDING edge — so #main's 40px bottom
-   padding would park the pager 40px above the real bottom. Drop the padding
-   while the table is showing; the pager's own padding closes the gap.
-   Browsers without :has() simply keep the padding — the pager still sticks,
-   just 40px higher, so this degrades harmlessly. */
-#main:has(> #view-table.visible) { padding-bottom: 0; }
+/* In the table view the ROWS scroll, not the page: #main stops scrolling and
+   the row area becomes the only scroller (see #view-table below). That keeps
+   the scrollbar spanning just the rows — its thumb stays next to the table
+   instead of running off to the bottom of a long page — and pins the header
+   and pager permanently in view. */
+#main:has(> #view-table.visible) { padding-bottom: 0; overflow-y: hidden; }
 
 /* ==================== sidebar filters ==================== */
 .f-group { margin-bottom: 18px; }
@@ -265,6 +264,7 @@ a:hover { text-decoration: underline; }
   gap: 6px;
   margin-bottom: 14px;
   flex-wrap: wrap;
+  flex: 0 0 auto;   /* never stretch when #main is a flex column (table view) */
 }
 #viewtabs button {
   padding: 8px 18px;
@@ -301,7 +301,7 @@ section.view.visible { display: block; }
   border: 1px solid var(--accent);
   border-radius: var(--radius);
 }
-#bulkBar.visible { display: flex; }
+#bulkBar.visible { display: flex; flex: 0 0 auto; }
 #bulkBar .bulk-count { font-weight: 700; color: var(--accent-strong); }
 #bulkBar .bulk-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 #bulkBar button.stbtn {
@@ -316,7 +316,18 @@ section.view.visible { display: block; }
 #bulkBar label.word-scope { display: flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
 #bulkBar .bulk-clear { margin-inline-start: auto; background: none; border: 0; cursor: pointer; color: var(--muted); }
 
-#tblWrap { overflow-x: auto; }
+/* Table view fills the pane; only the row area scrolls. #main becomes a flex
+   column for this view so the section can take the exact leftover height —
+   `height: 100%` would ignore #main's padding and overflow by that much. */
+#main:has(> #view-table.visible) { display: flex; flex-direction: column; }
+section#view-table.visible { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+#view-table .card-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;   /* let the flex child actually shrink so #tblWrap can scroll */
+  flex: 1;
+}
+#tblWrap { overflow: auto; flex: 1; min-height: 0; }
 table.ftable { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 table.ftable th {
   position: sticky;
@@ -418,27 +429,22 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
 }
 #stMenu button:hover { background: var(--accent-soft); }
 
-/* pager — sticks to the bottom of the viewport.
- * With 7,000+ pages the reviewer pages constantly; when it only lived at the
- * end of the table, every page turn meant scrolling all the way down first.
- * Sticky keeps it in reach from anywhere in the list and it still settles
- * inside the panel when scrolled to the end. */
+/* pager — always on screen at the bottom of the panel.
+ * With 7,000+ pages the reviewer pages constantly; when the whole page
+ * scrolled, every page turn meant scrolling to the very bottom first. Now the
+ * rows scroll inside #tblWrap and the pager is simply the panel's last row,
+ * so it never leaves the viewport. */
 #pager {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
   flex-wrap: wrap;
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
+  flex: 0 0 auto;
   background: var(--panel);
   border-top: 1px solid var(--border);
-  /* match the panel's rounded corners while pinned */
   border-radius: 0 0 var(--radius) var(--radius);
-  box-shadow: 0 -4px 14px rgba(20, 32, 45, .07);
 }
-[data-theme="dark"] #pager { box-shadow: 0 -4px 14px rgba(0, 0, 0, .35); }
 #pager button {
   border: 1px solid var(--border);
   background: var(--panel);
