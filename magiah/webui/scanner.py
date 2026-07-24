@@ -65,6 +65,20 @@ def _log_line(text):
     _log.append(text.rstrip('\r\n'))
 
 
+def _stage_cmd(stage, outdir):
+    """Command that runs one pipeline stage as a subprocess.
+
+    Frozen (PyInstaller) there is no interpreter to call: sys.executable IS
+    the exe, which ignores `-m magiah <stage>` and would open a second UI
+    instead of scanning. The exe's launcher accepts `<exe> <stage> --out <dir>`
+    and dispatches to the CLI, so call it that way.
+    """
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, stage, '--out', outdir]
+    return [sys.executable, '-X', 'utf8', '-m', 'magiah', stage,
+            '--out', outdir]
+
+
 def _parse_chunk(line):
     """Return (done, total) if `line` carries a `chunk i/N` marker, else None."""
     m = _CHUNK_RE.search(line)
@@ -206,8 +220,7 @@ def _run(outdir, stages):
                 # new stage — its chunk counters start fresh
                 _state.update(stage=stage, stage_index=i,
                               chunk_done=0, chunk_total=0)
-            cmd = [sys.executable, '-X', 'utf8', '-m', 'magiah', stage,
-                   '--out', outdir]
+            cmd = _stage_cmd(stage, outdir)
             emit(f'===== [{stage}] {" ".join(cmd)}')
             _proc = subprocess.Popen(
                 cmd, cwd=REPO_DIR, env=env,

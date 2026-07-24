@@ -13,6 +13,7 @@ Data/out dir resolution (first match wins):
 The console window is kept open on any startup error so a double-click user
 can read the Hebrew message instead of the window vanishing.
 """
+import multiprocessing
 import os
 import socket
 import sys
@@ -64,12 +65,25 @@ def _pause(msg):
         pass
 
 
+STAGES = ('lexicon', 'calibrate', 'detect', 'locate', 'report', 'all')
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
+
+    # Stage mode: the scan runner re-invokes this exe as `<exe> <stage> --out
+    # <dir>` to run one pipeline stage as a subprocess. A frozen exe is not a
+    # Python interpreter, so it cannot be driven with `-m magiah <stage>` —
+    # without this branch it would just open a second UI and never scan.
+    argv = [a for a in sys.argv[1:] if a not in ('-X', 'utf8')]
+    if argv and argv[0] in STAGES:
+        from magiah.cli import main as cli_main
+        sys.argv = ['magiah'] + argv
+        return cli_main() or 0
 
     outdir = _resolve_outdir(sys.argv[1:])
     port = _free_port()
@@ -105,4 +119,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # Required before anything else in a frozen build: the pipeline uses
+    # multiprocessing.Pool, and without this each worker re-runs the exe from
+    # the top instead of executing its task — the scan then hangs forever.
+    multiprocessing.freeze_support()
     sys.exit(main())
