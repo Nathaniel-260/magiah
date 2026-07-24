@@ -846,4 +846,14 @@ table.stats td.rowtotal, table.stats th.rowtotal { font-weight: 700; background:
 }
 .no-scan-card h2 { margin: 0 0 12px; font-size: 1.25rem; }
 .no-scan-card p { margin: 0 0 18px; color: var(--muted); }
-.no-scan-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.no-scan-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.ns-btn {
+  padding: 9px 18px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--panel-2);
+  color: var(--text); cursor: pointer; font-weight: 600;
+}
+.ns-btn:hover { background: var(--slate-soft); }
+.ns-primary {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.ns-primary:hover { background: var(--accent-strong); color: #fff; }

@@ -1731,11 +1731,12 @@ function showNoScanScreen() {
         "report.db. אפשר להריץ סריקה עכשיו — בסיומה הממצאים ייטענו לממשק " +
         "ללא צורך בהפעלה מחדש."),
       el("div", { class: "no-scan-actions" },
-        el("button", { class: "primary", onclick: () => {
+        el("button", { class: "ns-btn ns-primary", onclick: () => {
           hideNoScanScreen(); openScanModal();
           const d = $("#scanRunSection"); if (d) d.open = true;
-        } }, "▶ הרצת סריקה חדשה"),
-        el("button", { onclick: hideNoScanScreen }, "סגירה"))));
+        } }, el("bdi", null, "▶"), " הרצת סריקה חדשה"),
+        el("button", { class: "ns-btn", onclick: hideNoScanScreen },
+          "סגירה"))));
   document.body.appendChild(box);
 }
 function hideNoScanScreen() {
