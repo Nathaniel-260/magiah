@@ -10,6 +10,7 @@ into ``<outdir>/scan_ui_log.txt``. Only one scan may run at a time.
 import dataclasses
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -34,17 +35,25 @@ LOG_TAIL_LINES = 300
 REPO_DIR = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 
+# heavy stages print progress lines like "  [lexicon] chunk 12/48 types=..."
+# (core.py owns these; we only read them). Parse the last such pair per stage.
+_CHUNK_RE = re.compile(r'chunk\s+(\d+)\s*/\s*(\d+)')
+
 _lock = threading.Lock()
 _state = {
     'state': 'idle',            # idle | running | done | failed | cancelled
     'stage': None,              # currently running stage
     'stages': [],               # full ordered stage list of this scan
     'stage_index': -1,
-    'started_at': None,
+    'started_at': None,         # formatted local time string (display)
+    'started_epoch': None,      # time.time() at scan start (for `elapsed`)
     'finished_at': None,
+    'finished_epoch': None,     # time.time() at finish (freezes `elapsed`)
     'returncode': None,
     'error': None,
     'outdir': None,
+    'chunk_done': 0,            # latest "done" for the current stage (0 if none)
+    'chunk_total': 0,           # latest "total" for the current stage (0=unknown)
 }
 _log = deque(maxlen=LOG_TAIL_LINES)
 _proc = None                    # current subprocess.Popen
@@ -54,6 +63,14 @@ _thread = None
 
 def _log_line(text):
     _log.append(text.rstrip('\r\n'))
+
+
+def _parse_chunk(line):
+    """Return (done, total) if `line` carries a `chunk i/N` marker, else None."""
+    m = _CHUNK_RE.search(line)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
 
 
 def _spec_from_corpus(corpus):
@@ -148,8 +165,10 @@ def start_scan(outdir, stages=None, config_overrides=None,
         _cancel.clear()
         _state.update(state='running', stage=stages[0], stages=stages,
                       stage_index=0, returncode=None, error=None,
-                      outdir=outdir, finished_at=None,
-                      started_at=time.strftime('%Y-%m-%d %H:%M:%S'))
+                      outdir=outdir, finished_at=None, finished_epoch=None,
+                      chunk_done=0, chunk_total=0,
+                      started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                      started_epoch=time.time())
         _thread = threading.Thread(target=_run, args=(outdir, stages),
                                    daemon=True)
         _thread.start()
@@ -167,6 +186,10 @@ def _run(outdir, stages):
 
     def emit(line):
         _log_line(line)
+        ct = _parse_chunk(line)
+        if ct is not None:
+            with _lock:
+                _state['chunk_done'], _state['chunk_total'] = ct
         if logf:
             try:
                 logf.write(line.rstrip('\r\n') + '\n')
@@ -180,7 +203,9 @@ def _run(outdir, stages):
             if _cancel.is_set():
                 break
             with _lock:
-                _state.update(stage=stage, stage_index=i)
+                # new stage — its chunk counters start fresh
+                _state.update(stage=stage, stage_index=i,
+                              chunk_done=0, chunk_total=0)
             cmd = [sys.executable, '-X', 'utf8', '-m', 'magiah', stage,
                    '--out', outdir]
             emit(f'===== [{stage}] {" ".join(cmd)}')
@@ -220,7 +245,8 @@ def _run(outdir, stages):
             else:
                 _state.update(state='failed', returncode=rc)
             _state.update(stage=None,
-                          finished_at=time.strftime('%Y-%m-%d %H:%M:%S'))
+                          finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                          finished_epoch=time.time())
 
 
 def get_status():
@@ -228,6 +254,36 @@ def get_status():
         st = dict(_state)
     st['log_tail'] = list(_log)
     st['hebrew_state'] = hebrew.SCAN_STATES.get(st['state'], st['state'])
+    # --- derived progress (all backward-compatible additions) ---
+    total_stages = len(st.get('stages') or [])
+    st['total_stages'] = total_stages
+    done = int(st.get('chunk_done') or 0)
+    ctotal = int(st.get('chunk_total') or 0)
+    frac = (done / ctotal) if ctotal > 0 else 0.0
+    idx = st.get('stage_index')
+    if st['state'] == 'running' and total_stages > 0 and idx is not None \
+            and idx >= 0:
+        # completed stages + fraction of the current one, over all stages
+        pct = (idx + frac) / total_stages * 100.0
+    elif st['state'] in ('done',):
+        pct = 100.0
+    elif st['state'] in ('failed', 'cancelled'):
+        # freeze at wherever we got to (best-effort), no fake 100%
+        base = (idx if (idx is not None and idx >= 0) else 0)
+        pct = (base + frac) / total_stages * 100.0 if total_stages else 0.0
+    else:
+        pct = 0.0
+    if pct != pct or pct < 0:          # NaN / negative guard
+        pct = 0.0
+    st['percent'] = round(min(100.0, pct), 1)
+    # elapsed seconds: frozen at finish, live while running
+    se = st.get('started_epoch')
+    if se:
+        end = st.get('finished_epoch') if st['state'] != 'running' \
+            else time.time()
+        st['elapsed'] = max(0, int((end or time.time()) - se))
+    else:
+        st['elapsed'] = 0
     return st
 
 

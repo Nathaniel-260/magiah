@@ -857,3 +857,31 @@ table.stats td.rowtotal, table.stats th.rowtotal { font-weight: 700; background:
   background: var(--accent); border-color: var(--accent); color: #fff;
 }
 .ns-primary:hover { background: var(--accent-strong); color: #fff; }
+
+/* ---- scan progress indicator (§9d) ---- */
+#scanProgress { margin: 8px 0 10px; }
+#scanStageLine { font-weight: 600; margin-bottom: 6px; color: var(--text); }
+#scanBarWrap {
+  height: 14px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden;
+}
+#scanBar {
+  height: 100%; width: 0%;
+  background: var(--accent);
+  border-radius: 8px 0 0 8px;
+  transition: width .4s ease;
+}
+#scanBar.done { background: var(--green); }
+#scanBar.err { background: var(--red); }
+#scanBarMeta {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  margin-top: 5px; font-size: 12px; color: var(--muted);
+}
+#scanPctText { font-weight: 700; color: var(--text); }
+#scanElapsed { margin-inline-start: auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+#scanLexiconNote {
+  margin-top: 7px; padding: 6px 10px;
+  background: var(--accent-soft); color: var(--muted);
+  border-radius: var(--radius-sm); font-size: 12px; line-height: 1.5;
+}

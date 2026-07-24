@@ -1322,6 +1322,21 @@ function bindScanModal() {
 /* ------------------------------------------------ §9d — run scan from UI */
 const SCAN = { cfg: null, pollTimer: null, lastState: "idle" };
 
+/* fallback Hebrew stage names — real ones come from /api/scan/config */
+const STAGE_HEBREW = {
+  lexicon: "בניית מילון",
+  calibrate: "כיול",
+  detect: "איתור",
+  locate: "מיקום",
+  report: "דוחות",
+};
+
+function fmtElapsed(secs) {
+  const s = Math.max(0, Math.floor(Number(secs) || 0));
+  const mm = Math.floor(s / 60), ss = s % 60;
+  return String(mm).padStart(2, "0") + ":" + String(ss).padStart(2, "0");
+}
+
 async function loadScanConfig(force) {
   if (SCAN.cfg && !force) return SCAN.cfg;
   SCAN.cfg = await api("/api/scan/config");
@@ -1416,7 +1431,55 @@ function collectScanRequest() {
 
 function stageHebrew(key) {
   const s = ((SCAN.cfg && SCAN.cfg.stages) || []).find(x => x.key === key);
-  return s ? s.hebrew : key;
+  return s ? s.hebrew : (STAGE_HEBREW[key] || key);
+}
+
+function renderScanProgress(st) {
+  const wrap = $("#scanProgress");
+  const running = st.state === "running";
+  const known = ["running", "done", "failed", "cancelled"].includes(st.state);
+  // show the block whenever a scan is running or has produced a result
+  wrap.hidden = !known;
+  if (!known) return;
+
+  const total = (st.total_stages != null ? st.total_stages : (st.stages || []).length) || 0;
+  const idx = (st.stage_index != null && st.stage_index >= 0) ? st.stage_index : 0;
+  const stageKey = st.stage || (st.stages || [])[idx] || "";
+
+  // stage line: "שלב X מתוך Y: <name>"
+  const stageLine = $("#scanStageLine");
+  if (running && stageKey && total) {
+    stageLine.textContent = "שלב " + fmtNum(idx + 1) + " מתוך " + fmtNum(total) + ": " + stageHebrew(stageKey);
+  } else if (st.state === "done") {
+    stageLine.textContent = "כל השלבים הושלמו ✓";
+  } else if (st.state === "failed") {
+    stageLine.textContent = "הסריקה נעצרה עקב שגיאה";
+  } else if (st.state === "cancelled") {
+    stageLine.textContent = "הסריקה בוטלה";
+  } else {
+    stageLine.textContent = "";
+  }
+
+  // percent (0/NaN -> 0), bar fill + color
+  let pct = Number(st.percent);
+  if (isNaN(pct) || pct < 0) pct = 0;
+  if (st.state === "done") pct = 100;
+  pct = Math.min(100, Math.round(pct * 10) / 10);
+  const bar = $("#scanBar");
+  bar.style.width = pct + "%";
+  bar.classList.toggle("done", st.state === "done");
+  bar.classList.toggle("err", st.state === "failed" || st.state === "cancelled");
+
+  // chunk text (only when a chunk total is known)
+  const cd = Number(st.chunk_done) || 0, ctot = Number(st.chunk_total) || 0;
+  $("#scanChunkText").textContent = (running && ctot > 0)
+    ? "נתח " + fmtNum(cd) + " מתוך " + fmtNum(ctot)
+    : "";
+  $("#scanPctText").textContent = pct + "%";
+  $("#scanElapsed").textContent = "זמן שחלף: " + fmtElapsed(st.elapsed);
+
+  // lexicon-is-longest note — only during the lexicon stage
+  $("#scanLexiconNote").hidden = !(running && stageKey === "lexicon");
 }
 
 function renderScanStatus(st) {
@@ -1425,12 +1488,10 @@ function renderScanStatus(st) {
   const running = st.state === "running";
   panel.hidden = st.state === "idle" && !(st.log_tail || []).length;
   let txt = st.hebrew_state || st.state;
-  if (running && st.stage) {
-    txt += " — שלב " + fmtNum((st.stage_index || 0) + 1) + "/" + fmtNum((st.stages || []).length) + ": " + stageHebrew(st.stage);
-  }
   if (st.started_at) txt += " · התחילה: " + st.started_at;
   line.textContent = txt;
   line.className = running ? "run" : (st.state === "done" ? "ok" : (st.state === "idle" ? "" : "err"));
+  renderScanProgress(st);
   const log = $("#scanLog");
   const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
   log.textContent = (st.log_tail || []).join("\n");
