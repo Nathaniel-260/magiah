@@ -9,6 +9,7 @@ Hebrew; every response is UTF-8.
 import json
 import mimetypes
 import os
+import sys
 import threading
 import traceback
 import urllib.parse
@@ -17,8 +18,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db, export, hebrew, scanner
 
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'static')
+
+def _static_dir():
+    """Locate webui/static both as a normal package and when frozen.
+
+    Under a PyInstaller one-file build __file__ points into the temporary
+    _MEIPASS extract dir; the data files are unpacked at the same relative
+    path (magiah/webui/static), so the __file__-relative path is correct.
+    We keep an explicit _MEIPASS fallback in case __file__ resolution is
+    unavailable, so a missing static dir never silently falls back to the
+    Hebrew placeholder page in a frozen build."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+    if os.path.isdir(here):
+        return here
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        cand = os.path.join(base, 'magiah', 'webui', 'static')
+        if os.path.isdir(cand):
+            return cand
+    return here
+
+
+STATIC_DIR = _static_dir()
 
 PLACEHOLDER = '''<!DOCTYPE html>
 <html lang="he" dir="rtl"><head><meta charset="utf-8">
