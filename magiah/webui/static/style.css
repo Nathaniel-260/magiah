@@ -513,10 +513,25 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
 .d-history .h-item time { color: var(--faint); font-size: 11px; direction: ltr; display: inline-block; }
 
 /* ==================== card view ==================== */
-#view-cards .cards-stage { max-width: 760px; margin: 0 auto; }
+/* The card is the only thing on screen during triage, so it is centred in the
+   stage rather than pinned to the top with dead space beneath it. */
+section#view-cards.visible { display: flex; flex-direction: column; }
+/* fill the main pane minus the view tabs, so "centred" means centred on screen */
+#view-cards { min-height: calc(100vh - var(--topbar-h) - 108px); }
+#view-cards .cards-stage {
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding-bottom: 3vh;
+}
 #cardMeta {
   display: flex;
   justify-content: space-between;
+  gap: 12px;
   color: var(--muted);
   font-size: 13px;
   margin-bottom: 8px;
@@ -526,16 +541,133 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
-  padding: 26px 30px;
-  min-height: 340px;
+  padding: 24px 30px 22px;
 }
-.card-wordline {
+
+/* ---------- focus line: sentence intact, swap stacked at the error ----------
+ * The sentence is one continuous reading line. At the error we open a single
+ * shared column: the wrong word raised above the baseline, the correction
+ * dropped below it, centred on the same slot. The reviewer reads straight
+ * through and absorbs the swap without leaving the line. */
+.focus-line {
+  /* Snippets are ~95 chars with the error centred, so the line is sized to fit
+     on ONE row: wrapping is what would break the continuous read this design
+     exists to protect. JS shrinks --fl-size if a particular snippet is longer.
+     The stack keeps its real height (no negative-margin tricks — those let
+     wrapped text run straight through the stacked words). */
+  font-size: var(--fl-size, 25px);
+  line-height: 2.8;
   text-align: center;
-  font-size: 30px;
-  margin-bottom: 6px;
-  line-height: 1.4;
+  padding: 14px 10px;
+  margin-bottom: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  /* keep letterforms crisp at large size */
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1;
 }
-.card-wordline .arr { color: var(--faint); margin: 0 14px; font-size: 22px; }
+.focus-line .fl-text { color: var(--text); }
+
+/* the shared slot — an inline-grid stacks both words in one column, so they
+   are width-matched and their letters align vertically */
+.fl-swap {
+  display: inline-grid;
+  grid-template-rows: auto auto auto;
+  justify-items: center;
+  align-items: center;
+  /* Centred on the sentence's midline, so the error rides above the reading
+     line and the fix hangs below it — the swap happens in place. */
+  vertical-align: middle;
+  margin: 0 .22em;
+  line-height: 1.25;
+}
+.fl-swap .fl-word {
+  grid-column: 1;
+  font-weight: 700;
+  white-space: nowrap;
+  letter-spacing: .01em;
+  padding: 2px 8px;
+  border-radius: 5px;
+  line-height: 1.3;
+}
+/* raised: the original word, above the reading line */
+.fl-swap .fl-err {
+  grid-row: 1;
+  color: var(--red);
+  background: var(--red-soft);
+  /* struck through lightly — it is what leaves the text */
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--red) 45%, transparent);
+  text-decoration-thickness: 1px;
+}
+/* the hairline sits on the reading line itself and marks the swap point */
+.fl-swap .fl-rule {
+  grid-row: 2;
+  width: 100%;
+  min-width: 2.4em;
+  height: 0;
+  margin: 3px 0;
+  border-top: 1px dashed var(--border-strong);
+  opacity: .85;
+}
+/* dropped: the correction, below the reading line */
+.fl-swap .fl-fix {
+  grid-row: 3;
+  color: var(--green);
+  background: var(--green-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--green) 30%, transparent);
+}
+/* no suggestion: a single word sitting inline, no stack, no strike */
+.fl-swap.no-fix { margin: 0 .2em; vertical-align: baseline; }
+.fl-swap.no-fix .fl-err { text-decoration: none; }
+
+/* the changed letters — the whole point at this scale */
+.dc { border-radius: 3px; padding: 0 1px; }
+.dc-err {
+  background: color-mix(in srgb, var(--red) 26%, transparent);
+  box-shadow: 0 2px 0 0 var(--red);
+}
+.dc-fix {
+  background: color-mix(in srgb, var(--green) 30%, transparent);
+  box-shadow: 0 2px 0 0 var(--green);
+  font-weight: 800;
+}
+/* A changed space is invisible on its own — widen it and draw a bar in the gap
+   so "missing_space" / "extra_space" findings read at a glance. */
+.dc-space {
+  display: inline-block;
+  min-width: .55em;
+  vertical-align: baseline;
+}
+
+/* ---------- isolated pair, letter-diffed ---------- */
+.card-pair {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  font-size: 25px;
+  margin: 10px 0 8px;
+  line-height: 1.5;
+}
+.card-pair .arr { color: var(--faint); font-size: 20px; }
+.card-pair .pair-copy {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 3px 8px;
+  margin-inline-start: 4px;
+}
+.card-pair .pair-copy:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
 .card-sub {
   text-align: center;
   color: var(--muted);
@@ -546,24 +678,10 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
   justify-content: center;
   flex-wrap: wrap;
 }
-.card-snips { display: grid; gap: 10px; margin-bottom: 20px; }
-.card-snip {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 13px;
-  line-height: 1.8;
-  font-size: 15px;
-  word-break: break-word;
-}
-.card-snip .snip-label {
-  display: block;
-  font-size: 11.5px;
-  color: var(--faint);
-  margin-bottom: 3px;
-  font-weight: 700;
-}
-.card-snip.after { border-color: var(--green); }
+/* ---------- decisions ----------
+ * Ranked, not uniform: the two verdicts that end ~90% of cards are large and
+ * colour-coded so they are hit by muscle memory, while the rarer actions stay
+ * visible but visually quiet. Same eight actions, same keys as before. */
 .card-actions {
   display: flex;
   gap: 8px;
@@ -571,14 +689,19 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
   justify-content: center;
 }
 .card-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   border: 1px solid var(--border-strong);
   background: var(--panel-2);
   border-radius: var(--radius-sm);
   padding: 9px 14px;
   cursor: pointer;
   font-size: 14px;
+  transition: background .12s, border-color .12s, transform .06s;
 }
 .card-actions button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.card-actions button:active { transform: translateY(1px); }
 .card-actions button kbd {
   background: var(--panel);
   border: 1px solid var(--border-strong);
@@ -586,9 +709,46 @@ table.ftable td.refcell { max-width: 140px; overflow: hidden; text-overflow: ell
   border-radius: 4px;
   padding: 0 6px;
   font-size: 12px;
-  margin-inline-start: 6px;
   font-family: inherit;
+  color: var(--muted);
 }
+
+/* primary row — the two verdicts + skip */
+.card-actions.primary-row { margin-bottom: 9px; }
+.card-actions.primary-row button {
+  font-size: 16px;
+  font-weight: 600;
+  padding: 13px 22px;
+  border-width: 1.5px;
+  box-shadow: var(--shadow);
+}
+.card-actions.primary-row button kbd { font-size: 13px; padding: 1px 8px; }
+.act-approve {
+  border-color: var(--green) !important;
+  background: var(--green-soft) !important;
+  color: var(--green);
+}
+.act-approve:hover { background: color-mix(in srgb, var(--green) 20%, transparent) !important; }
+.act-approve kbd { border-color: var(--green); color: var(--green); }
+.act-reject {
+  border-color: var(--red) !important;
+  background: var(--red-soft) !important;
+  color: var(--red);
+}
+.act-reject:hover { background: color-mix(in srgb, var(--red) 18%, transparent) !important; }
+.act-reject kbd { border-color: var(--red); color: var(--red); }
+.act-skip { color: var(--muted); }
+
+/* secondary row — the occasional escapes */
+.card-actions.second-row button {
+  font-size: 13px;
+  padding: 7px 12px;
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+}
+.card-actions.second-row button:hover { color: var(--text); background: var(--accent-soft); }
+.card-actions.second-row button kbd { font-size: 11px; }
 #cardFixRow { display: none; gap: 8px; margin-top: 14px; }
 #cardFixRow.visible { display: flex; }
 #cardFixInput {

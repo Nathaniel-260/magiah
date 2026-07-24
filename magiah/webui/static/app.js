@@ -239,17 +239,184 @@ function totalOf(resp) {
 }
 
 /* ---------------------------------------------------------- snippets */
-function renderSnippet(snippet, word, repl) {
+
+/* Locate the reviewed word inside its snippet.
+ * The scanner builds snippets with ~45 chars of context on each side, so when a
+ * word occurs more than once the *central* occurrence is the reviewed one —
+ * plain indexOf() would highlight the wrong copy (~1% of findings). We also
+ * prefer occurrences that stand as whole words over ones inside a longer word. */
+const HEB_WORDCHAR = /[֐-׿‏‎'"׳״]/;
+function locateWord(s, w) {
+  if (!w) return -1;
+  const mid = s.length / 2;
+  let best = -1, bestScore = Infinity;
+  for (let i = s.indexOf(w); i >= 0; i = s.indexOf(w, i + 1)) {
+    const leftOk = i === 0 || !HEB_WORDCHAR.test(s[i - 1]);
+    const rightOk = i + w.length >= s.length || !HEB_WORDCHAR.test(s[i + w.length]);
+    // distance of the occurrence's centre from the snippet's centre
+    let score = Math.abs(i + w.length / 2 - mid);
+    if (!(leftOk && rightOk)) score += 1000; // whole-word matches win outright
+    if (score < bestScore) { bestScore = score; best = i; }
+  }
+  return best;
+}
+
+/* Character-level alignment of the wrong word against its correction.
+ * Almost every finding here is a one-letter Hebrew confusion (ז/ח, ו/י, ר/ד,
+ * ב/כ …), so showing only "red word → green word" makes the reviewer re-read
+ * both words letter by letter. Aligning them lets us mark *just* the letters
+ * that differ, which is what the eye should land on.
+ *
+ * Classic LCS backtrace. Words are short (< 20 chars), so the O(n·m) table is
+ * free, and unlike a greedy scan it never mis-pairs a shifted insertion.
+ * Returns two arrays of {ch, same} — one per word, in logical (not visual)
+ * order; the browser's bidi algorithm handles RTL presentation. */
+function diffChars(a, b) {
+  a = a == null ? "" : String(a);
+  b = b == null ? "" : String(b);
+  const n = a.length, m = b.length;
+  // Guard: pathological input shouldn't build a huge table.
+  if (!n || !m || n * m > 40000) {
+    return [[{ ch: a, same: false }], [{ ch: b, same: false }]];
+  }
+  const L = [];
+  for (let i = 0; i <= n; i++) L.push(new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      L[i][j] = a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    }
+  }
+  const A = [], B = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { A.push({ ch: a[i], same: true }); B.push({ ch: b[j], same: true }); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) { A.push({ ch: a[i], same: false }); i++; }
+    else { B.push({ ch: b[j], same: false }); j++; }
+  }
+  while (i < n) { A.push({ ch: a[i], same: false }); i++; }
+  while (j < m) { B.push({ ch: b[j], same: false }); j++; }
+  return [A, B];
+}
+
+/* Collapse a diff array into <span>s, merging runs so the DOM stays small and
+ * — more importantly — so adjacent changed letters read as one blob rather
+ * than a row of separately-boxed characters. */
+function diffSpans(parts, kind) {
+  const out = [];
+  let buf = "", bufSame = null;
+  const flush = () => {
+    if (!buf) return;
+    if (bufSame) {
+      out.push(document.createTextNode(buf));
+    } else {
+      // A changed run that is pure whitespace would be invisible, so show the
+      // open-box glyph instead — that is the whole finding for the 56k
+      // missing_space / extra_space rows.
+      const blank = /^\s+$/.test(buf);
+      out.push(el("span", { class: "dc dc-" + kind + (blank ? " dc-space" : "") },
+                  blank ? "␣" : buf));
+    }
+    buf = "";
+  };
+  for (const p of parts) {
+    if (p.same !== bufSame) { flush(); bufSame = p.same; }
+    buf += p.ch;
+  }
+  flush();
+  return out;
+}
+
+/* A word rendered with its differing letters marked. `kind` = "err" | "fix". */
+function wordDiffNode(word, other, kind, cls) {
+  const [A, B] = diffChars(word, other);
+  const parts = kind === "err" ? A : B;
+  const b = el("bdi", { class: cls || null });
+  b.append(...diffSpans(parts, kind));
+  return b;
+}
+
+/* `repl` = replacement to show instead of the word (the "after" rendering).
+ * `counter` = the other side of the pair, used only to mark differing letters. */
+function renderSnippet(snippet, word, repl, counter) {
   const b = el("bdi");
   const s = snippet == null ? "" : String(snippet);
   if (!s) { b.textContent = "—"; return b; }
   const w = word == null ? "" : String(word);
-  const i = w ? s.indexOf(w) : -1;
+  const i = locateWord(s, w);
   if (i < 0) { b.textContent = s; return b; }
   b.append(s.slice(0, i));
-  b.append(el("span", { class: repl != null ? "hl-fix" : "hl-err" }, repl != null ? repl : w));
+  const shown = repl != null ? repl : w;
+  const kind = repl != null ? "fix" : "err";
+  const other = counter != null ? counter : (repl != null ? w : "");
+  if (other && other !== shown) {
+    b.append(wordDiffNode(shown, other, kind, "hl-" + kind));
+  } else {
+    b.append(el("span", { class: "hl-" + kind }, shown));
+  }
   b.append(s.slice(i + w.length));
   return b;
+}
+
+/* ---- the focus line: sentence with the swap stacked in place -------------
+ * The reviewer's real task is "is this one letter wrong?", so the sentence must
+ * stay a single continuous reading line. At the error we open one shared column:
+ * the original word sits raised above the baseline, the correction drops below
+ * it, both centred on the same horizontal slot. The eye tracks the sentence
+ * straight through and takes the swap in without leaving the line — far faster
+ * than comparing two separate before/after paragraphs.
+ *
+ * The two stacked words are width-matched by the grid, so their letters line up
+ * vertically and the differing letter shows up as a break in the column. */
+function renderFocusLine(row) {
+  const s = row.snippet == null ? "" : String(row.snippet);
+  const w = row.word == null ? "" : String(row.word);
+  const fix = effFix(row) || "";
+  const line = el("div", { class: "focus-line" });
+  if (!s) {
+    line.append(el("bdi", { class: "fl-text" }, w || "—"));
+    return line;
+  }
+  const i = locateWord(s, w);
+  if (i < 0 || !w) {
+    line.append(el("bdi", { class: "fl-text" }, s));
+    return line;
+  }
+  const before = s.slice(0, i);
+  const after = s.slice(i + w.length);
+  const [A, B] = diffChars(w, fix);
+
+  const swap = el("span", { class: "fl-swap" + (fix ? "" : " no-fix") });
+  const errW = el("bdi", { class: "fl-word fl-err" });
+  errW.append(...diffSpans(A, "err"));
+  swap.append(errW);
+  if (fix) {
+    swap.append(el("span", { class: "fl-rule" }));
+    const fixW = el("bdi", { class: "fl-word fl-fix" });
+    fixW.append(...diffSpans(B, "fix"));
+    swap.append(fixW);
+  }
+  line.append(el("bdi", { class: "fl-text" }, before), swap, el("bdi", { class: "fl-text" }, after));
+  return line;
+}
+
+/* Shrink the focus line until the sentence fits on a single row.
+ * Wrapping would defeat the whole design, and horizontal scrolling would make
+ * the reviewer drag the sentence around, so we scale the type down instead —
+ * down to a floor where it is still comfortably larger than body text. */
+const FL_MAX = 25, FL_MIN = 13;
+window.addEventListener("resize", debounce(() => {
+  for (const line of $$(".focus-line")) fitFocusLine(line);
+}, 120));
+function fitFocusLine(line, max) {
+  if (!line || !line.isConnected || !line.clientWidth) return;
+  let size = max || Number(line.dataset.flMax) || FL_MAX;
+  line.style.setProperty("--fl-size", size + "px");
+  // scrollWidth > clientWidth means the nowrap line overflows its box
+  let guard = 0;
+  while (line.scrollWidth > line.clientWidth && size > FL_MIN && guard++ < 40) {
+    size -= 1;
+    line.style.setProperty("--fl-size", size + "px");
+  }
 }
 
 /* ---------------------------------------------------------- status writes */
@@ -506,14 +673,17 @@ function renderTableRows() {
       updateBulkBar();
     });
     tr.append(el("td", null, cb));
-    tr.append(el("td", null, el("bdi", { class: "w-err" }, r.word || "")));
-    tr.append(el("td", null, el("bdi", { class: "w-fix" }, effFix(r))));
+    // letter-level diff here too, so scanning the table shows *what* changed
+    tr.append(el("td", null, wordDiffNode(r.word || "", effFix(r), "err", "w-err")));
+    tr.append(el("td", null, effFix(r)
+      ? wordDiffNode(effFix(r), r.word || "", "fix", "w-fix")
+      : el("bdi", { class: "w-fix" }, "")));
     tr.append(el("td", { class: "num" }, fmtRank(r.rank)));
     tr.append(el("td", null, r.verified ? el("span", { class: "vbadge" }, "מאומת") : ""));
     tr.append(el("td", null, el("span", { class: "et-tag", title: errtypeInfo(r.errtype).explanation || "" }, errtypeInfo(r.errtype).hebrew)));
     tr.append(el("td", { class: "bookcell", title: r.source || "" }, el("bdi", null, r.source || "")));
     tr.append(el("td", { class: "refcell", title: r.ref || "" }, el("bdi", null, r.ref || "")));
-    tr.append(el("td", { class: "snip" }, renderSnippet(r.snippet, r.word)));
+    tr.append(el("td", { class: "snip" }, renderSnippet(r.snippet, r.word, null, effFix(r))));
     tr.append(el("td", null, statusChip(r)));
     tr.addEventListener("click", () => openDrawer(r.id));
     tb.append(tr);
@@ -630,15 +800,20 @@ async function openDrawer(id) {
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
-  // word line
+  const dfix = effFix(r);
+  // word line — letter-diffed like everywhere else
   body.append(el("div", { class: "d-word-line" },
-    el("bdi", { class: "w-err" }, r.word || "—"),
+    wordDiffNode(r.word || "—", dfix || "", "err", "w-err"),
     el("span", { class: "arr" }, "⇐"),
-    el("bdi", { class: "w-fix" }, effFix(r) || "—")));
-  // snippets before/after
-  const sec = el("div", { class: "d-section" }, el("h4", null, "קטע מהטקסט — לפני ואחרי התיקון"));
-  sec.append(el("div", { class: "d-snippet" }, renderSnippet(r.snippet, r.word)));
-  if (effFix(r)) sec.append(el("div", { class: "d-snippet", style: "margin-top:6px;border-color:var(--green)" }, renderSnippet(r.snippet, r.word, effFix(r))));
+    dfix ? wordDiffNode(dfix, r.word || "", "fix", "w-fix") : el("bdi", { class: "w-fix" }, "—")));
+  // the swap shown in place, then the two full readings for careful checking
+  const sec = el("div", { class: "d-section" }, el("h4", null, "קטע מהטקסט — התיקון במקומו"));
+  const dfocus = renderFocusLine(r);
+  dfocus.dataset.flMax = "19"; // the drawer is narrow
+  sec.append(dfocus);
+  requestAnimationFrame(() => fitFocusLine(dfocus));
+  sec.append(el("div", { class: "d-snippet", style: "margin-top:8px" }, renderSnippet(r.snippet, r.word, null, dfix)));
+  if (dfix) sec.append(el("div", { class: "d-snippet", style: "margin-top:6px;border-color:var(--green)" }, renderSnippet(r.snippet, r.word, dfix)));
   body.append(sec);
   // status buttons
   const stSec = el("div", { class: "d-section" }, el("h4", null, "סטטוס"));
@@ -790,10 +965,25 @@ function renderCard() {
     return;
   }
   const info = errtypeInfo(r.errtype);
-  box.append(el("div", { class: "card-wordline" },
-    el("bdi", { class: "w-err" }, r.word || "—"),
-    el("span", { class: "arr" }, "⇐"),
-    el("bdi", { class: "w-fix" }, effFix(r) || "—")));
+  const fix = effFix(r);
+
+  // 1. the reading line — sentence intact, swap stacked in place at the error
+  const focus = renderFocusLine(r);
+  box.append(focus);
+  // must run after the node is in the document to measure it
+  requestAnimationFrame(() => fitFocusLine(focus));
+
+  // 2. the isolated pair, letter-diffed, for when the stack alone isn't enough
+  const pair = el("div", { class: "card-pair" },
+    wordDiffNode(r.word || "—", fix || "", "err", "w-err"),
+    el("span", { class: "arr" }, "⇦"),
+    fix ? wordDiffNode(fix, r.word || "", "fix", "w-fix") : el("bdi", { class: "w-fix" }, "—"));
+  const cp = el("button", { class: "pair-copy", title: "העתקת התיקון" }, "⧉");
+  cp.addEventListener("click", () => copyText(fix || r.word || ""));
+  pair.append(cp);
+  box.append(pair);
+
+  // 3. provenance / confidence, secondary
   box.append(el("div", { class: "card-sub" },
     el("span", { class: "et-tag", title: info.explanation || "" }, info.hebrew),
     el("span", null, "📖 ", el("bdi", null, r.source || "")),
@@ -801,30 +991,26 @@ function renderCard() {
     el("span", null, "ציון: " + fmtRank(r.rank)),
     r.verified ? el("span", { class: "vbadge" }, "מאומת") : null,
     el("span", { class: "chip st-" + effStatus(r) }, statusInfo(effStatus(r)).icon + " " + statusInfo(effStatus(r)).hebrew)));
-  const snips = el("div", { class: "card-snips" });
-  const before = el("div", { class: "card-snip" }, el("span", { class: "snip-label" }, "לפני התיקון"));
-  before.append(renderSnippet(r.snippet, r.word));
-  snips.append(before);
-  if (effFix(r)) {
-    const after = el("div", { class: "card-snip after" }, el("span", { class: "snip-label" }, "אחרי התיקון"));
-    after.append(renderSnippet(r.snippet, r.word, effFix(r)));
-    snips.append(after);
-  }
-  box.append(snips);
-  const mkBtn = (label, kbd, fn) => {
-    const b = el("button", null, label, el("kbd", null, kbd));
+  /* Decisions — same eight actions and same keys as always, but ranked by how
+   * often they are actually used. In triage ~90% of cards end in one of the
+   * first two, so those get large, colour-coded primary buttons; the rest stay
+   * one click away on a quieter secondary row. Nothing is hidden. */
+  const mkBtn = (label, kbd, fn, cls) => {
+    const b = el("button", { class: cls || null },
+      el("span", { class: "lbl" }, label), el("kbd", null, kbd));
     b.addEventListener("click", fn);
     return b;
   };
-  box.append(el("div", { class: "card-actions" },
-    mkBtn("✅ אושר — זו שגיאה", "י", () => cardAct("approved")),
-    mkBtn("❌ לא שגיאה", "נ", () => cardAct("not_error")),
+  box.append(el("div", { class: "card-actions primary-row" },
+    mkBtn("✅ אושר — זו שגיאה", "י", () => cardAct("approved"), "act-approve"),
+    mkBtn("❌ לא שגיאה", "נ", () => cardAct("not_error"), "act-reject"),
+    mkBtn("⏭ דלג", "רווח", () => cardSkip(), "act-skip")));
+  box.append(el("div", { class: "card-actions second-row" },
     mkBtn("❌ לא שגיאה בכל מקום", "ד", () => cardAct("not_error", { scope: "word" })),
     mkBtn("✏ תיקון ידני", "ת", () => toggleCardFix(true)),
     mkBtn("🚫 התעלם", "ע", () => cardAct("ignored")),
     mkBtn("❓ דרוש בירור", "ב", () => cardAct("unsure")),
-    mkBtn("🔧 תוקן בספר", "ק", () => cardAct("fixed")),
-    mkBtn("⏭ דלג", "רווח", () => cardSkip())));
+    mkBtn("🔧 תוקן בספר", "ק", () => cardAct("fixed"))));
   const fixRow = el("div", { id: "cardFixRow", class: S.cardFixOpen ? "visible" : "" },
     el("input", { id: "cardFixInput", type: "text", placeholder: "הקלד את התיקון הנכון ולחץ Enter…", dir: "rtl" }),
     el("button", { class: "btn primary" }, "שמור ואשר"));
@@ -951,12 +1137,13 @@ function renderFixList(scroll) {
     const done = effStatus(r) === "fixed";
     const row = el("div", { class: "fix-row" + (idx === S.fixIdx ? " current" : "") + (done ? " done-row" : ""), dataset: { idx: String(idx) } });
     const main = el("div", { class: "fix-main" });
+    const rfix = effFix(r);
     main.append(el("div", { class: "fix-wordline" },
-      el("bdi", { class: "w-err" }, r.word || ""),
+      wordDiffNode(r.word || "", rfix || "", "err", "w-err"),
       el("span", { class: "arr" }, "⇐"),
-      el("bdi", { class: "w-fix" }, effFix(r) || "—"),
+      rfix ? wordDiffNode(rfix, r.word || "", "fix", "w-fix") : el("bdi", { class: "w-fix" }, "—"),
       r.custom_suggestion ? el("span", { class: "et-tag", style: "margin-inline-start:8px" }, "תיקון ידני") : null));
-    main.append(el("div", { class: "fix-snip" }, renderSnippet(r.snippet, r.word)));
+    main.append(el("div", { class: "fix-snip" }, renderSnippet(r.snippet, r.word, null, rfix)));
     const pf = parseFileUnit(r.unit);
     if (pf) main.append(el("div", { class: "fix-file" }, fileUnitNode(pf)));
     row.append(main);
