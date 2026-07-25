@@ -39,6 +39,10 @@ REPO_DIR = os.path.dirname(os.path.dirname(
 # (core.py owns these; we only read them). Parse the last such pair per stage.
 _CHUNK_RE = re.compile(r'chunk\s+(\d+)\s*/\s*(\d+)')
 
+class _Cancelled(Exception):
+    """Internal: the user cancelled before anything was written."""
+
+
 _lock = threading.Lock()
 _state = {
     'state': 'idle',            # idle | running | done | failed | cancelled
@@ -54,6 +58,7 @@ _state = {
     'outdir': None,
     'chunk_done': 0,            # latest "done" for the current stage (0 if none)
     'chunk_total': 0,           # latest "total" for the current stage (0=unknown)
+    'book': None,               # single-book scan: {source,key,title,result}
 }
 _log = deque(maxlen=LOG_TAIL_LINES)
 _proc = None                    # current subprocess.Popen
@@ -180,7 +185,7 @@ def start_scan(outdir, stages=None, config_overrides=None,
         _state.update(state='running', stage=stages[0], stages=stages,
                       stage_index=0, returncode=None, error=None,
                       outdir=outdir, finished_at=None, finished_epoch=None,
-                      chunk_done=0, chunk_total=0,
+                      chunk_done=0, chunk_total=0, book=None,
                       started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                       started_epoch=time.time())
         _thread = threading.Thread(target=_run, args=(outdir, stages),
@@ -267,6 +272,9 @@ def get_status():
         st = dict(_state)
     st['log_tail'] = list(_log)
     st['hebrew_state'] = hebrew.SCAN_STATES.get(st['state'], st['state'])
+    # a single-book scan is one indivisible stage with no chunk counters, so
+    # the generic stage/chunk maths below would report a stuck 0% for it
+    st['is_book'] = (st.get('stages') or []) == ['book']
     # --- derived progress (all backward-compatible additions) ---
     total_stages = len(st.get('stages') or [])
     st['total_stages'] = total_stages
@@ -301,7 +309,13 @@ def get_status():
 
 
 def cancel():
-    """Terminate the running scan (kills the whole process tree)."""
+    """Terminate the running scan (kills the whole process tree).
+
+    A single-book scan has no subprocess — it runs in `_thread` — so there is
+    nothing to kill: setting the flag is the whole cancellation. The worker
+    checks it once the (seconds-long) scan returns and discards the result
+    instead of merging it.
+    """
     with _lock:
         if _state['state'] != 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['not_running'])
@@ -318,6 +332,143 @@ def cancel():
         except OSError:
             pass
     return {'ok': True, 'message': hebrew.SCAN_MESSAGES['cancel_sent']}
+
+
+def start_book_scan(outdir, source, key, config_overrides=None,
+                    corpus_overrides=None, verify_ctx=False):
+    """Launch a single-book scan (UI: "סריקת ספר בודד").
+
+    Runs in a thread rather than a subprocess: a book scan is seconds of work
+    against the already-built lexicon, and keeping it in-process lets the
+    findings be merged into ui_review.db the moment it finishes — no separate
+    "refresh" step. It shares `_state` and `_lock` with the full scan, so the
+    two can never run at once and the UI's existing status polling shows it
+    with no changes.
+
+    Raises ValueError (Hebrew) on any user error, before anything starts.
+    """
+    global _thread
+    outdir = os.path.abspath(outdir)
+    if source not in ('db', 'library', 'file'):
+        raise ValueError(hebrew.SCAN_MESSAGES['book_bad_source'])
+    if not str(key or '').strip():
+        raise ValueError(hebrew.SCAN_MESSAGES['book_no_book'])
+    # the whole feature rests on an existing lexicon — fail before starting,
+    # with the Hebrew instruction, rather than inside the worker thread
+    if not os.path.isfile(os.path.join(outdir, 'lexicon.pkl')):
+        raise ValueError(hebrew.SCAN_MESSAGES['book_no_lexicon'])
+    spec = _spec_from_corpus(corpus_overrides)
+    cfg = _merge_config(outdir, config_overrides)
+    db_path = spec.get('db') if spec['type'] != 'sqlite' else spec.get('path')
+    library_dir = spec.get('path') if spec['type'] in ('hybrid', 'library') \
+        else None
+    if source == 'db' and not os.path.isfile(db_path or ''):
+        raise ValueError(hebrew.SCAN_MESSAGES['db_missing'] + str(db_path))
+    if source == 'library' and not os.path.isdir(library_dir or ''):
+        raise ValueError(hebrew.SCAN_MESSAGES['library_missing']
+                         + str(library_dir))
+
+    with _lock:
+        if _state['state'] == 'running':
+            raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
+        _log.clear()
+        _cancel.clear()
+        _state.update(state='running', stage='book', stages=['book'],
+                      stage_index=0, returncode=None, error=None,
+                      outdir=outdir, finished_at=None, finished_epoch=None,
+                      chunk_done=0, chunk_total=0,
+                      started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                      started_epoch=time.time())
+        _state['book'] = {'source': source, 'key': key, 'title': None,
+                          'result': None}
+        _thread = threading.Thread(
+            target=_run_book,
+            args=(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
+                  spec),
+            daemon=True)
+        _thread.start()
+    return dict(get_status())
+
+
+def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
+              spec):
+    """Worker: scan one book, then merge it into ui_review.db."""
+    from .. import book_scan
+    from ..book_source import BookNotFound
+    from . import db as uidb
+
+    log_path = os.path.join(outdir, LOG_FILE)
+    try:
+        logf = open(log_path, 'w', encoding='utf-8')
+    except OSError:
+        logf = None
+
+    def emit(line):
+        _log_line(line)
+        ct = _parse_chunk(line)
+        if ct is not None:
+            with _lock:
+                _state['chunk_done'], _state['chunk_total'] = ct
+        if logf:
+            try:
+                logf.write(line.rstrip('\r\n') + '\n')
+                logf.flush()
+            except OSError:
+                pass
+
+    rc, err = 0, None
+    merged = False           # once the merge commits, it cannot be "cancelled"
+    cancelled = False
+    try:
+        emit(f'===== [book] {source}: {key}')
+        result = book_scan.scan_book(
+            outdir, source, key, cfg=cfg, db_path=db_path,
+            library_dir=library_dir, verify_ctx=verify_ctx, spec=spec,
+            progress=emit)
+        if _cancel.is_set():
+            # cancelled before anything was written — discard the result
+            cancelled = True
+            emit('===== [book] ' + hebrew.SCAN_MESSAGES['cancelled'])
+            raise _Cancelled()
+        with _lock:
+            _state['book']['title'] = result.get('title')
+        counts = uidb.import_book_scan(outdir, result)
+        merged = True
+        emit(f"===== [book] נוספו {counts['added']:,} ממצאים, "
+             f"הוחלפו {counts['replaced']:,}, "
+             f"נשמרו {counts['preserved']:,} החלטות")
+        with _lock:
+            _state['book']['result'] = dict(counts, **{
+                'lines': result.get('lines'),
+                'origin': result.get('origin'),
+                'ctx_scope': result.get('ctx_scope'),
+                'seconds': result.get('seconds')})
+    except _Cancelled:
+        rc = 1
+    except (book_scan.BookScanError, BookNotFound, ValueError) as e:
+        rc, err = 1, str(e)
+        emit(f'===== [book] שגיאה: {e}')
+    except Exception as e:                          # noqa: BLE001
+        rc, err = -1, str(e)
+        emit(f'===== [book] שגיאה פנימית: {e!r}')
+    finally:
+        if logf:
+            try:
+                logf.close()
+            except OSError:
+                pass
+        with _lock:
+            # a cancel that arrived *during* the merge is too late: the rows
+            # are committed, so report the truth (done), not "cancelled"
+            if cancelled and not merged:
+                _state.update(state='cancelled', returncode=rc or 1)
+            elif rc == 0:
+                _state.update(state='done', returncode=0)
+            else:
+                _state.update(state='failed', returncode=rc, error=err)
+            _state.update(stage=None,
+                          finished_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                          finished_epoch=time.time())
 
 
 def scan_config(outdir):

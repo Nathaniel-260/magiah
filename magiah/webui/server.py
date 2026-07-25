@@ -132,6 +132,31 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/scan/config':
                 self._json(scanner.scan_config(self.outdir))
                 return
+            if path == '/api/scan/books':
+                # book picker: search the chosen source for books to scan
+                from .. import book_source
+                src = q.get('source') or 'db'
+                cfg = scanner.scan_config(self.outdir)['corpus']
+                # `or` (not `get(..., default)`): the UI sends the field empty
+                # when its path box is blank, and an empty path must fall back
+                # to the saved config rather than fail
+                try:
+                    if src == 'library':
+                        books = book_source.list_library_books(
+                            (q.get('library_dir') or '').strip()
+                            or cfg.get('library_dir'),
+                            q.get('q', ''), int(q.get('limit', 100)))
+                    else:
+                        books = book_source.list_db_books(
+                            (q.get('db_path') or '').strip()
+                            or cfg.get('db_path'),
+                            q.get('q', ''), int(q.get('limit', 100)))
+                except book_source.BookNotFound as e:
+                    self._error(str(e), 400)
+                    return
+                self._json({'books': books, 'source': src,
+                            'total': len(books)})
+                return
             con = db.connect(self.outdir)
             try:
                 self._api_get(path, q, con)
@@ -196,20 +221,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok': True, 'status': res,
                             'message': hebrew.SCAN_MESSAGES['started']})
                 return
+            if path == '/api/scan/book':
+                res = scanner.start_book_scan(
+                    self.outdir, body.get('source') or 'db',
+                    body.get('book'), body.get('config'),
+                    body.get('corpus'), bool(body.get('verify_ctx')))
+                self._json({'ok': True, 'status': res,
+                            'message': hebrew.SCAN_MESSAGES['book_started']})
+                return
             if path == '/api/scan/cancel':
                 self._json(scanner.cancel())
                 return
             if path == '/api/refresh':
                 with _import_lock:
                     counts = db.import_all(self.outdir)
+                kept = counts.get('book_scan_kept') or 0
                 self._json({'ok': True, 'counts': counts,
                             'added': counts['added'],
                             'removed': counts['removed'],
                             'preserved': counts['preserved'],
+                            'book_scan_kept': kept,
                             'message': 'הרענון הושלם: נוספו '
                                        f"{counts['added']:,}, הוסרו "
                                        f"{counts['removed']:,}, נשמרו "
-                                       f"{counts['preserved']:,} החלטות"})
+                                       f"{counts['preserved']:,} החלטות"
+                                       + (f'. נשמרו גם {kept:,} ממצאים '
+                                          'מסריקות ספר בודד' if kept else '')})
                 return
             con = db.connect(self.outdir)
             try:

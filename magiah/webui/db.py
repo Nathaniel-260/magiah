@@ -94,6 +94,9 @@ CREATE INDEX IF NOT EXISTS idx_f_source ON findings(source);
 CREATE INDEX IF NOT EXISTS idx_f_errtype ON findings(errtype);
 CREATE INDEX IF NOT EXISTS idx_f_word_unit ON findings(word, unit);
 CREATE INDEX IF NOT EXISTS idx_f_rank ON findings(rank);
+-- single-book scans select/delete a whole book by doc; without this each
+-- merge scans the entire (300 MB+) findings table three times
+CREATE INDEX IF NOT EXISTS idx_f_doc ON findings(doc);
 
 CREATE TABLE IF NOT EXISTS review(
   finding_id INTEGER PRIMARY KEY REFERENCES findings(id),
@@ -182,6 +185,16 @@ def connect(outdir):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if not SCHEMA_TABLES <= have:
         con.executescript(SCHEMA)
+    elif not con.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+                         "AND name='idx_f_doc'").fetchone():
+        # added with the single-book scan; existing databases predate it and
+        # would otherwise scan the whole findings table on every book merge
+        try:
+            con.execute('CREATE INDEX IF NOT EXISTS idx_f_doc '
+                        'ON findings(doc)')
+            con.commit()
+        except sqlite3.OperationalError:
+            pass                       # another connection is building it
     return con
 
 
@@ -366,12 +379,41 @@ def import_all(outdir, migrate_legacy=False):
                               'WHERE old_id IS NOT NULL').fetchone()[0]
         max_id = cur.execute(
             'SELECT COALESCE(MAX(id), 0) FROM findings').fetchone()[0]
+        hw = cur.execute(
+            "SELECT value FROM meta WHERE key='max_finding_id'").fetchone()
+        try:
+            max_id = max(max_id, int(hw[0])) if hw else max_id
+        except (TypeError, ValueError):
+            pass
 
-        cur.execute('DELETE FROM findings')
+        # Books that exist ONLY because of a single-book scan have no rows in
+        # report.db, so the rebuild below would erase them and every decision
+        # made on them. Carry those rows (and their review rows) across intact
+        # — a full scan of a corpus that does not contain that book says
+        # nothing about it. A book present in BOTH is rebuilt from report.db as
+        # usual: report.db is the newer, corpus-wide truth for it.
+        cur.execute('''CREATE TEMP TABLE keep_docs AS
+            SELECT DISTINCT doc FROM findings
+            WHERE doc IS NOT NULL AND doc != ''
+              AND extra LIKE '%"book_scan": true%'
+              AND doc NOT IN (SELECT DISTINCT COALESCE(doc,'')
+                              FROM imp WHERE doc IS NOT NULL)''')
+        cur.execute('''CREATE TEMP TABLE keep_rows AS
+            SELECT * FROM findings
+            WHERE doc IN (SELECT doc FROM keep_docs)''')
+        kept = cur.execute('SELECT COUNT(*) FROM keep_rows').fetchone()[0]
+
+        cur.execute('DELETE FROM findings WHERE id NOT IN '
+                    '(SELECT id FROM keep_rows)')
         cols17 = ('family, errtype, word, suggestion, score, rank, ctx_hits, '
                   'sugg_local, book_repeat, tanach, verified, origin, source, '
                   'ref, unit, doc, snippet, extra')
         icols = ', '.join('i.' + c.strip() for c in cols17.split(','))
+        # a preserved book-scan row may hold an id that identity-matching also
+        # assigned to a rebuilt row; the preserved row keeps it, so re-point
+        # the colliding rebuilt row at a fresh id instead
+        cur.execute('''UPDATE assign SET old_id = NULL
+            WHERE old_id IN (SELECT id FROM keep_rows)''')
         cur.execute(f'''INSERT INTO findings(id, {cols17})
             SELECT a.old_id, {icols}
             FROM imp2 i JOIN assign a ON a.irow = i.irow
@@ -381,6 +423,10 @@ def import_all(outdir, migrate_legacy=False):
             FROM imp2 i JOIN assign a ON a.irow = i.irow
             WHERE a.old_id IS NULL''', (max_id,))
         total = cur.execute('SELECT COUNT(*) FROM findings').fetchone()[0]
+        new_max = cur.execute(
+            'SELECT COALESCE(MAX(id), 0) FROM findings').fetchone()[0]
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('max_finding_id', ?)",
+                    (str(max(max_id, new_max)),))
 
         # drop review rows of vanished findings; count what survived
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
@@ -389,9 +435,12 @@ def import_all(outdir, migrate_legacy=False):
 
         counts.update({
             'total': total,
-            'added': total - matched,
-            'removed': old_total - matched,
+            # `kept` rows were never candidates for matching, so they are
+            # neither "added" nor "removed" by this refresh
+            'added': total - matched - kept,
+            'removed': old_total - matched - kept,
             'preserved': preserved,
+            'book_scan_kept': kept,
         })
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
@@ -401,6 +450,8 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('DROP TABLE imp2')
         cur.execute('DROP TABLE oldmap')
         cur.execute('DROP TABLE assign')
+        cur.execute('DROP TABLE keep_rows')
+        cur.execute('DROP TABLE keep_docs')
         con.commit()
         con.execute('DETACH DATABASE rep')
 
@@ -408,6 +459,177 @@ def import_all(outdir, migrate_legacy=False):
             counts['migrated'] = migrate_legacy_decisions(con, outdir)
         counts['seconds'] = round(time.time() - t0, 1)
         return counts
+    finally:
+        con.close()
+
+
+def import_book_scan(outdir, result):
+    """Merge ONE book's scan into `findings`, additively.
+
+    Unlike :func:`import_all` — which rebuilds the whole table from report.db —
+    this touches only the rows of the scanned book:
+
+    * rows of other books are never read or rewritten, so a book scan cannot
+      disturb the rest of the review;
+    * rows of *this* book are replaced (a re-scan is the new truth for it, not
+      a second copy), and their review decisions are carried over by the same
+      ``(family, word, unit, errtype, ref)`` + sequence identity ``import_all``
+      uses, so approving a finding and re-scanning does not lose the approval;
+    * ids are allocated above a monotonic high-water mark (``meta.max_finding_id``)
+      rather than the live ``MAX(id)``. Deleting this book's rows can lower
+      ``MAX(id)``, and reissuing those ids would silently attach this book's
+      new findings to another book's leftover ``history`` rows — an undo would
+      then write a decision onto the wrong finding.
+
+    Which rows belong to the book
+    -----------------------------
+    ``doc`` is the book identity, but ``import_all`` leaves ``doc`` NULL for the
+    ``extra_space`` and ``tokdiag`` families (report.db carries no doc for
+    them). Matching on ``doc`` alone would leave those full-scan rows behind:
+    the user re-scans a book, is told it was refreshed, and still sees hundreds
+    of stale findings a current scan would not produce — and the extra_space
+    ones would be duplicated, since a book scan *does* emit that family with a
+    doc set. So the book's rows are ``doc = ?`` OR the NULL-doc rows whose
+    ``source`` (book title) is this book's.
+
+    A book that yields no findings still counts as scanned: its old rows are
+    removed, which is the correct outcome for a book the user has just fixed.
+
+    Returns a dict of counts (added / replaced / preserved decisions).
+    """
+    doc = result.get('doc')
+    if not doc:
+        raise ValueError(hebrew.SCAN_MESSAGES['book_no_doc'])
+    title = result.get('title') or ''
+    # rows of this book: its own doc, plus the doc-less full-scan families
+    # (extra_space / tokdiag) that belong to it by title
+    where = '(f.doc = ? OR (f.doc IS NULL AND f.source = ?))'
+    wparams = (doc, title)
+    con = connect(outdir)
+    try:
+        cur = con.cursor()
+        cur.execute('BEGIN IMMEDIATE')
+
+        # -- remember the decisions currently attached to this book ---------
+        cur.execute(f'''CREATE TEMP TABLE oldbook AS
+            SELECT f.id AS id, f.family AS family,
+                   COALESCE(f.word,'') AS w, COALESCE(f.unit,'') AS u,
+                   f.errtype AS errtype, COALESCE(f.ref,'') AS r,
+                   ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
+                                      ORDER BY f.id) AS seq
+            FROM findings f WHERE {where}''', wparams)
+        old_total = cur.execute('SELECT COUNT(*) FROM oldbook').fetchone()[0]
+        cur.execute('''CREATE TEMP TABLE oldrev AS
+            SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
+                   r.status, r.note, r.custom_suggestion, r.updated_at
+            FROM oldbook o JOIN review r ON r.finding_id = o.id''')
+
+        # -- out with the old rows of this book ------------------------------
+        cur.execute('DELETE FROM review WHERE finding_id IN '
+                    '(SELECT id FROM oldbook)')
+        # history rows of removed findings would otherwise dangle onto whatever
+        # id is issued next
+        cur.execute('DELETE FROM history WHERE finding_id IN '
+                    '(SELECT id FROM oldbook)')
+        cur.execute(f'DELETE FROM findings WHERE {where.replace("f.", "")}',
+                    wparams)
+
+        # -- in with the new -------------------------------------------------
+        # Staged in a temp table so `rank` and `verified` can be computed by
+        # the very same RANK_SQL / VERIFIED_SQL expressions import_all uses —
+        # re-deriving the formula in Python here would be a second source of
+        # truth that could silently drift from core.py.
+        # `rank` for non-error families is log-scaled in Python (as in
+        # import_all): SQLite's LOG() is a compile-time option and must not be
+        # relied on — the frozen build may ship without it.
+        cur.execute('''CREATE TEMP TABLE bimp(
+            family TEXT, errtype TEXT, word TEXT, suggestion TEXT,
+            score REAL, ctx_hits INT, sugg_local INT, book_repeat INT,
+            tanach INT, origin TEXT, source TEXT, ref TEXT, unit TEXT,
+            snippet TEXT, extra TEXT, flat_rank REAL)''')
+        extra_json = json.dumps({'book_scan': True,
+                                 'ctx_scope': result.get('ctx_scope')},
+                                ensure_ascii=False)
+        err_rows = [('error', r.get('errtype') or '', r.get('word'),
+                     r.get('suggestion'), float(r.get('score') or 0.0),
+                     int(r.get('ctx_hits') or 0), int(r.get('sugg_local') or 0),
+                     int(r.get('book_repeat') or 0), int(r.get('tanach') or 0),
+                     r.get('origin'), r.get('source'), r.get('ref'),
+                     r.get('unit'), r.get('snippet'), extra_json, None)
+                    for r in (result.get('findings') or [])]
+        space_rows = []
+        for r in result.get('space_errors') or []:
+            jf = int(r.get('join_freq') or 0)
+            space_rows.append((
+                'extra_space', 'extra_space',
+                (r.get('part1') or '') + ' ' + (r.get('part2') or ''),
+                r.get('joined'), float(jf), None, None, None, None,
+                r.get('origin'), r.get('source'), r.get('ref'), r.get('unit'),
+                r.get('snippet'),
+                json.dumps({'part1': r.get('part1'), 'part2': r.get('part2'),
+                            'joined': r.get('joined'), 'join_freq': jf,
+                            'book_scan': True}, ensure_ascii=False),
+                round(math.log10(jf + 1), 2)))
+        cur.executemany('INSERT INTO bimp VALUES(' + ','.join('?' * 16) + ')',
+                        err_rows + space_rows)
+
+        cols = ('family, errtype, word, suggestion, score, rank, ctx_hits, '
+                'sugg_local, book_repeat, tanach, verified, origin, source, '
+                'ref, unit, doc, snippet, extra')
+        # Monotonic id high-water mark. MAX(id) alone is unsafe here: this
+        # book's rows were just deleted, so if they held the highest ids those
+        # ids would be reissued to a *different* book's findings — and any
+        # history row still pointing at them (undo) would then act on the wrong
+        # finding. The mark only ever grows.
+        max_id = cur.execute(
+            'SELECT COALESCE(MAX(id), 0) FROM findings').fetchone()[0]
+        row = cur.execute(
+            "SELECT value FROM meta WHERE key='max_finding_id'").fetchone()
+        try:
+            max_id = max(max_id, int(row[0])) if row else max_id
+        except (TypeError, ValueError):
+            pass
+        cur.execute(f'''INSERT INTO findings(id, {cols})
+            SELECT ? + ROW_NUMBER() OVER (ORDER BY rowid),
+                   family, errtype, word, suggestion, score,
+                   CASE WHEN family = 'error' THEN ROUND({RANK_SQL}, 2)
+                        ELSE flat_rank END,
+                   ctx_hits, sugg_local, book_repeat, tanach,
+                   CASE WHEN family = 'error' AND ({VERIFIED_SQL})
+                        THEN 1 ELSE 0 END,
+                   origin, source, ref, unit, ?, snippet, extra
+            FROM bimp ORDER BY rowid''', (max_id, doc))
+        added = cur.rowcount
+        cur.execute('DROP TABLE bimp')
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('max_finding_id', ?)",
+                    (str(max_id + added),))
+
+        # -- carry the old decisions onto the matching new rows -------------
+        cur.execute(f'''CREATE TEMP TABLE newbook AS
+            SELECT f.id AS id, f.family AS family,
+                   COALESCE(f.word,'') AS w, COALESCE(f.unit,'') AS u,
+                   f.errtype AS errtype, COALESCE(f.ref,'') AS r,
+                   ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
+                                      ORDER BY f.id) AS seq
+            FROM findings f WHERE f.doc = ? AND f.id > ?''', (doc, max_id))
+        cur.execute('''INSERT OR REPLACE INTO review(
+                finding_id, status, note, custom_suggestion, updated_at)
+            SELECT n.id, o.status, o.note, o.custom_suggestion, o.updated_at
+            FROM newbook n JOIN oldrev o
+              ON o.family = n.family AND o.w = n.w AND o.u = n.u
+             AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
+        preserved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
+                    (_now(),))
+        for t in ('oldbook', 'oldrev', 'newbook'):
+            cur.execute(f'DROP TABLE {t}')
+        con.commit()
+        return {'doc': doc, 'title': result.get('title'),
+                'added': added, 'replaced': old_total,
+                'preserved': preserved,
+                'findings': len(result.get('findings') or []),
+                'space_errors': len(result.get('space_errors') or [])}
     finally:
         con.close()
 

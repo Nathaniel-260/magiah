@@ -65,7 +65,7 @@ def _pause(msg):
         pass
 
 
-STAGES = ('lexicon', 'calibrate', 'detect', 'locate', 'report', 'all')
+STAGES = ('lexicon', 'calibrate', 'detect', 'locate', 'report', 'all', 'book')
 
 
 def main():

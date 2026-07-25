@@ -1383,31 +1383,40 @@ function renderHelp() {
 }
 
 /* ------------------------------------------------ file-based units (§9c) */
+/* Two prefixes carry a path + line number:
+     file:<repo-relpath>:<lineno>   — a book inside the library repo
+     local:<absolute-path>:<lineno> — a .txt scanned from anywhere on disk
+   The absolute form already IS the full path, so it must not be joined onto
+   the repo root. Both split from the RIGHT: a Windows path contains ':'. */
 function parseFileUnit(unit) {
-  if (typeof unit !== "string" || unit.indexOf("file:") !== 0) return null;
-  const body = unit.slice(5);
+  if (typeof unit !== "string") return null;
+  let abs = false, body;
+  if (unit.indexOf("file:") === 0) body = unit.slice(5);
+  else if (unit.indexOf("local:") === 0) { body = unit.slice(6); abs = true; }
+  else return null;
   const i = body.lastIndexOf(":");
   if (i < 1) return null;
   const ln = body.slice(i + 1);
   if (!/^\d+$/.test(ln)) return null;
-  return { rel: body.slice(0, i), lineno: parseInt(ln, 10) };
+  return { rel: body.slice(0, i), lineno: parseInt(ln, 10), abs: abs };
 }
 
-function fileUnitFullPath(rel) {
-  const root = SCAN.cfg && SCAN.cfg.corpus && SCAN.cfg.corpus.library_dir;
+function fileUnitFullPath(rel, abs) {
   const winRel = rel.replace(/\//g, "\\");
+  if (abs) return winRel;                       // already an absolute path
+  const root = SCAN.cfg && SCAN.cfg.corpus && SCAN.cfg.corpus.library_dir;
   return root ? root.replace(/[\\\/]+$/, "") + "\\" + winRel : winRel;
 }
 
-async function copyFilePath(rel) {
-  if (!SCAN.cfg) { try { await loadScanConfig(); } catch (e) {} }
-  copyText(fileUnitFullPath(rel));
+async function copyFilePath(rel, abs) {
+  if (!abs && !SCAN.cfg) { try { await loadScanConfig(); } catch (e) {} }
+  copyText(fileUnitFullPath(rel, abs));
 }
 
 /* path + 1-based line number + copy button, for findings scanned from files */
 function fileUnitNode(pf) {
   const btn = el("button", { class: "copy-path", title: "העתקת נתיב הקובץ המלא" }, "📋 נתיב");
-  btn.addEventListener("click", ev => { ev.stopPropagation(); copyFilePath(pf.rel); });
+  btn.addEventListener("click", ev => { ev.stopPropagation(); copyFilePath(pf.rel, pf.abs); });
   return el("span", { class: "file-unit" },
     el("bdi", { class: "file-path", title: pf.rel }, pf.rel),
     el("span", { class: "file-line" }, " · שורה " + fmtNum(pf.lineno + 1)),
@@ -1470,6 +1479,7 @@ function hebrewResult(resp, fallback) {
 function bindScanModal() {
   $("#btnScan").addEventListener("click", openScanModal);
   bindScanRun();
+  bindBookScan();
   $("#scanClose").addEventListener("click", closeScanModal);
   $("#scanScrim").addEventListener("click", closeScanModal);
   $("#scanRefresh").addEventListener("click", async () => {
@@ -1510,7 +1520,7 @@ function bindScanModal() {
 }
 
 /* ------------------------------------------------ §9d — run scan from UI */
-const SCAN = { cfg: null, pollTimer: null, lastState: "idle" };
+const SCAN = { cfg: null, pollTimer: null, lastState: "idle", statusSeq: 0 };
 
 /* fallback Hebrew stage names — real ones come from /api/scan/config */
 const STAGE_HEBREW = {
@@ -1638,7 +1648,10 @@ function renderScanProgress(st) {
 
   // stage line: "שלב X מתוך Y: <name>"
   const stageLine = $("#scanStageLine");
-  if (running && stageKey && total) {
+  if (running && st.is_book) {
+    // one indivisible stage — there is no "stage i of n" to report
+    stageLine.textContent = "סורק ספר בודד מול המילון הקיים…";
+  } else if (running && stageKey && total) {
     stageLine.textContent = "שלב " + fmtNum(idx + 1) + " מתוך " + fmtNum(total) + ": " + stageHebrew(stageKey);
   } else if (st.state === "done") {
     stageLine.textContent = "כל השלבים הושלמו ✓";
@@ -1656,16 +1669,23 @@ function renderScanProgress(st) {
   if (st.state === "done") pct = 100;
   pct = Math.min(100, Math.round(pct * 10) / 10);
   const bar = $("#scanBar");
-  bar.style.width = pct + "%";
+  const cd = Number(st.chunk_done) || 0, ctot = Number(st.chunk_total) || 0;
+  // A book scan reports no chunks, so there is no honest percentage to show:
+  // use an indeterminate (animated) bar rather than a bar frozen at 0%.
+  const indet = running && st.is_book && ctot === 0;
+  bar.classList.toggle("indet", indet);
+  // a book scan that failed/was cancelled has no meaningful percentage; let
+  // the bar stay full and turn red instead of visibly draining to 0%
+  const bookEnded = st.is_book && !running && st.state !== "idle";
+  bar.style.width = (indet || bookEnded) ? "100%" : pct + "%";
   bar.classList.toggle("done", st.state === "done");
   bar.classList.toggle("err", st.state === "failed" || st.state === "cancelled");
 
   // chunk text (only when a chunk total is known)
-  const cd = Number(st.chunk_done) || 0, ctot = Number(st.chunk_total) || 0;
   $("#scanChunkText").textContent = (running && ctot > 0)
     ? "נתח " + fmtNum(cd) + " מתוך " + fmtNum(ctot)
     : "";
-  $("#scanPctText").textContent = pct + "%";
+  $("#scanPctText").textContent = (indet || bookEnded) ? "" : pct + "%";
   $("#scanElapsed").textContent = "זמן שחלף: " + fmtElapsed(st.elapsed);
 
   // lexicon-is-longest note — only during the lexicon stage
@@ -1679,6 +1699,8 @@ function renderScanStatus(st) {
   panel.hidden = st.state === "idle" && !(st.log_tail || []).length;
   let txt = st.hebrew_state || st.state;
   if (st.started_at) txt += " · התחילה: " + st.started_at;
+  // the backend's precise Hebrew reason is far more useful than "נכשלה"
+  if (st.state === "failed" && st.error) txt += " — " + st.error;
   line.textContent = txt;
   line.className = running ? "run" : (st.state === "done" ? "ok" : (st.state === "idle" ? "" : "err"));
   renderScanProgress(st);
@@ -1688,27 +1710,49 @@ function renderScanStatus(st) {
   if (atBottom) log.scrollTop = log.scrollHeight;
   $("#scanStart").hidden = running;
   $("#scanCancel").hidden = !running;
-  $("#scanRefreshAfter").hidden = st.state !== "done";
+  // a book scan merges its findings itself, so there is nothing to refresh
+  $("#scanRefreshAfter").hidden = st.state !== "done" || !!st.is_book;
   if (running) startScanPolling();
   else stopScanPolling();
   if (SCAN.lastState === "running" && !running) {
-    if (st.state === "done") toast("הסריקה הושלמה — אפשר לרענן את הממצאים", "ok", 8000);
-    else if (st.state === "failed") toast("הסריקה נכשלה — ראו את יומן הריצה", "err", 8000);
+    if (st.state === "done" && st.is_book) {
+      const r = (st.book && st.book.result) || {};
+      const name = (st.book && st.book.title) || "הספר";
+      // `added` is every merged row; `findings` counts only the error family
+      toast("סריקת «" + name + "» הושלמה: " + fmtNum(r.added || 0) +
+            " ממצאים" +
+            (r.replaced ? " (הוחלפו " + fmtNum(r.replaced) + " קודמים)" : "") +
+            (r.preserved ? ", " + fmtNum(r.preserved) + " החלטות נשמרו" : ""),
+            "ok", 9000);
+      // the findings are already merged — reload the views, but leave the
+      // panel open so the user can read the log and scan another book
+      reloadAfterBookScan();
+    }
+    else if (st.state === "done") toast("הסריקה הושלמה — אפשר לרענן את הממצאים", "ok", 8000);
+    else if (st.state === "failed") toast("הסריקה נכשלה: " + (st.error || "ראו את יומן הריצה"), "err", 10000);
     else if (st.state === "cancelled") toast("הסריקה בוטלה", "", 5000);
   }
   SCAN.lastState = st.state;
 }
 
-async function syncScanStatusOnce() {
-  try { renderScanStatus(await api("/api/scan/status")); } catch (e) {}
+/* The poller and syncScanStatusOnce race: a slow "running" response can land
+   after a newer "done" one and reset SCAN.lastState, which re-fires the
+   completion branch (duplicate toast + a second full reload). Drop any
+   response older than the newest one already rendered. */
+async function fetchScanStatus() {
+  const seq = ++SCAN.statusSeq;
+  let st;
+  try { st = await api("/api/scan/status"); }
+  catch (e) { return; }
+  if (seq !== SCAN.statusSeq) return;
+  renderScanStatus(st);
 }
+
+async function syncScanStatusOnce() { await fetchScanStatus(); }
 
 function startScanPolling() {
   if (SCAN.pollTimer) return;
-  SCAN.pollTimer = setInterval(async () => {
-    try { renderScanStatus(await api("/api/scan/status")); }
-    catch (e) { /* keep polling; server may be busy */ }
-  }, 2000);
+  SCAN.pollTimer = setInterval(fetchScanStatus, 2000);
 }
 function stopScanPolling() {
   if (SCAN.pollTimer) { clearInterval(SCAN.pollTimer); SCAN.pollTimer = null; }
@@ -1745,6 +1789,131 @@ function bindScanRun() {
       afterDataChanged();
     } catch (e) { toast("הרענון נכשל: " + e.message, "err", 8000); }
   });
+}
+
+/* -------------------------------------------- single-book scan (fast path) */
+const BS = { source: "db", chosen: null, seq: 0 };
+
+function bsSource() {
+  const r = $("#bsSources input:checked");
+  return r ? r.value : "db";
+}
+
+function bsUpdateRows() {
+  const isFile = bsSource() === "file";
+  $("#bsPickRow").hidden = isFile;
+  $("#bsFileRow").hidden = !isFile;
+}
+
+function bsSetChosen(book) {
+  BS.chosen = book;
+  const box = $("#bsChosen");
+  if (!book) { box.hidden = true; box.replaceChildren(); return; }
+  box.hidden = false;
+  box.replaceChildren(
+    "📖 ייסרק: " + book.title,
+    book.origin ? el("span", { class: "bs-org" }, "  · " + book.origin) : null,
+    book.path ? el("span", { class: "bs-path" }, book.path) : null
+  );
+}
+
+async function bsSearch() {
+  // bump FIRST: an early return must still invalidate any in-flight request,
+  // or a response for a query the user already cleared repaints the list
+  const seq = ++BS.seq;
+  const src = bsSource();
+  if (src === "file") return;
+  const q = $("#bsSearch").value.trim();
+  const box = $("#bsResults");
+  if (!q) { box.replaceChildren(el("div", { class: "empty" }, "הקלד כדי לחפש ספר…")); return; }
+  box.replaceChildren(el("div", { class: "empty" }, "מחפש…"));
+  // search the corpus the scan will actually use — the paths in the full-scan
+  // panel above, not whatever run_config.json happens to hold
+  const corpus = collectScanRequest().corpus || {};
+  let data;
+  try {
+    data = await api("/api/scan/books?source=" + encodeURIComponent(src) +
+                     "&q=" + encodeURIComponent(q) + "&limit=100" +
+                     "&library_dir=" + encodeURIComponent(corpus.library_dir || "") +
+                     "&db_path=" + encodeURIComponent(corpus.db_path || ""));
+  } catch (e) {
+    if (seq === BS.seq) box.replaceChildren(el("div", { class: "empty" }, "החיפוש נכשל: " + e.message));
+    return;
+  }
+  if (seq !== BS.seq) return;
+  const books = (data && data.books) || [];
+  if (!books.length) { box.replaceChildren(el("div", { class: "empty" }, "לא נמצאו ספרים מתאימים")); return; }
+  box.replaceChildren(...books.map(b => {
+    // several library books can share a filename (three different ספר רשות),
+    // so show the folder that tells them apart
+    const dir = b.path ? b.path.replace(/\/[^/]*$/, "") : "";
+    const row = el("div", { class: "bs-item", title: b.path || b.title },
+      el("span", { class: "bs-ttl" }, b.title,
+        dir ? el("span", { class: "bs-path" }, dir) : null),
+      el("span", { class: "bs-org" }, b.origin || ""));
+    row.addEventListener("click", () => {
+      $$("#bsResults .bs-item").forEach(x => x.classList.remove("on"));
+      row.classList.add("on");
+      bsSetChosen(b);
+    });
+    return row;
+  }));
+}
+
+function bindBookScan() {
+  $$("#bsSources input").forEach(r => r.addEventListener("change", () => {
+    bsUpdateRows();
+    bsSetChosen(null);
+    $("#bsResults").replaceChildren(el("div", { class: "empty" }, "הקלד כדי לחפש ספר…"));
+    bsSearch();
+  }));
+  $("#bsSearch").addEventListener("input", debounce(bsSearch, 300));
+  bsUpdateRows();
+
+  $("#bsStart").addEventListener("click", async () => {
+    const src = bsSource();
+    let key = null, label = "";
+    if (src === "file") {
+      key = $("#bsFilePath").value.trim();
+      label = key;
+      if (!key) { toast("יש להזין נתיב לקובץ", "err"); return; }
+    } else {
+      if (!BS.chosen) { toast("יש לבחור ספר מהרשימה", "err"); return; }
+      key = BS.chosen.key;
+      label = BS.chosen.title;
+    }
+    const verify = $("#bsVerifyCtx").checked;
+    if (!confirm("לסרוק את «" + label + "»?\n\n" +
+                 "הסריקה מתבססת על המילון הקיים ואורכת שניות." +
+                 (verify ? "\n\n⚠ סימנת «אימות הקשר מול כל המאגר» — הסריקה " +
+                           "תימשך כ־10 דקות במקום שניות." : "") +
+                 "\n\nממצאים קודמים של ספר זה יוחלפו; ההחלטות שלך עליהם יישמרו.")) return;
+    const req = collectScanRequest();
+    try {
+      const r = await api("/api/scan/book", {
+        method: "POST",
+        body: { source: src, book: key, verify_ctx: verify,
+                config: req.config, corpus: req.corpus },
+      });
+      toast((r && r.message) || "סריקת הספר הופעלה", "ok");
+      $("#scanRunSection").setAttribute("open", "");
+      renderScanStatus((r && r.status) || { state: "running", log_tail: [] });
+    } catch (e) {
+      toast("הפעלת סריקת הספר נכשלה: " + e.message, "err", 9000);
+    }
+  });
+}
+
+/* Same refresh as afterDataChanged, minus closing the modal: a book scan is
+   short and usually repeated for the next book, so the panel stays open. */
+async function reloadAfterBookScan() {
+  S.lastActions = [];
+  S.sel.clear();
+  S.cardStale = true;
+  try { S.meta = await api("/api/meta"); buildSidebar(); } catch (e) {}
+  loadBooks();
+  refreshCurrentView();
+  updateProgress();
 }
 
 async function afterDataChanged() {

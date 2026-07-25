@@ -256,6 +256,87 @@ The user updates books in their local copy of the otzaria-library repo (text fil
 - Backend: `POST /api/scan/start` (writes run_config.json, launches `python -X utf8 -m magiah <stages>` as a subprocess with the chosen flags), `GET /api/scan/status` (state + tail of captured log lines, polled by UI), `POST /api/scan/cancel`. Only one scan at a time; UI shows live log + progress; on completion offer "רענן ממצאים" (§9b refresh). Scan settings persist in run_config.json (single source of truth, same file the CLI uses).
 - Hebrew explanations for every threshold go in hebrew.py (CONFIG_LABELS dict).
 
+## 9e. Single-book scan — check one book in seconds (user note #10)
+
+**Problem.** The full pipeline flags word *types* across the whole 417M-token
+corpus and then locates them (30–45 min). To check one book — one just typed,
+one just corrected, one out of the library — nearly all of that is wasted:
+only the types that occur *in that book* can yield findings there.
+
+**Approach.** Invert the pipeline: read the book first, then apply the same
+per-word rules to just the types present in it, scoring against the **existing**
+`lexicon.pkl`. The lexicon is never rebuilt — that is the hard requirement.
+Cost: seconds (measured: 2s for a 336-line book, 47s for a 22k-line one).
+
+- `magiah/book_source.py` — resolve and read ONE book from three sources,
+  reproducing the identity conventions of §9c exactly, so a book scanned alone
+  lands on precisely the rows a full scan produced for it:
+
+  | source | doc | unit |
+  |---|---|---|
+  | `db` | `str(bookId)` | `str(line.id)` |
+  | `library` | repo relpath | `file:<relpath>:<lineno>` |
+  | `file` | `local:<abspath>` | `local:<abspath>:<lineno>` |
+
+  A `file` path *inside* the configured repo is promoted to a `library` book,
+  so re-scanning an edited file updates the right rows instead of forking a
+  parallel `local:` copy.
+
+- `magiah/book_scan.py` — detection. Rules are **imported from core.py**, never
+  re-implemented (`_dld1`, `_segment`, `_frequent_stem`, the CONFUSABLE /
+  prefix / suffix tables), so the two cannot drift. Candidate generation
+  necessarily differs — per-word lexicon probing instead of a global deletion
+  index — and was verified equivalent on 4,000 real rare words (0 mismatches).
+  Where a single book cannot answer what the corpus answers, the difference is
+  explicit, never faked: see the module docstring for `missing_space`,
+  `ctx_hits` and `book_repeat`. Opt-in `verify_context()` upgrades `ctx_hits`
+  to the true corpus-wide count via `core._ctx_count_chunk` (one full pass,
+  ~10 min — off by default).
+
+- `db.import_book_scan(outdir, result)` — the additive merge. Unlike
+  `import_all` (which rebuilds the whole table from report.db) it touches only
+  the scanned book's rows: deletes them, inserts the new ones, and carries
+  review decisions across with the same `(family, word, unit, errtype, ref)` +
+  sequence identity `import_all` uses. `rank`/`verified` are computed by the
+  shared `RANK_SQL`/`VERIFIED_SQL`, never re-derived in Python. Whole thing
+  runs in one `BEGIN IMMEDIATE` transaction. Three subtleties, each of which
+  was a real bug before it was handled:
+
+  * **Which rows are "the book's".** `import_all` leaves `doc` NULL for the
+    `extra_space` and `tokdiag` families (report.db has no doc for them), so
+    `WHERE doc = ?` alone leaves them behind — the user is told the book was
+    re-scanned while still seeing hundreds of stale rows, and the extra_space
+    ones get duplicated (a book scan emits that family *with* a doc). The
+    predicate is therefore `doc = ? OR (doc IS NULL AND source = <title>)`.
+  * **Ids are never recycled.** Allocation is from a monotonic
+    `meta.max_finding_id`, not the live `MAX(id)`: deleting this book can lower
+    `MAX(id)`, and reissuing those ids would let a stale `history` row make an
+    undo write a decision onto a *different* book's finding. `history` rows of
+    removed findings are deleted too.
+  * **`import_all` must not undo a book scan.** A book scanned only via the
+    fast path has no rows in report.db, so the rebuild would erase it and every
+    decision on it. `import_all` now carries such books across untouched
+    (reported as `book_scan_kept`); a book present in both is still rebuilt
+    from report.db, which is the newer corpus-wide truth for it.
+
+- Backend: `GET /api/scan/books?source=&q=` (book picker),
+  `POST /api/scan/book {source, book, verify_ctx, config, corpus}`. It runs in
+  a thread (not a subprocess — it is seconds of work and merges its own
+  results), sharing `_state`/`_lock` with the full-scan runner so the two can
+  never run at once. `get_status()` gains `is_book`, and `book.result` carries
+  the added/replaced/preserved counts. No "רענן ממצאים" step: the UI reloads
+  its views the moment the scan finishes.
+
+- Frontend: `#bookScanSection` in the scan modal — source radios, search-as-you
+  type picker (or a path field for `file`), the opt-in context checkbox, and an
+  indeterminate progress bar (a book scan reports no chunk counters, so a
+  percentage would be dishonestly frozen at 0%).
+
+**Recall vs a full scan** (22k-line real book, 2,269 full-scan findings):
+99.6% of flagged words reproduced; the remainder are `missing_space` splits
+whose only evidence is corpus-scale. The book scan also surfaced correct
+findings the full scan missed.
+
 ## 10. Non-goals
 
 - No auth/multi-user; localhost only.

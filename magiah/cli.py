@@ -50,6 +50,63 @@ def _save_run_config(out_dir, spec, cfg):
                   ensure_ascii=False, indent=2)
 
 
+def _guess_book_source(key):
+    """db id | existing file path | library relpath — in that order."""
+    key = str(key).strip()
+    if key.isdigit():
+        return 'db'
+    if os.path.isfile(key):
+        return 'file'
+    return 'library'
+
+
+def _run_book_cmd(args, spec, cfg, out_dir):
+    """`magiah book` — scan one book, or list the books to choose from."""
+    from . import book_scan, book_source
+
+    db_path = spec.get('db') if spec.get('type') != 'sqlite' \
+        else spec.get('path')
+    library_dir = spec.get('path') if spec.get('type') in ('hybrid',
+                                                           'library') else None
+
+    if args.book_list is not None:
+        src = args.book_source or 'db'
+        try:
+            if src == 'db':
+                books = book_source.list_db_books(db_path, args.book_list)
+            else:
+                books = book_source.list_library_books(library_dir,
+                                                       args.book_list)
+        except book_source.BookNotFound as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
+        for b in books:
+            print(f"{b['key']}\t{b['title']}\t{b['origin']}", flush=True)
+        print(f'-- {len(books)} books', flush=True)
+        return 0
+
+    if not args.book:
+        print('יש לציין ספר לסריקה: --book <מזהה/נתיב>  '
+              '(או --book-list כדי לראות את הרשימה)',
+              file=sys.stderr, flush=True)
+        return 1
+    source = args.book_source or _guess_book_source(args.book)
+    try:
+        result = book_scan.scan_book(
+            out_dir, source, args.book, cfg=cfg, db_path=db_path,
+            library_dir=library_dir, verify_ctx=args.book_verify_ctx,
+            spec=spec, progress=lambda s: print(s, flush=True))
+    except (book_scan.BookScanError, book_source.BookNotFound) as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
+    from .webui import db as uidb
+    counts = uidb.import_book_scan(out_dir, result)
+    print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
+          f"הוחלפו {counts['replaced']:,}, "
+          f"נשמרו {counts['preserved']:,} החלטות", flush=True)
+    return 0
+
+
 def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -62,7 +119,24 @@ def main(argv=None):
                     'dictionary.')
     ap.add_argument('command',
                     choices=['lexicon', 'calibrate', 'detect', 'locate',
-                             'report', 'review', 'ui', 'all'])
+                             'report', 'review', 'ui', 'all', 'book'])
+    bk = ap.add_argument_group(
+        'book: scan a single book against the existing lexicon')
+    bk.add_argument('--book', metavar='KEY',
+                    help='the book to scan: a seforim.db book id, a path '
+                         'relative to the library repo, or a .txt file path '
+                         '(see --book-source)')
+    bk.add_argument('--book-source', choices=['db', 'library', 'file'],
+                    default=None,
+                    help='where --book comes from (default: guessed — a '
+                         'number is a db id, an existing path is a file, '
+                         'anything else a library relpath)')
+    bk.add_argument('--book-list', metavar='QUERY', nargs='?', const='',
+                    help='list matching books instead of scanning; combine '
+                         'with --book-source (default: db)')
+    bk.add_argument('--book-verify-ctx', action='store_true',
+                    help='verify corrections against the whole corpus '
+                         '(slower, matches a full scan more closely)')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')
@@ -121,6 +195,8 @@ def main(argv=None):
     _save_run_config(out_dir, spec, cfg)
 
     try:
+        if args.command == 'book':
+            return _run_book_cmd(args, spec, cfg, out_dir)
         if args.command in ('lexicon', 'all'):
             core.build_lexicon(spec, cfg, out_dir)
         if args.command == 'calibrate':

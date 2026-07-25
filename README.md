@@ -116,6 +116,30 @@ magiah locate    --out results
 magiah report    --out results
 ```
 
+**Scan a single book** (seconds instead of an hour):
+
+```bash
+magiah book --book-list "Bartenura" --out results  # find a book
+magiah book --book 593 --out results               # a seforim.db book id
+magiah book --book "books/halacha/x.txt" --out results  # a library relpath
+magiah book --book "C:\new book.txt" --out results      # any .txt on disk
+```
+
+Scans one book against the **already-built** lexicon — the lexicon is never
+rebuilt, which is what makes this cost seconds. Every correction candidate is
+still scored against whole-corpus frequencies, so detection quality matches a
+full scan.
+
+Findings are merged **additively** into `ui_review.db`. If the book was scanned
+before, its rows are replaced in place (no duplicates) and your review
+decisions on them are preserved; other books are untouched.
+
+`--book-verify-ctx` additionally verifies each correction against the entire
+corpus (more accurate, adds ~10 min). Without it, verification is book-local.
+
+> Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
+> `all`) run.
+
 **Review the findings** in your browser:
 
 ```bash

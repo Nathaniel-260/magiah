@@ -205,6 +205,46 @@
         </div>
       </div>
     </details>
+    <details id="bookScanSection">
+      <summary>📖 סריקת ספר בודד — מהירה, על בסיס המילון הקיים</summary>
+      <div class="scanrun">
+        <p class="bs-intro">
+          סורק ספר אחד בלבד מול המילון שכבר נבנה — <b>שניות במקום שעה</b>.
+          המילון אינו נבנה מחדש.
+          הממצאים <b>מתווספים</b> לממצאים הקיימים; אם הספר כבר נסרק בעבר,
+          הממצאים שלו מתעדכנים במקומם וההחלטות שכבר קיבלת עליהם נשמרות.
+        </p>
+        <div class="f-group">
+          <label class="f-title">מקור הספר</label>
+          <div id="bsSources">
+            <label class="chk-row"><input type="radio" name="bsSource" value="db" checked>
+              <span>ספר ממסד הנתונים (seforim.db)<span class="mode-desc">בחירה מתוך כל ספרי אוצריא</span></span></label>
+            <label class="chk-row"><input type="radio" name="bsSource" value="library">
+              <span>ספר מריפו הספרייה<span class="mode-desc">קובצי otzaria-library המקומיים</span></span></label>
+            <label class="chk-row"><input type="radio" name="bsSource" value="file">
+              <span>קובץ מהמחשב<span class="mode-desc">כל קובץ טקסט — גם ספר שאינו בספרייה</span></span></label>
+          </div>
+        </div>
+        <div class="f-group" id="bsPickRow">
+          <label class="f-title" for="bsSearch">חיפוש ספר</label>
+          <input id="bsSearch" type="text" placeholder="הקלד חלק משם הספר…" autocomplete="off">
+          <div id="bsResults"><div class="empty">הקלד כדי לחפש ספר…</div></div>
+        </div>
+        <div class="f-group" id="bsFileRow" hidden>
+          <label class="f-title" for="bsFilePath">נתיב הקובץ</label>
+          <input id="bsFilePath" type="text" dir="ltr" placeholder="C:\OTZ\...\ספר.txt" autocomplete="off">
+        </div>
+        <div id="bsChosen" hidden></div>
+        <label class="chk-row bs-ctx"><input type="checkbox" id="bsVerifyCtx">
+          <span>אימות הקשר מול כל המאגר (איטי)
+            <span class="mode-desc">מאמת כל תיקון מוצעת מול הקורפוס כולו — מדויק יותר, אך
+              <b>מוסיף כ־10 דקות</b> לסריקה, ללא תלות בגודל הספר.
+              ללא סימון (מומלץ): האימות נעשה מול הספר עצמו והסריקה נמשכת שניות.</span></span></label>
+        <div class="scan-run-actions">
+          <button id="bsStart" class="btn primary">📖 סרוק ספר זה</button>
+        </div>
+      </div>
+    </details>
     <div class="scan-row">
       <button id="scanRefresh" class="btn primary">🔄 רענן מסריקה חדשה</button>
       <p>טוען מחדש את הממצאים מ־report.db לאחר הרצה חוזרת של הסריקה. החלטות על ממצאים שעדיין קיימים — נשמרות.</p>
@@ -279,6 +319,24 @@
 #scanStateLine.run { color: var(--accent); }
 #scanStateLine.ok { color: var(--green); }
 #scanStateLine.err { color: var(--red); }
+/* single-book scan panel */
+#bookScanSection { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 12px; background: var(--panel-2); }
+#bookScanSection > summary { cursor: pointer; font-weight: 700; padding: 10px 12px; list-style: none; }
+#bookScanSection > summary::-webkit-details-marker { display: none; }
+#bookScanSection[open] > summary { border-bottom: 1px solid var(--border); }
+.bs-intro { margin: 0 0 12px; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+#bsSearch, #bsFilePath { width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); }
+#bsFilePath { direction: ltr; text-align: left; }
+#bsResults { max-height: 210px; overflow-y: auto; margin-top: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); }
+#bsResults .empty { padding: 10px; color: var(--faint); font-size: 12.5px; }
+#bsResults .bs-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+#bsResults .bs-item:last-child { border-bottom: 0; }
+#bsResults .bs-item:hover, #bsResults .bs-item.on { background: var(--accent-soft); }
+#bsResults .bs-item .bs-org { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+#bsResults .bs-item .bs-ttl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bs-path { display: block; direction: ltr; text-align: right; color: var(--faint); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#bsChosen { margin: 10px 0 4px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--accent-soft); font-size: 13px; font-weight: 600; }
+.bs-ctx { margin-top: 10px; align-items: flex-start; }
 #scanLog { direction: ltr; text-align: left; unicode-bidi: plaintext; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; max-height: 220px; overflow: auto; font-family: Consolas, "Courier New", monospace; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; margin: 0; }
 </style>
 
