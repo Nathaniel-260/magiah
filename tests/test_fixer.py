@@ -22,6 +22,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -721,6 +722,48 @@ class TestApi(TempCase):
         self.call('/api/fixer/mode', {'key': key, 'mode': 'bracket'})
         _c, doc = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
         self.assertEqual(doc['default_mode'], 'bracket')
+
+    def test_a_drifted_book_applies_where_the_corrector_was_shown(self):
+        """The doc endpoint relocates a finding; the apply endpoint rebuilds
+        the line from the ORIGINAL unit. If the two ever disagreed, the edit
+        would land on the line the scan named rather than the line the
+        corrector saw marked — so pin that they agree.
+        """
+        before = ('כותרת\n'
+                  'הקדמה חדשה א\n'
+                  'הקדמה חדשה ב\n'
+                  'אמר רבי יותבת בן זומא בשם רבו\n')     # scanned as line 1
+        p = write(os.path.join(self.lib, 'זז.txt'), before)
+        con = db.connect(self.outdir)
+        con.execute(
+            'INSERT INTO findings(id, family, errtype, word, suggestion, '
+            'rank, verified, origin, source, ref, unit, doc, snippet) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (7, 'error', 'edit1_sub', 'יותבת', 'יושבת', 5.0, 1, 'o', 'זז',
+             'r', 'file:זז.txt:1', None, 'אמר רבי יותבת בן זומא בשם רבו'))
+        con.execute("INSERT INTO review VALUES(7,'approved',NULL,NULL,'t')")
+        con.commit()
+        con.close()
+
+        key = 'file:זז.txt'
+        code, d = self.call('/api/fixer/doc?' +
+                            urllib.parse.urlencode({'key': key}))
+        self.assertEqual(code, 200, d)
+        item = d['items'][0]
+        self.assertTrue(item['anchor']['ok'], item['anchor'])
+        self.assertEqual(item['lineno'], 3)          # relocated
+        self.assertEqual(item['anchor']['confidence'], 'moved')
+
+        code, res = self.call('/api/fixer/apply', {
+            'key': key, 'fingerprint': d['fingerprint'],
+            'items': [{'id': 7}]})
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res['applied'][0]['lineno'], 3)
+        after = text_of(p).splitlines()
+        self.assertIn('יושבת', after[3])
+        # the hand-inserted preface, and everything else, is untouched
+        self.assertEqual(after[:3],
+                         ['כותרת', 'הקדמה חדשה א', 'הקדמה חדשה ב'])
 
     def test_db_book_is_listed_but_not_editable(self):
         con = db.connect(self.outdir)
