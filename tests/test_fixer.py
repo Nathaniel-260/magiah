@@ -513,6 +513,65 @@ class TestDriftedLines(TempCase):
                 'correction': 'מחוז', 'snippet': 'ועוד אמר מחורז דבר'})
         self.assertEqual(cm.exception.code, 'token_not_found')
 
+    # -- parallel verses: the case that makes drift dangerous --------------
+    # Hebrew religious texts repeat long formulas verbatim across many
+    # verses. When a word has been hand-fixed, the nearest surviving copy is
+    # typically its TWIN a few lines down — a different passage that shares
+    # the formula. Relocating there writes the correction into the wrong
+    # verse, silently. These tests pin the discrimination.
+
+    FORMULA = "וידבר ה' אל משה לאמר דבר אל בני ישראל ואמרת אלהם"
+    VERSE_A = FORMULA + ' איש כי יהיה בו נגעימ בעור בשרו'
+    VERSE_B = FORMULA + ' אשה כי תזריע וילדה זכר נגעימ אחרים'
+
+    def _formulaic(self, **edits):
+        lines = ['%s פסוק מספר %d' % (self.FORMULA, i) for i in range(30)]
+        for n, text in edits.items():
+            lines[int(n[1:])] = text        # keys look like 'n10'
+        return lines
+
+    def test_a_hand_fix_never_relocates_onto_a_parallel_verse(self):
+        lines = self._formulaic(n10=self.VERSE_A.replace('נגעימ', 'נגעים'),
+                                n20=self.VERSE_B)
+        d = self.doc('\n'.join(lines) + '\n')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
+                                  'correction': 'נגעים',
+                                  'snippet': self.VERSE_A})
+        self.assertEqual(cm.exception.code, 'token_not_found')
+        # and the twin is untouched
+        self.assertIn('נגעימ', d.lines[20])
+
+    def test_two_viable_candidates_refuse_rather_than_pick_one(self):
+        lines = self._formulaic(n10=self.VERSE_A, n20=self.VERSE_B)
+        lines.insert(0, 'שורה שנוספה')      # everything drifts by one
+        d = self.doc('\n'.join(lines) + '\n')
+        with self.assertRaises(patcher.PatchError):
+            patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
+                                  'correction': 'נגעים',
+                                  'snippet': self.VERSE_A})
+
+    def test_genuine_drift_still_relocates_in_a_formulaic_book(self):
+        """The strict identity test must not make drift useless: a real
+        insertion in a formulaic book still relocates correctly."""
+        lines = self._formulaic(n10=self.VERSE_A)
+        lines.insert(0, 'שורה שנוספה')
+        d = self.doc('\n'.join(lines) + '\n')
+        plan = patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
+                                     'correction': 'נגעים',
+                                     'snippet': self.VERSE_A})
+        self.assertEqual(plan.lineno, 11)
+        self.assertTrue(plan.drifted)
+
+    def test_an_unchanged_book_is_fixed_in_place(self):
+        lines = self._formulaic(n10=self.VERSE_A)
+        d = self.doc('\n'.join(lines) + '\n')
+        plan = patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
+                                     'correction': 'נגעים',
+                                     'snippet': self.VERSE_A})
+        self.assertEqual(plan.lineno, 10)
+        self.assertFalse(plan.drifted)
+
 
 # ---------------------------------------------------------------------------
 # writing, backups, restore
