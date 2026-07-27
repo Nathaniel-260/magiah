@@ -275,6 +275,41 @@ class TestPlanAndApply(TempCase):
             results.append(doc.lines[0])
         self.assertEqual(len(set(results)), 1, results)
 
+    def test_bracket_mode_with_several_edits_on_one_line(self):
+        """Bracket mode makes each replacement LONGER than what it replaced,
+        so a line carrying three of them is the case where left-to-right
+        application would drift furthest off."""
+        doc = self.doc('אמר יותבת וגם מחורז ועוד יותבת בסוף')
+        plans, failures = patcher.plan_all(doc, [
+            {'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
+             'occurrence': 0, 'expected_count': 2},
+            {'id': 2, 'lineno': 0, 'word': 'מחורז', 'correction': 'מחוז'},
+            {'id': 3, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
+             'occurrence': 1, 'expected_count': 2}],
+            default_mode=patcher.MODE_BRACKET)
+        self.assertEqual(failures, [])
+        patcher.apply_edits(doc, plans)
+        self.assertEqual(
+            doc.lines[0],
+            'אמר (יושבת) [יותבת] וגם (מחוז) [מחורז] ועוד (יושבת) [יותבת] בסוף')
+
+    def test_mode_can_be_overridden_per_correction(self):
+        """A per-book default with a per-finding override: one correction in
+        brackets, the rest replaced outright, in a single write."""
+        doc = self.doc('אמר יותבת וגם מחורז ועוד יותבת בסוף')
+        plans, failures = patcher.plan_all(doc, [
+            {'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
+             'occurrence': 0, 'expected_count': 2},
+            {'id': 2, 'lineno': 0, 'word': 'מחורז', 'correction': 'מחוז'},
+            {'id': 3, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
+             'occurrence': 1, 'expected_count': 2}],
+            default_mode=patcher.MODE_REPLACE,
+            modes={2: patcher.MODE_BRACKET})
+        self.assertEqual(failures, [])
+        patcher.apply_edits(doc, plans)
+        self.assertEqual(doc.lines[0],
+                         'אמר יושבת וגם (מחוז) [מחורז] ועוד יושבת בסוף')
+
     def test_extra_space_multi_token(self):
         doc = self.doc('והנה הבת ל קוחה מבית אביה')
         plans, failures = patcher.plan_all(
