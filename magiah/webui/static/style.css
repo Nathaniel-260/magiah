@@ -804,7 +804,88 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 .pbar { height: 9px; background: var(--slate-soft); border-radius: 6px; overflow: hidden; }
 .pbar > div { height: 100%; background: var(--green); border-radius: 6px; transition: width .25s; }
 
-#fixList { display: grid; gap: 8px; }
+/* -- mode toggle (per book, and per row) -- */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.seg-btn {
+  border: 0; background: var(--panel-2); color: var(--text);
+  padding: 7px 13px; cursor: pointer; font-size: 13px; font-family: inherit;
+}
+.seg-btn:hover { background: var(--accent-soft); }
+.seg-btn.active { background: var(--accent); color: #fff; }
+.seg.mini .seg-btn { padding: 3px 8px; font-size: 11.5px; }
+
+/* -- banner: refusals, DB-only books, stale file -- */
+#fixerBanner {
+  background: var(--amber-soft); border: 1px solid var(--amber);
+  border-radius: var(--radius); padding: 10px 14px; margin-bottom: 10px;
+  font-size: 13.5px; line-height: 1.7;
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+#fixerBanner.err { background: var(--red-soft); border-color: var(--red); }
+#fixerBanner.ok { background: var(--green-soft); border-color: var(--green); }
+#fixerBanner .bn-text { flex: 1 1 260px; }
+#fixerBanner ul { margin: 4px 0 0; padding-inline-start: 18px; }
+#fixerBanner li { margin: 2px 0; }
+
+/* -- split: the book on the reading side, the worklist beside it -- */
+#fixerSplit {
+  display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px;
+  align-items: start; min-height: 0;
+}
+@media (max-width: 1150px) { #fixerSplit { grid-template-columns: 1fr; } }
+
+#fixDocWrap {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; min-width: 0;
+}
+#fixDocHead {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  padding: 7px 12px; border-bottom: 1px solid var(--border);
+  background: var(--panel-2); font-size: 11.5px; color: var(--muted);
+}
+#fixDocPath {
+  direction: ltr; unicode-bidi: embed; font-family: Consolas, "Courier New", monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#fixDocMeta { white-space: nowrap; }
+#fixDoc {
+  max-height: calc(100vh - var(--topbar-h) - 190px);
+  overflow: auto; padding: 10px 12px; line-height: 2.05; font-size: 16px;
+}
+#fixDoc:focus { outline: 2px solid var(--accent-soft); outline-offset: -2px; }
+.fdoc-line { display: grid; grid-template-columns: 4.5ch 1fr; gap: 10px; padding: 1px 3px; border-radius: var(--radius-sm); }
+.fdoc-line.has-fix { background: var(--amber-soft); }
+.fdoc-line.edited { background: var(--green-soft); }
+.fdoc-line.current { box-shadow: inset 0 0 0 2px var(--accent); }
+.fdoc-num {
+  direction: ltr; text-align: end; color: var(--faint); font-size: 11px;
+  font-family: Consolas, "Courier New", monospace; user-select: none;
+  padding-top: 5px;
+}
+.fdoc-text { word-break: break-word; min-width: 0; }
+.fdoc-gap {
+  text-align: center; color: var(--faint); font-size: 12px;
+  padding: 7px 0; margin: 5px 0; border-top: 1px dashed var(--border);
+  border-bottom: 1px dashed var(--border);
+}
+/* the highlighted word inside the book text */
+.fdoc-hit {
+  background: var(--amber-soft); border-bottom: 2px solid var(--amber);
+  border-radius: 3px; padding: 0 2px; cursor: pointer; color: inherit;
+}
+.fdoc-hit.st-approved { background: var(--red-soft); border-bottom-color: var(--red); }
+.fdoc-hit.st-unsure { background: var(--blue-soft); border-bottom-color: var(--blue); }
+.fdoc-hit.st-pending { background: var(--slate-soft); border-bottom-color: var(--slate); }
+.fdoc-hit.st-fixed, .fdoc-hit.applied { background: var(--green-soft); border-bottom-color: var(--green); }
+.fdoc-hit.amb { outline: 2px dashed var(--red); outline-offset: 1px; }
+.fdoc-hit.weak { border-bottom-style: dashed; }
+.fdoc-hit.current { box-shadow: 0 0 0 2px var(--accent); }
+.fdoc-hit:hover { filter: brightness(.95); }
+/* clickable token, when the corrector must point at the right occurrence */
+.fdoc-tok { cursor: pointer; border-radius: 3px; padding: 0 1px; }
+.fdoc-tok:hover { background: var(--accent-soft); outline: 1px solid var(--accent); }
+
+#fixList { display: grid; gap: 8px; align-content: start; max-height: calc(100vh - var(--topbar-h) - 190px); overflow-y: auto; }
 .fix-refgroup {
   font-weight: 700;
   color: var(--accent-strong);
@@ -825,10 +906,43 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 }
 .fix-row.current { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .fix-row.done-row { opacity: .45; }
+/* a finding the server refused to anchor: it must never be applied blindly */
+.fix-row.row-blocked { border-color: var(--red); background: var(--red-soft); }
 .fix-main { min-width: 0; }
-.fix-wordline { font-size: 17px; margin-bottom: 4px; }
+.fix-wordline { font-size: 17px; margin-bottom: 4px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .fix-wordline .arr { color: var(--faint); margin: 0 8px; }
 .fix-snip { color: var(--muted); font-size: 13px; line-height: 1.7; word-break: break-word; }
+.fix-loc {
+  font-size: 12px; color: var(--accent-strong); cursor: pointer;
+  margin-top: 4px; display: inline-block;
+}
+.fix-loc:hover { text-decoration: underline; }
+.fix-warn { color: var(--red); font-size: 12.5px; margin-top: 5px; line-height: 1.6; }
+/* a caution, not a refusal: the edit CAN be applied, but deserves a look */
+.fix-warn.weak-warn { color: var(--amber); }
+.fix-mode-tag {
+  font-size: 11px; background: var(--accent-soft); color: var(--accent-strong);
+  border-radius: 4px; padding: 1px 6px; font-weight: 600;
+}
+/* the full decision set from the cards tab, inside the fixer */
+.fix-acts { display: flex; flex-wrap: wrap; gap: 4px; max-width: 236px; }
+.fix-acts button {
+  border: 1px solid var(--border); background: var(--panel-2);
+  border-radius: var(--radius-sm); padding: 4px 8px; cursor: pointer;
+  font-size: 12px; white-space: nowrap; font-family: inherit; color: var(--text);
+}
+.fix-acts button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.fix-acts .act-approve { border-color: var(--green); color: var(--green); }
+.fix-acts .act-reject { border-color: var(--red); color: var(--red); }
+.fix-pick { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.fix-pick input { cursor: pointer; }
+.fix-edit { grid-column: 1 / -1; display: none; gap: 6px; margin-top: 6px; }
+.fix-edit.visible { display: flex; }
+.fix-edit input {
+  flex: 1; padding: 6px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--panel); color: var(--text);
+  font-family: inherit; font-size: 14px;
+}
 .fix-side { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
 .fix-side .copybtns { display: flex; gap: 5px; }
 .fix-side .copybtns button {

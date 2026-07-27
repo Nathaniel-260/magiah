@@ -121,12 +121,27 @@
       <div id="fixerTop">
         <select id="fixBook"><option value="">בחר ספר לתיקון…</option></select>
         <label class="chk-row"><input type="checkbox" id="fixInclude"> כלול גם «דרוש בירור» ו«טרם נבדק»</label>
+        <div class="seg" id="fixModeWrap" role="group" aria-label="אופן החלת התיקון">
+          <button id="fixModeReplace" class="seg-btn active" data-mode="replace"
+                  data-tip="המילה השגויה מוחלפת בתיקון">החלפה</button>
+          <button id="fixModeBracket" class="seg-btn" data-mode="bracket"
+                  data-tip="נכתב «(תיקון) [שגיאה]» — התיקון בסוגריים עגולים ואחריו המילה המקורית במרובעים">סוגריים</button>
+        </div>
+        <button id="fixApply" class="btn primary" disabled>✔ החלה על הקובץ</button>
+        <button id="fixUndoFile" class="btn" hidden>↩ שחזור מגיבוי</button>
         <div id="fixProgressWrap">
           <div id="fixProgressText"></div>
           <div class="pbar"><div id="fixProgressBar" style="width:0%"></div></div>
         </div>
       </div>
-      <div id="fixList"><div class="fixer-empty">בחר ספר מהרשימה — מוצגים רק ספרים שיש בהם ממצאים מאושרים שטרם תוקנו.</div></div>
+      <div id="fixerBanner" hidden></div>
+      <div id="fixerSplit">
+        <div id="fixDocWrap">
+          <div id="fixDocHead"><span id="fixDocPath"></span><span id="fixDocMeta"></span></div>
+          <div id="fixDoc" tabindex="0" aria-label="טקסט הספר"></div>
+        </div>
+        <div id="fixList"><div class="fixer-empty">בחר ספר מהרשימה — מוצגים רק ספרים שיש בהם ממצאים מאושרים שטרם תוקנו.</div></div>
+      </div>
     </section>
 
     <!-- ===================== stats view ===================== -->

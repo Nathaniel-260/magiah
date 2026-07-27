@@ -16,7 +16,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, export, hebrew, scanner
+from . import db, export, fixer_api, hebrew, patcher, scanner
 
 
 def _static_dir():
@@ -80,6 +80,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, msg, code=400):
         self._json({'error': msg}, code)
+
+    def _patch_error(self, exc):
+        """A fixer refusal. Conflicts (the file moved under the user) are 409
+        so the UI can offer 'reload' rather than presenting a dead end."""
+        body = {'error': str(exc), 'code': exc.code}
+        body.update(exc.extra or {})
+        self._json(body, 409 if exc.code in patcher.CONFLICT_CODES else 400)
 
     def _static(self, relpath):
         if relpath in ('', '/'):
@@ -162,6 +169,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_get(path, q, con)
             finally:
                 con.close()
+        except patcher.PatchError as e:
+            self._patch_error(e)
+        except (ValueError, FileNotFoundError) as e:
+            self._error(str(e), 400)
         except Exception:
             traceback.print_exc()
             self._error(hebrew.MESSAGES['server_error'], 500)
@@ -203,6 +214,12 @@ class Handler(BaseHTTPRequestHandler):
                                       q.get('statuses')))
         elif path == '/api/backups':
             self._json({'backups': db.list_backups(self.outdir)})
+        elif path == '/api/fixer/books':
+            self._json(fixer_api.books(con, self.outdir, q))
+        elif path == '/api/fixer/doc':
+            self._json(fixer_api.doc(con, self.outdir, q))
+        elif path == '/api/fixer/edits':
+            self._json(fixer_api.edits(con, q))
         else:
             self._error(hebrew.MESSAGES['not_found'], 404)
 
@@ -253,8 +270,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_post(path, body, con)
             finally:
                 con.close()
+        except patcher.PatchError as e:
+            # before the ValueError clause below: PatchError subclasses it
+            self._patch_error(e)
         except PermissionError as e:
-            self._error(str(e), 423)
+            self._error(str(e) or hebrew.FIXER_MESSAGES['locked'], 423)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -274,6 +294,14 @@ class Handler(BaseHTTPRequestHandler):
             if res is None:
                 self._error(hebrew.MESSAGES['nothing_to_undo'], 409)
             else:
+                # undoing a status does NOT rewrite the book; say so plainly
+                # when the finding's correction is already on disk, or the
+                # corrector will assume the file was reverted too
+                ids = [e['finding_id'] for e in res.get('entries') or []
+                       if e.get('finding_id') is not None]
+                if ids and db.edits_touching(con, ids):
+                    res['file_warning'] = hebrew.FIXER_MESSAGES[
+                        'file_untouched']
                 self._json({'ok': True, **res})
         elif path == '/api/export/xlsx':
             paths = export.export_xlsx(con, self.outdir, body.get('origin'))
@@ -300,6 +328,13 @@ class Handler(BaseHTTPRequestHandler):
                         'message': 'השחזור הושלם: '
                                    f"{res['review']} ממצאים, "
                                    f"{res['word_rules']} כללי מילים"})
+        elif path == '/api/fixer/apply':
+            res, code = fixer_api.apply(con, self.outdir, body)
+            self._json(res, code)
+        elif path == '/api/fixer/undo_file':
+            self._json(fixer_api.undo_file(con, self.outdir, body))
+        elif path == '/api/fixer/mode':
+            self._json(fixer_api.set_mode(con, body))
         else:
             self._error(hebrew.MESSAGES['not_found'], 404)
 
