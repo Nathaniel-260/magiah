@@ -463,7 +463,7 @@ async function setStatus(ids, status, opts) {
     if (opts.custom_suggestion !== undefined) r.custom_suggestion = opts.custom_suggestion;
     if (opts.note !== undefined) r.note = opts.note;
   }
-  repaintStatuses();
+  repaintStatuses(ids);
   const body = { ids, status };
   if (opts.note !== undefined) body.note = opts.note;
   if (opts.custom_suggestion !== undefined) body.custom_suggestion = opts.custom_suggestion;
@@ -479,15 +479,37 @@ async function setStatus(ids, status, opts) {
     return resp;
   } catch (e) {
     for (const [r, st, cs, nt] of snapshot) { r.effective_status = st; r.custom_suggestion = cs; r.note = nt; }
-    repaintStatuses();
+    repaintStatuses(ids);
     toast("שמירת הסטטוס נכשלה: " + e.message, "err");
     throw e;
   }
 }
 
-function repaintStatuses() {
+/* `ids`, when given, are the findings that just changed status. For the
+ * fixer we patch just those rows/lines in place rather than rebuilding the
+ * whole (possibly huge) worklist and document pane on every click — see
+ * patchFixRowById / patchFixDocLineFor. A full rebuild only happens when the
+ * current status filter means the change could have moved a row in/out of
+ * view, or when no ids are given (bulk/unknown change). */
+function repaintStatuses(ids) {
   if (S.view === "table") renderTableRows();
-  if (S.view === "fixer") { renderFixList(false); renderFixDoc(); }
+  if (S.view !== "fixer") return;
+  const editable = !!(S.fixDoc && S.fixDoc.editable);
+  if (ids && ids.length && canPatchFixRows()) {
+    let ok = true;
+    for (const id of ids) {
+      if (!patchFixRowById(id, editable)) { ok = false; break; }
+      patchFixDocLineFor(id);
+    }
+    if (ok) {
+      syncFixViewSelect();   // keeps the per-status counts in the dropdown honest
+      updateFixProgress();
+      updateApplyButton();
+      return;
+    }
+  }
+  renderFixList(false);
+  renderFixDoc();
 }
 
 async function doUndo() {
@@ -1342,6 +1364,21 @@ function renderFixDoc() {
   if (!nums.length) box.append(el("div", { class: "fixer-empty" }, "הקובץ ריק."));
 }
 
+/* Patch the one book line a status change actually touched, instead of
+ * rebuilding every line the document pane has loaded. Safe unconditionally:
+ * unlike the worklist, the doc pane has no status filter, so a status change
+ * never adds/removes/reorders lines — only what's drawn on the one line. */
+function patchFixDocLineFor(id) {
+  const box = $("#fixDoc");
+  const r = S.fixRows.find(x => x.id === id);
+  if (!r || r.lineno == null) return false;
+  const old = box.querySelector('.fdoc-line[data-n="' + r.lineno + '"]');
+  if (!old) return false;
+  const rows = S.fixRows.filter(x => x.lineno === r.lineno);
+  old.replaceWith(fixDocLine(r.lineno, rows));
+  return true;
+}
+
 function fixDocLine(n, rows) {
   const info = S.fixLines.get(n);
   const text = info ? info.text : "";
@@ -1575,6 +1612,33 @@ function renderFixList(scroll) {
   if (scroll) scrollFixCurrent();
 }
 
+/* Patch a single already-rendered row in place instead of rebuilding the
+ * whole (possibly huge) worklist. Only safe when the status change cannot
+ * have moved the finding in or out of the current filter — callers must
+ * check that first (see canPatchFixRows). Falls back to the caller doing a
+ * full renderFixList() when the row isn't currently on screen. */
+function patchFixRowById(id, editable) {
+  const box = $("#fixList");
+  const old = box.querySelector('.fix-row[data-id="' + id + '"]');
+  if (!old) return false;
+  const r = S.fixRows.find(x => x.id === id);
+  if (!r) return false;
+  const idx = Number(old.dataset.idx);
+  const fresh = fixRowNode(r, idx, editable);
+  old.replaceWith(fresh);
+  return true;
+}
+
+/* A plain status/note/suggestion edit never changes which findings exist or
+ * their order — it can only change which FILTERED VIEW they belong to (a
+ * status filter, or "blocked" if anchoring info also changed). So patching
+ * in place is safe exactly when the current view isn't filtered by status,
+ * and isn't the "blocked" view (anchor.ok doesn't change here either way,
+ * but keep the check for future-proofing). */
+function canPatchFixRows() {
+  return !S.fixView || S.fixView.startsWith("et:");
+}
+
 /* rebuild the view picker, showing how many findings each choice holds */
 function syncFixViewSelect() {
   const sel = $("#fixView");
@@ -1596,7 +1660,7 @@ function fixRowNode(r, idx, editable) {
   const row = el("div", {
     class: "fix-row" + (cur && cur.id === r.id ? " current" : "") +
       (done ? " done-row" : "") + (blocked ? " row-blocked" : ""),
-    dataset: { idx: String(idx) },
+    dataset: { idx: String(idx), id: String(r.id) },
   });
   const main = el("div", { class: "fix-main" });
   const rfix = r.correction || effFix(r);
@@ -1727,9 +1791,24 @@ function toggleFixEdit(row, r) {
 function selectFixRowById(id) {
   const r = S.fixRows.find(x => x.id === id);
   if (!r) return;
+  const prevId = S.fixCurId;
   S.fixCurId = id;
-  renderFixList(false);
-  renderFixDoc();
+  // Selection only moves the "current" highlight — it never changes which
+  // findings exist, their filter/order, or their status, so the previous and
+  // new current row/line are the only DOM the change can affect. Patching
+  // just those two (instead of rebuilding the whole worklist + doc pane)
+  // keeps clicking through a book with many findings snappy.
+  const editable = !!(S.fixDoc && S.fixDoc.editable);
+  const patched = canPatchFixRows() &&
+    (prevId == null || patchFixRowById(prevId, editable)) &&
+    patchFixRowById(id, editable);
+  if (patched) {
+    if (prevId != null) patchFixDocLineFor(prevId);
+    patchFixDocLineFor(id);
+  } else {
+    renderFixList(false);
+    renderFixDoc();
+  }
   if (r.lineno != null) scrollDocToLine(r.lineno, r.id);
   scrollFixCurrent();
 }
@@ -1737,17 +1816,23 @@ function selectFixRowById(id) {
 /* a status decision from inside the fixer — reuses the shared writer, so the
  * optimistic update, the rollback and Ctrl+Z all behave as everywhere else */
 async function fixAct(r, status, opts) {
+  // Only an approved finding stays armed. "Needs clarification" in
+  // particular is the opposite of "write this now", so leaving it ticked
+  // would apply the very thing the corrector just flagged as unresolved.
+  // Set this BEFORE setStatus's optimistic repaint, so the row it patches
+  // in place (see repaintStatuses/patchFixRowById) draws its checkbox from
+  // the up-to-date pick state instead of a stale one.
+  const wasPicked = S.fixPicked.has(r.id);
+  if (status === "approved") S.fixPicked.add(r.id);
+  else S.fixPicked.delete(r.id);
   try {
     await setStatus([r.id], status, opts || {});
-    // Only an approved finding stays armed. "Needs clarification" in
-    // particular is the opposite of "write this now", so leaving it ticked
-    // would apply the very thing the corrector just flagged as unresolved.
-    if (status === "approved") S.fixPicked.add(r.id);
-    else S.fixPicked.delete(r.id);
-    renderFixList(false);
-    renderFixDoc();
-    updateApplyButton();
-  } catch (e) { /* toast already shown */ }
+  } catch (e) {
+    // toast already shown; setStatus's own catch already repainted the row
+    // with the rolled-back status, so undo the pick-set change to match.
+    if (wasPicked) S.fixPicked.add(r.id); else S.fixPicked.delete(r.id);
+  }
+  updateApplyButton();
 }
 
 function scrollFixCurrent() {
