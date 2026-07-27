@@ -119,8 +119,14 @@
     <!-- ===================== fixer view ===================== -->
     <section id="view-fixer" class="view">
       <div id="fixerTop">
-        <select id="fixBook"><option value="">בחר ספר לתיקון…</option></select>
+        <div id="fixBookPick">
+          <input id="fixBookSearch" type="search" placeholder="🔍 חיפוש ספר — שם או תיקייה…" autocomplete="off">
+          <select id="fixBook" size="1"><option value="">בחר ספר לתיקון…</option></select>
+        </div>
         <label class="chk-row"><input type="checkbox" id="fixInclude"> כלול גם «דרוש בירור» ו«טרם נבדק»</label>
+        <select id="fixView" title="הצגת סוג מסוים בלבד — הסדר תמיד לפי מספר השורה בספר">
+          <option value="">הכל</option>
+        </select>
         <div class="seg" id="fixModeWrap" role="group" aria-label="אופן החלת התיקון">
           <button id="fixModeReplace" class="seg-btn active" data-mode="replace"
                   data-tip="המילה השגויה מוחלפת בתיקון">החלפה</button>
@@ -135,6 +141,15 @@
         </div>
       </div>
       <div id="fixerBanner" hidden></div>
+      <div id="fixPickBar">
+        <span id="fixPickCount"></span>
+        <span class="fp-sep"></span>
+        <span class="fp-label">בחירה מהירה:</span>
+        <button data-pick="approved" class="fp-btn">✅ רק מאושרים</button>
+        <button data-pick="verified" class="fp-btn" title="ממצאים ברמת ודאות גבוהה שאושרו">✅★ מאושרים ומאומתים</button>
+        <button data-pick="view" class="fp-btn">הנראים כעת</button>
+        <button data-pick="none" class="fp-btn">✕ נקה בחירה</button>
+      </div>
       <div id="fixerSplit">
         <div id="fixDocWrap">
           <div id="fixDocHead"><span id="fixDocPath"></span><span id="fixDocMeta"></span></div>

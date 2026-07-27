@@ -797,7 +797,15 @@ section#view-cards.visible { display: flex; flex-direction: column; }
   flex-wrap: wrap;
   margin-bottom: 12px;
 }
-#fixBook { min-width: 300px; max-width: 460px; padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); }
+#fixBookPick { display: flex; flex-direction: column; gap: 4px; min-width: 320px; max-width: 470px; flex: 1 1 320px; }
+#fixBookSearch {
+  padding: 6px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--panel); color: var(--text);
+  font-family: inherit; font-size: 13px; width: 100%;
+}
+#fixBookSearch:focus { outline: none; border-color: var(--accent); }
+#fixBook { width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); color: var(--text); }
+#fixView { padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); color: var(--text); max-width: 220px; }
 #fixerTop label.chk-row { font-size: 13px; }
 #fixProgressWrap { flex: 1 1 220px; min-width: 180px; }
 #fixProgressText { font-size: 13px; color: var(--muted); margin-bottom: 3px; }
@@ -828,6 +836,25 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 #fixerBanner li { margin: 2px 0; }
 
 /* -- split: the book on the reading side, the worklist beside it -- */
+/* -- quick selection: what will actually be written -- */
+#fixPickBar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 10px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius); font-size: 12.5px;
+}
+#fixPickBar[hidden] { display: none; }
+#fixPickCount { color: var(--muted); }
+#fixPickBar .fp-sep { flex: 1 1 auto; }
+#fixPickBar .fp-label { color: var(--faint); }
+#fixPickBar .fp-btn {
+  border: 1px solid var(--border); background: var(--panel);
+  color: var(--text); border-radius: var(--radius-sm);
+  padding: 4px 10px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+  white-space: nowrap;
+}
+#fixPickBar .fp-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+
 #fixerSplit {
   display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px;
   align-items: start; min-height: 0;
@@ -850,7 +877,10 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 #fixDocMeta { white-space: nowrap; }
 #fixDoc {
   max-height: calc(100vh - var(--topbar-h) - 190px);
-  overflow: auto; padding: 10px 12px; line-height: 2.05; font-size: 16px;
+  overflow: auto; padding: 10px 12px; line-height: 2.15; font-size: 16px;
+  /* Hebrew body text reads right-aligned; ragged-left (never justified) so
+     the eye keeps a fixed starting edge and no rivers open up between words */
+  text-align: right;
 }
 #fixDoc:focus { outline: 2px solid var(--accent-soft); outline-offset: -2px; }
 .fdoc-line { display: grid; grid-template-columns: 4.5ch 1fr; gap: 10px; padding: 1px 3px; border-radius: var(--radius-sm); }
@@ -862,25 +892,48 @@ section#view-cards.visible { display: flex; flex-direction: column; }
   font-family: Consolas, "Courier New", monospace; user-select: none;
   padding-top: 5px;
 }
-.fdoc-text { word-break: break-word; min-width: 0; }
+.fdoc-text { word-break: break-word; min-width: 0; text-align: right; }
 .fdoc-gap {
   text-align: center; color: var(--faint); font-size: 12px;
   padding: 7px 0; margin: 5px 0; border-top: 1px dashed var(--border);
   border-bottom: 1px dashed var(--border);
 }
-/* the highlighted word inside the book text */
+/* A marked word inside the book text.
+   The printer's convention, so the corrector never has to hover to find out
+   what will happen: the original struck through, the correction underlined. */
 .fdoc-hit {
-  background: var(--amber-soft); border-bottom: 2px solid var(--amber);
-  border-radius: 3px; padding: 0 2px; cursor: pointer; color: inherit;
+  display: inline-flex; align-items: baseline; gap: 3px;
+  background: var(--amber-soft); border-radius: 4px;
+  padding: 0 4px; cursor: pointer; color: inherit;
+  box-shadow: inset 0 -2px 0 0 var(--amber);
 }
-.fdoc-hit.st-approved { background: var(--red-soft); border-bottom-color: var(--red); }
-.fdoc-hit.st-unsure { background: var(--blue-soft); border-bottom-color: var(--blue); }
-.fdoc-hit.st-pending { background: var(--slate-soft); border-bottom-color: var(--slate); }
-.fdoc-hit.st-fixed, .fdoc-hit.applied { background: var(--green-soft); border-bottom-color: var(--green); }
+.fdoc-old {
+  text-decoration: line-through;
+  text-decoration-color: var(--red);
+  text-decoration-thickness: 2px;
+  color: var(--muted);
+}
+.fdoc-new {
+  text-decoration: underline;
+  text-decoration-color: var(--green);
+  text-decoration-thickness: 2px;
+  color: var(--green); font-weight: 700;
+}
+.fdoc-bracket { color: var(--accent-strong); font-weight: 600; }
+.fdoc-word { font-weight: 600; }
+/* the status of this very finding, readable at a glance across the page */
+.fdoc-badge { font-size: 11px; opacity: .85; user-select: none; }
+
+.fdoc-hit.st-approved { background: var(--red-soft); box-shadow: inset 0 -2px 0 0 var(--red); }
+.fdoc-hit.st-unsure { background: var(--blue-soft); box-shadow: inset 0 -2px 0 0 var(--blue); }
+.fdoc-hit.st-pending { background: var(--slate-soft); box-shadow: inset 0 -2px 0 0 var(--slate); }
+.fdoc-hit.st-not_error, .fdoc-hit.st-ignored { background: transparent; box-shadow: none; opacity: .55; }
+.fdoc-hit.st-not_error .fdoc-old, .fdoc-hit.st-ignored .fdoc-old { text-decoration: none; color: inherit; }
+.fdoc-hit.st-fixed, .fdoc-hit.applied { background: var(--green-soft); box-shadow: inset 0 -2px 0 0 var(--green); }
 .fdoc-hit.amb { outline: 2px dashed var(--red); outline-offset: 1px; }
-.fdoc-hit.weak { border-bottom-style: dashed; }
-.fdoc-hit.current { box-shadow: 0 0 0 2px var(--accent); }
-.fdoc-hit:hover { filter: brightness(.95); }
+.fdoc-hit.weak { box-shadow: inset 0 -2px 0 0 var(--amber), 0 0 0 1px var(--amber); }
+.fdoc-hit.current { outline: 2px solid var(--accent); outline-offset: 1px; }
+.fdoc-hit:hover { filter: brightness(.96); }
 /* clickable token, when the corrector must point at the right occurrence */
 .fdoc-tok { cursor: pointer; border-radius: 3px; padding: 0 1px; }
 .fdoc-tok:hover { background: var(--accent-soft); outline: 1px solid var(--accent); }

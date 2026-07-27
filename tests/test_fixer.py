@@ -389,6 +389,70 @@ class TestPlanAndApply(TempCase):
 
 
 # ---------------------------------------------------------------------------
+# the book changed between the scan and the fix
+# ---------------------------------------------------------------------------
+
+class TestDriftedLines(TempCase):
+    """A book edited after the scan must still be fixable — safely.
+
+    Inserting or deleting a line shifts every finding below it. Refusing them
+    all would force a full re-scan over one added line, so the finding is
+    relocated — but only to an unambiguous, snippet-corroborated line, because
+    guessing here is exactly how a correction reaches an unrelated passage.
+    """
+
+    def doc(self, text):
+        return patcher.read_doc(write(os.path.join(self.tmp, 'b.txt'), text))
+
+    def test_finds_the_line_after_an_insertion(self):
+        d = self.doc('כותרת\nשורה חדשה\nאמר רבי יותבת בן זומא\nסוף\n')
+        plan = patcher.plan_edit(d, {
+            'id': 1, 'lineno': 1,            # where the scan saw it
+            'word': 'יותבת', 'correction': 'יושבת',
+            'snippet': 'אמר רבי יותבת בן זומא'})
+        self.assertEqual(plan.lineno, 2)     # where it actually is now
+        self.assertTrue(plan.drifted)
+        self.assertEqual(plan.confidence, 'moved')
+        self.assertEqual(d.lines[plan.lineno][plan.start:plan.end], 'יותבת')
+
+    def test_refuses_when_several_lines_could_match(self):
+        """Two candidate lines means no way to tell which one was meant."""
+        d = self.doc('אמר רבי יותבת בן זומא\nכותרת\nאמר רבי יותבת בן זומא\n')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, {
+                'id': 1, 'lineno': 1, 'word': 'יותבת',
+                'correction': 'יושבת', 'snippet': 'אמר רבי יותבת בן זומא'})
+        self.assertEqual(cm.exception.code, 'token_not_found')
+
+    def test_refuses_without_a_snippet_to_corroborate(self):
+        """With no snippet there is nothing to confirm the line with, so the
+        nearest occurrence must NOT be assumed to be the right one."""
+        d = self.doc('כותרת\nשורה\nאמר רבי יותבת בן זומא\n')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, {'id': 1, 'lineno': 1, 'word': 'יותבת',
+                                  'correction': 'יושבת'})
+        self.assertEqual(cm.exception.code, 'token_not_found')
+
+    def test_does_not_search_beyond_the_window(self):
+        lines = ['מילוי'] * 400 + ['אמר רבי יותבת בן זומא']
+        d = self.doc('\n'.join(lines) + '\n')
+        with self.assertRaises(patcher.PatchError):
+            patcher.plan_edit(d, {
+                'id': 1, 'lineno': 0, 'word': 'יותבת',
+                'correction': 'יושבת', 'snippet': 'אמר רבי יותבת בן זומא'})
+
+    def test_a_hand_fixed_word_is_left_alone(self):
+        """The corrector already fixed it in an editor: there is nothing to
+        do, and nothing may be overwritten."""
+        d = self.doc('כותרת\nועוד אמר מחוז דבר\n')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, {
+                'id': 1, 'lineno': 1, 'word': 'מחורז',
+                'correction': 'מחוז', 'snippet': 'ועוד אמר מחורז דבר'})
+        self.assertEqual(cm.exception.code, 'token_not_found')
+
+
+# ---------------------------------------------------------------------------
 # writing, backups, restore
 # ---------------------------------------------------------------------------
 

@@ -128,7 +128,8 @@ const S = {
   fixLines: new Map(),      // lineno -> {n, text, tokens?}
   fixInclude: false,
   fixRows: [],
-  fixIdx: 0,
+  fixCurId: null,           // the selected finding, by id — survives filtering
+  fixView: "",              // "" | blocked | st:<status> | et:<errtype>
   fixMode: "replace",       // per-book default
   fixModeOverride: new Map(),  // finding id -> mode (session only)
   fixPicked: new Set(),     // findings selected for the next apply
@@ -191,6 +192,7 @@ function writeHash() {
   // written whenever a book is open, so that reloading a link cannot flip the
   // mode back to the book's stored default behind the corrector's back
   if (S.fixKey) p.set("fm", S.fixMode);
+  if (S.fixView) p.set("fv", S.fixView);
   S.hashLock = true;
   location.hash = p.toString();
   setTimeout(() => { S.hashLock = false; }, 0);
@@ -213,6 +215,7 @@ function readHash() {
   S.fixKey = p.get("fk") || "";
   S.fixInclude = p.get("fi") === "1";
   S.fixMode = p.get("fm") === "bracket" ? "bracket" : "replace";
+  S.fixView = p.get("fv") || "";
 }
 window.addEventListener("hashchange", () => {
   if (S.hashLock) return;
@@ -542,6 +545,7 @@ function syncFilterControls() {
   $("#fixInclude").checked = S.fixInclude;
   if ($("#fixBook")) $("#fixBook").value = S.fixKey;
   syncModeButtons();
+  syncFixViewSelect();
 }
 
 function buildSidebar() {
@@ -1100,22 +1104,47 @@ function fixBookLabel(b) {
 }
 
 async function loadFixerBooks() {
-  const sel = $("#fixBook");
-  const keep = S.fixKey;
-  sel.replaceChildren(el("option", { value: "" }, "בחר ספר לתיקון…"));
   try {
     const p = new URLSearchParams();
     if (S.filters.origin) p.set("origin", S.filters.origin);
     p.set("statuses", S.fixInclude ? "approved,unsure,pending" : "approved");
     const resp = await api("/api/fixer/books?" + p);
     S.fixBooks = resp.books || [];
-    for (const b of S.fixBooks) {
-      sel.append(el("option", { value: b.key }, fixBookLabel(b)));
-    }
   } catch (e) {
     toast("טעינת רשימת הספרים נכשלה: " + e.message, "err");
   }
-  if (keep) sel.value = keep;
+  renderFixBookOptions();
+}
+
+/* The picker is filtered in the browser: the whole list is already here, and
+ * a corrector hunting for one book among hundreds should not wait for a round
+ * trip on every keystroke. The book currently open always stays listed, so
+ * typing can never make the selection silently vanish. */
+function renderFixBookOptions() {
+  const sel = $("#fixBook");
+  if (!sel) return;
+  const q = ($("#fixBookSearch") ? $("#fixBookSearch").value : "").trim();
+  const books = S.fixBooks || [];
+  const hits = q
+    ? books.filter(b => (b.title || "").indexOf(q) >= 0 ||
+                        (b.folder || "").indexOf(q) >= 0)
+    : books;
+  // the open book stays listed even when it does not match, so typing can
+  // never make the current selection disappear — but it is not counted as a
+  // search result, which would be a lie
+  const shown = hits.slice();
+  if (q && S.fixKey && !shown.some(b => b.key === S.fixKey)) {
+    const open = books.find(b => b.key === S.fixKey);
+    if (open) shown.push(open);
+  }
+  sel.replaceChildren(el("option", { value: "" },
+    q ? (hits.length ? "נמצאו " + fmtNum(hits.length) + " ספרים — בחר…"
+                     : "לא נמצא ספר התואם לחיפוש")
+      : "בחר ספר לתיקון…"));
+  for (const b of shown) {
+    sel.append(el("option", { value: b.key }, fixBookLabel(b)));
+  }
+  sel.value = S.fixKey || "";
 }
 
 function fixBookInfo(key) {
@@ -1158,9 +1187,14 @@ async function loadFixDoc() {
     // link, so it outranks the book's stored default
     S.fixMode = hashMode() || resp.default_mode || "replace";
     S.fixModeOverride = new Map();
-    S.fixPicked = new Set(S.fixRows.filter(canApply).map(r => r.id));
+    // Only APPROVED findings are pre-selected. A finding nobody has judged
+    // yet must never be written into a book just because it was on screen —
+    // the corrector opts in, per finding or with the quick-pick bar.
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved")
+      .map(r => r.id));
     S.fixDocStale = false;
-    S.fixIdx = 0;
+    S.fixCurId = (S.fixRows[0] || {}).id ?? null;
     S.fixEdits = resp.edits || [];
     syncModeButtons();
     renderFixDoc();
@@ -1178,6 +1212,73 @@ async function loadFixDoc() {
     setFixBanner(e.message, "err");
   }
   updateApplyButton();
+}
+
+/* ---- which findings the worklist shows -------------------------------
+ * The order is ALWAYS the order of the book (by line number). A corrector
+ * works a book front to back, and re-ordering the list would make them lose
+ * their place — so "show me the pending ones" narrows the list instead of
+ * shuffling it. Whatever is shown stays in reading order.
+ */
+function fixViewOptions() {
+  const counts = new Map();
+  for (const r of S.fixRows) {
+    const st = effStatus(r);
+    counts.set("st:" + st, (counts.get("st:" + st) || 0) + 1);
+    const et = r.errtype || "";
+    if (et) counts.set("et:" + et, (counts.get("et:" + et) || 0) + 1);
+  }
+  const opts = [{ key: "", label: "הכל", n: S.fixRows.length }];
+  const blocked = S.fixRows.filter(r => r.anchor && !r.anchor.ok).length;
+  if (blocked) {
+    opts.push({ key: "blocked", label: "⚠ דורשים אישור ידני", n: blocked });
+  }
+  for (const s of statuses()) {
+    const n = counts.get("st:" + s.key) || 0;
+    if (n) opts.push({ key: "st:" + s.key, label: s.icon + " " + s.hebrew, n });
+  }
+  for (const [k, n] of counts) {
+    if (!k.startsWith("et:")) continue;
+    const et = k.slice(3);
+    opts.push({ key: k, label: errtypeInfo(et).hebrew || et, n });
+  }
+  return opts;
+}
+
+function visibleFixRows() {
+  const f = S.fixView;
+  if (!f) return S.fixRows;
+  if (f === "blocked") {
+    return S.fixRows.filter(r => r.anchor && !r.anchor.ok);
+  }
+  if (f.startsWith("st:")) {
+    const st = f.slice(3);
+    return S.fixRows.filter(r => effStatus(r) === st);
+  }
+  if (f.startsWith("et:")) {
+    const et = f.slice(3);
+    return S.fixRows.filter(r => (r.errtype || "") === et);
+  }
+  return S.fixRows;
+}
+
+/* the selected finding, and how to move the selection within the view */
+function currentFixRow() {
+  const view = visibleFixRows();
+  if (S.fixCurId != null) {
+    const hit = view.find(r => r.id === S.fixCurId);
+    if (hit) return hit;
+  }
+  return view[0] || null;
+}
+
+function moveFixSelection(delta) {
+  const view = visibleFixRows();
+  if (!view.length) return;
+  const cur = currentFixRow();
+  const at = Math.max(0, view.findIndex(r => cur && r.id === cur.id));
+  const next = view[Math.min(view.length - 1, Math.max(0, at + delta))];
+  if (next) selectFixRowById(next.id);
 }
 
 /* a row can be written only when the server managed to anchor it */
@@ -1219,7 +1320,7 @@ function renderFixDoc() {
 function fixDocLine(n, rows) {
   const info = S.fixLines.get(n);
   const text = info ? info.text : "";
-  const cur = S.fixRows[S.fixIdx];
+  const cur = currentFixRow();
   const line = el("div", {
     class: "fdoc-line" + (rows.length ? " has-fix" : "") +
       (rows.some(r => effStatus(r) === "fixed") ? " edited" : "") +
@@ -1239,18 +1340,8 @@ function fixDocLine(n, rows) {
     const a = r.anchor;
     if (a.end > tail) continue;                 // overlapping: skip the later
     pieces.unshift(text.slice(a.end, tail));
-    const mark = el("mark", {
-      class: "fdoc-hit st-" + effStatus(r) +
-        (a.confidence === "weak" ? " weak" : "") +
-        (cur && cur.id === r.id ? " current" : ""),
-      dataset: { id: String(r.id) },
-      title: (r.word || "") + " ⇐ " + (r.correction || effFix(r) || ""),
-    }, text.slice(a.start, a.end));
-    mark.addEventListener("click", ev => {
-      ev.stopPropagation();
-      selectFixRow(S.fixRows.indexOf(r));
-    });
-    pieces.unshift(mark);
+    pieces.unshift(fixHitNode(r, text.slice(a.start, a.end),
+                              cur && cur.id === r.id));
     tail = a.start;
   }
   pieces.unshift(text.slice(0, tail));
@@ -1268,6 +1359,51 @@ function fixDocLine(n, rows) {
   }
   line.append(body);
   return line;
+}
+
+/* One marked word inside the book text.
+ *
+ * The corrector's question at every mark is "what goes and what comes?", so
+ * the mark answers it in place, using the printer's convention: the original
+ * struck through, the correction underlined right after it. Nothing is hidden
+ * behind a tooltip — the line reads as the corrected sentence would, with the
+ * old word still visible for comparison.
+ *
+ * In bracket mode the mark shows the literal string that will be written,
+ * "(תיקון) [שגיאה]", because there the original stays in the book too.
+ */
+function fixHitNode(r, rawSlice, isCurrent) {
+  const st = effStatus(r);
+  const fix = r.correction || effFix(r) || "";
+  const a = r.anchor || {};
+  const mode = rowMode(r);
+  const done = st === "fixed";
+  const wrap = el("span", {
+    class: "fdoc-hit st-" + st + (isCurrent ? " current" : "") +
+      (a.confidence === "weak" ? " weak" : ""),
+    dataset: { id: String(r.id) },
+    title: statusInfo(st).hebrew + " — " + (r.word || "") + " ⇐ " + (fix || "—"),
+  });
+  // status marker, so a glance over the page says what was decided where
+  wrap.append(el("span", { class: "fdoc-badge" }, statusInfo(st).icon));
+
+  // Nothing is going to be written here, so showing a correction would be a
+  // lie: a rejected or ignored finding leaves the book exactly as it is, and
+  // an already-applied one is the book as it is. Show the word plainly.
+  const keeps = st === "not_error" || st === "ignored";
+  if (done || keeps || !fix) {
+    wrap.append(el("bdi", { class: "fdoc-word" }, rawSlice));
+  } else if (mode === "bracket") {
+    wrap.append(el("bdi", { class: "fdoc-bracket" }, "(" + fix + ") [" + rawSlice + "]"));
+  } else {
+    wrap.append(el("bdi", { class: "fdoc-old" }, rawSlice),
+                el("bdi", { class: "fdoc-new" }, fix));
+  }
+  wrap.addEventListener("click", ev => {
+    ev.stopPropagation();
+    selectFixRowById(r.id);
+  });
+  return wrap;
 }
 
 /* every token clickable, so an ambiguous finding can be resolved by hand */
@@ -1305,9 +1441,20 @@ function resolveOccurrence(row, start, end) {
   showBlockedBanner();
 }
 
-function scrollDocToLine(n) {
-  const node = $("#fixDoc .fdoc-line[data-n='" + n + "']");
-  if (node) node.scrollIntoView({ block: "center", behavior: "smooth" });
+/* Bring the finding into view — the WORD, not the top of its paragraph.
+ * Book lines can run for hundreds of characters, so scrolling to the line
+ * often left the marked word far below the fold, which is the opposite of
+ * the point. Scroll to the mark itself when it exists. */
+function scrollDocToLine(n, id) {
+  const doc = $("#fixDoc");
+  if (!doc) return;
+  const line = doc.querySelector(".fdoc-line[data-n='" + n + "']");
+  if (!line) return;
+  const hit = id != null
+    ? line.querySelector(".fdoc-hit[data-id='" + id + "']")
+    : line.querySelector(".fdoc-hit");
+  (hit || line).scrollIntoView({ block: "center", inline: "center",
+                                 behavior: "smooth" });
 }
 
 function updateFixHead() {
@@ -1367,8 +1514,18 @@ function renderFixList(scroll) {
     return;
   }
   const editable = !!(S.fixDoc && S.fixDoc.editable);
+  // filtered, but never re-ordered: the list always runs down the book
+  const view = visibleFixRows();
+  syncFixViewSelect();
+  if (!view.length) {
+    box.append(el("div", { class: "fixer-empty" },
+      "אין ממצאים מהסוג שנבחר בספר זה. אפשר לבחור «הכל» כדי לראות את השאר."));
+    updateFixProgress();
+    updateApplyButton();
+    return;
+  }
   let lastRef = null;
-  S.fixRows.forEach((r, idx) => {
+  view.forEach((r, idx) => {
     const ref = r.ref || "(ללא מראה מקום)";
     if (ref !== lastRef) {
       box.append(el("div", { class: "fix-refgroup" }, el("bdi", null, ref)));
@@ -1381,18 +1538,43 @@ function renderFixList(scroll) {
   if (scroll) scrollFixCurrent();
 }
 
+/* rebuild the view picker, showing how many findings each choice holds */
+function syncFixViewSelect() {
+  const sel = $("#fixView");
+  if (!sel) return;
+  const opts = fixViewOptions();
+  sel.replaceChildren();
+  for (const o of opts) {
+    sel.append(el("option", { value: o.key },
+      o.label + " (" + fmtNum(o.n) + ")"));
+  }
+  if (!opts.some(o => o.key === S.fixView)) S.fixView = "";
+  sel.value = S.fixView;
+}
+
 function fixRowNode(r, idx, editable) {
   const done = effStatus(r) === "fixed";
   const blocked = !!(r.anchor && !r.anchor.ok) && !done;
+  const cur = currentFixRow();
   const row = el("div", {
-    class: "fix-row" + (idx === S.fixIdx ? " current" : "") +
+    class: "fix-row" + (cur && cur.id === r.id ? " current" : "") +
       (done ? " done-row" : "") + (blocked ? " row-blocked" : ""),
     dataset: { idx: String(idx) },
   });
   const main = el("div", { class: "fix-main" });
   const rfix = r.correction || effFix(r);
   const mode = rowMode(r);
+  const st = effStatus(r);
+  const sinfo = statusInfo(st);
+  // the status of THIS finding, stated rather than implied by row colour
+  const chip = el("span", { class: "chip st-" + st, title: "לחיצה לשינוי הסטטוס" },
+    (sinfo.icon ? sinfo.icon + " " : "") + sinfo.hebrew);
+  chip.addEventListener("click", ev => {
+    ev.stopPropagation();
+    openStatusMenu(ev.currentTarget, key => fixAct(r, key));
+  });
   main.append(el("div", { class: "fix-wordline" },
+    chip,
     wordDiffNode(r.word || "", rfix || "", "err", "w-err"),
     el("span", { class: "arr" }, "⇐"),
     rfix ? wordDiffNode(rfix, r.word || "", "fix", "w-fix")
@@ -1403,7 +1585,7 @@ function fixRowNode(r, idx, editable) {
     renderSnippet(r.snippet, r.word, null, rfix)));
   if (r.lineno != null && editable) {
     const loc = el("span", { class: "fix-loc" }, "📍 שורה " + fmtNum(r.lineno + 1));
-    loc.addEventListener("click", ev => { ev.stopPropagation(); scrollDocToLine(r.lineno); });
+    loc.addEventListener("click", ev => { ev.stopPropagation(); scrollDocToLine(r.lineno, r.id); });
     main.append(loc);
   }
   if (blocked) main.append(el("div", { class: "fix-warn" }, r.anchor.message || ""));
@@ -1490,7 +1672,7 @@ function fixRowNode(r, idx, editable) {
 
   row.addEventListener("click", ev => {
     if (ev.target.closest("button, input, label, mark")) return;
-    selectFixRow(idx);
+    selectFixRowById(r.id);
   });
   return row;
 }
@@ -1503,13 +1685,14 @@ function toggleFixEdit(row, r) {
   if (open) { const i = box.querySelector("input"); i.focus(); i.select(); }
 }
 
-function selectFixRow(idx) {
-  if (idx < 0 || idx >= S.fixRows.length) return;
-  S.fixIdx = idx;
+function selectFixRowById(id) {
+  const r = S.fixRows.find(x => x.id === id);
+  if (!r) return;
+  S.fixCurId = id;
   renderFixList(false);
   renderFixDoc();
-  const r = S.fixRows[idx];
-  if (r && r.lineno != null) scrollDocToLine(r.lineno);
+  if (r.lineno != null) scrollDocToLine(r.lineno, r.id);
+  scrollFixCurrent();
 }
 
 /* a status decision from inside the fixer — reuses the shared writer, so the
@@ -1537,16 +1720,23 @@ async function markFixed(idx) {
   await fixAct(r, "fixed");
   let next = idx + 1;
   while (next < S.fixRows.length && effStatus(S.fixRows[next]) === "fixed") next++;
-  if (next < S.fixRows.length) selectFixRow(next);
+  if (next < S.fixRows.length) selectFixRowById(S.fixRows[next].id);
 }
 
 function updateFixProgress() {
+  // progress is always about the BOOK, never the current filter — otherwise
+  // narrowing the view would appear to change how much work is left
   const total = S.fixRows.length;
   const done = S.fixRows.filter(r => effStatus(r) === "fixed").length;
   const pct = total ? Math.round(done * 100 / total) : 0;
-  $("#fixProgressText").textContent = S.fixKey
-    ? "תוקנו " + fmtNum(done) + " מתוך " + fmtNum(total) + " בספר זה (" + pct + "%)"
-    : "";
+  let txt = "";
+  if (S.fixKey) {
+    txt = "תוקנו " + fmtNum(done) + " מתוך " + fmtNum(total) +
+          " בספר זה (" + pct + "%)";
+    const shown = visibleFixRows().length;
+    if (S.fixView && shown !== total) txt += " · מוצגים " + fmtNum(shown);
+  }
+  $("#fixProgressText").textContent = txt;
   $("#fixProgressBar").style.width = pct + "%";
 }
 
@@ -1572,7 +1762,54 @@ function applicableRows() {
   return S.fixRows.filter(r => S.fixPicked.has(r.id) && canApply(r));
 }
 
+/* Quick selection.
+ *
+ * Writing into a book is a decision, so the set of corrections to write is
+ * built explicitly. Findings nobody has judged are never pre-selected; these
+ * buttons are how a corrector opts a whole group in, without ticking dozens
+ * of boxes by hand.
+ */
+function fixPick(which) {
+  if (which === "none") {
+    S.fixPicked.clear();
+  } else if (which === "approved") {
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved")
+      .map(r => r.id));
+  } else if (which === "verified") {
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved" && r.verified)
+      .map(r => r.id));
+  } else if (which === "view") {
+    // whatever the current filter shows — the corrector can see exactly what
+    // they are about to select
+    S.fixPicked = new Set(visibleFixRows().filter(canApply).map(r => r.id));
+  }
+  renderFixList(false);
+  renderFixDoc();
+  updateApplyButton();
+}
+
+function updateFixPickBar() {
+  const bar = $("#fixPickBar");
+  if (!bar) return;
+  const editable = !!(S.fixDoc && S.fixDoc.editable) && S.fixRows.length;
+  bar.hidden = !editable;
+  if (!editable) return;
+  const n = applicableRows().length;
+  const avail = S.fixRows.filter(canApply).length;
+  const undecided = S.fixRows.filter(
+    r => canApply(r) && effStatus(r) !== "approved").length;
+  const parts = ["נבחרו " + fmtNum(n) + " מתוך " + fmtNum(avail) +
+                 " הניתנים לתיקון"];
+  if (undecided) {
+    parts.push(fmtNum(undecided) + " טרם הוחלטו — לא ייכנסו אלא אם תבחר בהם");
+  }
+  $("#fixPickCount").textContent = parts.join(" · ");
+}
+
 function updateApplyButton() {
+  updateFixPickBar();
   const btn = $("#fixApply");
   const editable = !!(S.fixDoc && S.fixDoc.editable) && !S.fixDocStale;
   const n = applicableRows().length;
@@ -1820,6 +2057,16 @@ function renderHelp() {
       el("li", null, el("b", null, "רשימת הספרים: "),
         "מזוהים לפי הקובץ, לא לפי השם. לכן שני ספרים בשם «פרק א» בתיקיות " +
         "שונות מופיעים בנפרד, ולצד כל אחד מוצגת התיקייה שלו."),
+      el("li", null, el("b", null, "הסימון בטקסט: "),
+        "כל מילה מסומנת מראה גם ", el("b", null, "מה ירד"),
+        " (המילה המקורית, מחוקה בקו) וגם ", el("b", null, "מה יהיה"),
+        " (התיקון, בקו תחתון ירוק) — כך רואים בדיוק מה ייכתב, בלי לרחף עם " +
+        "העכבר. לצד כל סימון מופיע גם סמל הסטטוס שלו."),
+      el("li", null, el("b", null, "הצגה לפי סוג: "),
+        "התיבה שבסרגל מציגה רק ממצאים מסטטוס או מסוג מסוים (למשל רק «טרם " +
+        "נבדק», או רק אלה שדורשים אישור ידני). ",
+        el("b", null, "הסדר תמיד נשאר לפי מספר השורה בספר"),
+        " — הסינון מצמצם את הרשימה ולא מערבב אותה, כדי לא לאבד את המקום."),
       el("li", null, el("b", null, "אופן הכתיבה: "),
         "«החלפה» — המילה השגויה מוחלפת בתיקון. «סוגריים» — נכתב " +
         "«(תיקון) [שגיאה]», כלומר התיקון בסוגריים עגולים ואחריו המילה " +
@@ -1828,9 +2075,17 @@ function renderHelp() {
       el("li", null, el("b", null, "כל פעולות הסקירה זמינות כאן: "),
         "אפשר גם לאשר, לדחות, להקליד תיקון ידני או לסמן «דרוש בירור» — " +
         "כך אפשר לטפל גם בממצאים שטרם נבדקו בלי לצאת מהמסך."),
+      el("li", null, el("b", null, "מה נכנס לתיקון: "),
+        el("b", null, "ממצא שטרם הוחלט לגביו לעולם אינו נכנס אוטומטית"),
+        " — רק ממצאים ב«אושר» מסומנים מראש. בסרגל הבחירה אפשר לבחור במכה " +
+        "אחת «רק מאושרים», «מאושרים ומאומתים», או «הנראים כעת»."),
       el("li", null, el("b", null, "גיבוי אוטומטי: "),
         "לפני כל כתיבה נשמר עותק מלא של הקובץ. שום דבר בקובץ אינו משתנה " +
         "מלבד המילים שתוקנו."),
+      el("li", null, el("b", null, "אם הספר השתנה מאז הסריקה: "),
+        "אין צורך בסריקה חדשה — הקובץ נקרא מהדיסק בכל פתיחה. אם שורות זזו, " +
+        "הכלי מאתר את המילה במקומה החדש, אך ורק כשהזיהוי חד־משמעי ומאושש " +
+        "מול הקטע שנסרק. מילה שכבר תוקנה ידנית תזוהה ולא תיגע."),
       el("li", null, el("b", null, "ממצאים שלא יוחלו אוטומטית: "),
         "אם הכלי אינו יכול לקבוע בוודאות היכן המילה נמצאת (למשל כשהיא " +
         "מופיעה כמה פעמים באותה שורה, או שהקובץ השתנה מאז הסריקה) — הוא " +
@@ -2535,20 +2790,20 @@ document.addEventListener("keydown", ev => {
     else if (keyIs(ev, "fixedBook")) { ev.preventDefault(); cardAct("fixed"); }
     else if (ev.code === "Space" || ev.key === " ") { ev.preventDefault(); cardSkip(); }
   } else if (S.view === "fixer") {
-    const cur = S.fixRows[S.fixIdx];
+    const cur = currentFixRow();
     if ((ev.ctrlKey || ev.metaKey) && (ev.code === "KeyS" || ev.key === "s")) {
       ev.preventDefault();                       // beats the browser's Save
       applyFixes();
     } else if (ev.key === "Enter" || keyIs(ev, "fixedBook")) {
-      ev.preventDefault(); markFixed(S.fixIdx);
+      ev.preventDefault(); if (cur) markFixed(cur);
     } else if (ev.code === "ArrowDown") {
-      ev.preventDefault(); selectFixRow(Math.min(S.fixRows.length - 1, S.fixIdx + 1));
+      ev.preventDefault(); moveFixSelection(1);
     } else if (ev.code === "ArrowUp") {
-      ev.preventDefault(); selectFixRow(Math.max(0, S.fixIdx - 1));
+      ev.preventDefault(); moveFixSelection(-1);
     } else if (ev.code === "Home") {
-      ev.preventDefault(); selectFixRow(0);
+      ev.preventDefault(); { const v = visibleFixRows(); if (v.length) selectFixRowById(v[0].id); }
     } else if (ev.code === "End") {
-      ev.preventDefault(); selectFixRow(S.fixRows.length - 1);
+      ev.preventDefault(); { const v = visibleFixRows(); if (v.length) selectFixRowById(v[v.length - 1].id); }
     } else if (ev.key === "ס" || ev.code === "KeyX") {
       // toggle THIS correction between plain replace and (תיקון) [שגיאה]
       if (cur) {
@@ -2649,6 +2904,29 @@ function bindControls() {
     S.fixInclude = $("#fixInclude").checked;
     writeHash();
     loadFixerBooks().then(loadFixDoc);
+  });
+  for (const b of $$("#fixPickBar .fp-btn")) {
+    b.addEventListener("click", () => fixPick(b.dataset.pick));
+  }
+  $("#fixBookSearch").addEventListener("input", debounce(renderFixBookOptions, 120));
+  $("#fixBookSearch").addEventListener("keydown", ev => {
+    // Enter on a single match opens it, so searching never needs the mouse
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const sel = $("#fixBook");
+    const opts = [...sel.children].filter(o => o.value);
+    if (opts.length === 1) {
+      sel.value = opts[0].value;
+      S.fixKey = sel.value;
+      writeHash();
+      loadFixDoc();
+    }
+  });
+  $("#fixView").addEventListener("change", () => {
+    S.fixView = $("#fixView").value;
+    writeHash();
+    renderFixList(true);
+    renderFixDoc();
   });
   $("#fixModeReplace").addEventListener("click", () => setFixMode("replace"));
   $("#fixModeBracket").addEventListener("click", () => setFixMode("bracket"));

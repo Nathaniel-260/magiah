@@ -294,6 +294,7 @@ class EditPlan:
         self.total = total
         self.confidence = confidence
         self.spans_markup = spans_markup
+        self.drifted = False        # set when the line moved since the scan
 
     def to_dict(self):
         return {'id': self.finding_id, 'lineno': self.lineno,
@@ -336,6 +337,41 @@ def _snippet_supports(line_clean, snippet, tok_index_hint=None):
     return hits >= max(2, len(toks) // 4)
 
 
+# How far to look for a line that drifted. Books get lines inserted and
+# removed between a scan and a fix; a few dozen lines covers ordinary editing
+# while staying far too small to reach an unrelated chapter.
+DRIFT_WINDOW = 60
+
+
+def _find_drifted_line(doc, lineno, word, snippet):
+    """The line this finding now sits on, after the file was edited.
+
+    Only ever returns a line that is unambiguous on two counts: the word must
+    occur there exactly once, and exactly ONE nearby line may qualify. The
+    report's snippet must corroborate it too — without that, a word common in
+    the book would relocate a finding to whichever line happened to be closest,
+    which is precisely the "correction on an unrelated passage" this module
+    exists to prevent. Returns None when anything is in doubt.
+    """
+    if not snippet:
+        return None            # nothing to corroborate with: do not guess
+    lo = max(0, lineno - DRIFT_WINDOW)
+    hi = min(len(doc.lines), lineno + DRIFT_WINDOW + 1)
+    hits = []
+    for n in range(lo, hi):
+        if n == lineno:
+            continue
+        line = doc.lines[n]
+        if len(normalize.phrase_spans(line, word)) != 1:
+            continue
+        if not _snippet_supports(line, snippet):
+            continue
+        hits.append(n)
+        if len(hits) > 1:
+            return None        # several candidates -> ambiguous, refuse
+    return hits[0] if len(hits) == 1 else None
+
+
 def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
     """Verify one finding against the file and return an :class:`EditPlan`.
 
@@ -355,9 +391,28 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
             'token_not_found', word='', n=(lineno or 0) + 1), id=fid)
     if mode not in MODES:
         mode = MODE_REPLACE
-    if lineno is None or lineno < 0 or lineno >= len(doc.lines):
+    if lineno is None or lineno < 0:
         raise PatchError('line_gone', _msg(
             'line_gone', n=(lineno or 0) + 1), id=fid)
+
+    # The book may have been edited since the scan — lines inserted or removed
+    # shift every finding below them. Rather than refuse everything (which
+    # would force a full re-scan for one added line), look for the line the
+    # finding drifted to. _find_drifted_line only accepts an unambiguous,
+    # snippet-corroborated match, so a failure to relocate still refuses.
+    drifted = False
+    if lineno >= len(doc.lines) or not normalize.phrase_spans(
+            doc.lines[lineno], word):
+        moved = None
+        if explicit is None:
+            moved = _find_drifted_line(doc, lineno, word,
+                                       finding.get('snippet'))
+        if moved is None:
+            if lineno >= len(doc.lines):
+                raise PatchError('line_gone', _msg(
+                    'line_gone', n=lineno + 1), id=fid)
+        else:
+            lineno, drifted = moved, True
 
     line = doc.lines[lineno]
     spans = normalize.phrase_spans(line, word)
@@ -410,9 +465,15 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
     if confidence != 'manual' and not _snippet_supports(
             line, finding.get('snippet')):
         confidence = 'weak'
-    return EditPlan(fid, lineno, start, end, old_raw,
+    if drifted:
+        # the line moved since the scan; the corrector should be told, even
+        # though the match itself was corroborated
+        confidence = 'moved'
+    plan = EditPlan(fid, lineno, start, end, old_raw,
                     render_replacement(mode, old_raw, correction), mode,
                     occurrence, total, confidence, '<' in old_raw)
+    plan.drifted = drifted
+    return plan
 
 
 def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
@@ -605,7 +666,12 @@ def anchor_rows(doc, rows):
             r['anchor'] = {'ok': True, 'start': plan.start, 'end': plan.end,
                            'confidence': plan.confidence,
                            'spans_markup': plan.spans_markup,
-                           'total_occurrences': plan.total}
+                           'total_occurrences': plan.total,
+                           'moved_from': (r.get('lineno')
+                                          if plan.drifted else None)}
+            # the row now describes where the word REALLY is, so the document
+            # pane highlights the right line
+            r['lineno'] = plan.lineno
         except PatchError as e:
             r['anchor'] = dict({'ok': False, 'code': e.code,
                                 'message': str(e)}, **e.extra)
