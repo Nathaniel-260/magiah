@@ -73,7 +73,13 @@ for _a, _b in _CONF_PAIRS:
 
 
 def clean(text):
-    """Strip HTML tags, decode entities, remove nikud/teamim."""
+    """Strip HTML tags, decode entities, remove nikud/teamim.
+
+    NOTE: :func:`clean_mapped` reproduces this transform character by
+    character in order to report offsets. The two MUST stay in sync — every
+    change here needs the same change there, and the test suite asserts
+    ``clean_mapped(t)[0] == clean(t)``.
+    """
     if '<' in text:
         text = INLINE_TAG_RE.sub('', text)
         text = TAG_RE.sub(' ', text)
@@ -85,6 +91,153 @@ def clean(text):
 def tokenize(text):
     """Hebrew tokens of cleaned text."""
     return TOKEN_RE.findall(clean(text))
+
+
+# ---------------------------------------------------------------------------
+# Offset-preserving variant, for editing the ORIGINAL file
+# ---------------------------------------------------------------------------
+# `clean` is lossy about position: it deletes nikud, drops inline tags and
+# rewrites entities, so a token's index in clean(text) says nothing about where
+# that word sits in the raw line (measured: 35 raw chars -> 22 clean ones). The
+# fixer must write back into the raw file, so it needs the inverse map.
+#
+# `clean_mapped` therefore performs the SAME transform as `clean` while
+# recording, for every character it emits, the raw index that produced it.
+# Tag ranges are blanked in place (rather than removed) so that indices stay
+# raw-aligned throughout:
+_DROP = '\x00'      # inline tag: removed with NO space (never splits a word)
+_SPACE = '\x01'     # structural tag: ONE space per tag (matches TAG_RE.sub(' '))
+_KEEP = '\x02'      # continuation of a structural tag: contributes nothing
+
+# `clean` decodes entities with html.unescape, which is more permissive than a
+# strict entity regex (it also accepts some forms without a trailing ';'). To
+# stay byte-identical we do not re-implement it: we find candidate runs, hand
+# each to html.unescape, and keep only the ones it actually changes.
+_ENTITY_RE = re.compile(r'&#?[0-9a-zA-Z]+;?')
+
+
+def clean_mapped(text):
+    """:func:`clean` plus a map from each output character back to the input.
+
+    Returns ``(clean_text, offmap, endmap)``. ``offmap[i]`` is the index in
+    `text` where the raw unit behind ``clean_text[i]`` STARTS, and
+    ``endmap[i]`` is the index just past where it ENDS. For an ordinary
+    character the two are ``i`` and ``i + 1``; when one raw unit expands to
+    several output characters (a presentation form decomposing to its base
+    letters, ``&#1488;`` decoding to a letter) every produced character
+    carries the whole unit's bounds. Slicing
+    ``text[offmap[a]:endmap[b]]`` therefore always covers whole raw units —
+    which is what makes a replacement safe.
+
+    Invariant (asserted by the tests): ``clean_mapped(t)[0] == clean(t)``.
+    """
+    buf = list(text)
+    if '<' in text:
+        # inline first, then structural — the order `clean` uses
+        for m in INLINE_TAG_RE.finditer(text):
+            for i in range(m.start(), m.end()):
+                buf[i] = _DROP
+        masked = ''.join(buf)
+        for m in TAG_RE.finditer(masked):
+            if _DROP in masked[m.start():m.end()]:
+                continue        # already consumed as an inline tag
+            # one space PER TAG: mark the opening char, blank the remainder,
+            # so '<blockquote><p>' yields two spaces exactly as
+            # TAG_RE.sub(' ') does
+            buf[m.start()] = _SPACE
+            for i in range(m.start() + 1, m.end()):
+                buf[i] = _KEEP
+    # entity decoding, still position-aligned: the decoded text is attributed
+    # to the '&' that started the entity
+    ents = {}
+    if '&' in text:
+        masked = ''.join(buf)
+        for m in _ENTITY_RE.finditer(masked):
+            frag = m.group()
+            if _DROP in frag or _SPACE in frag or _KEEP in frag:
+                continue        # the candidate sat inside a tag
+            dec = html.unescape(frag)
+            if dec != frag:
+                ents[m.start()] = (m.end(), dec)
+
+    out, omap, emap = [], [], []
+    i, n = 0, len(buf)
+    while i < n:
+        ent = ents.get(i)
+        if ent is not None:
+            end, dec = ent
+            for ch in dec:
+                rep = _STRIP.get(ord(ch), ch)
+                if rep is None:
+                    continue
+                for c in rep:
+                    out.append(c)
+                    omap.append(i)
+                    emap.append(end)
+            i = end
+            continue
+        ch = buf[i]
+        if ch == _DROP or ch == _KEEP:
+            i += 1
+            continue
+        if ch == _SPACE:
+            out.append(' ')
+            omap.append(i)
+            emap.append(i + 1)
+            i += 1
+            continue
+        rep = _STRIP.get(ord(ch), ch)
+        if rep is None:
+            i += 1
+            continue
+        for c in rep:
+            out.append(c)
+            omap.append(i)
+            emap.append(i + 1)
+        i += 1
+    return ''.join(out), omap, emap
+
+
+def token_spans(text):
+    """Tokens of `text` with the RAW slice each one occupies.
+
+    Returns ``[(token, raw_start, raw_end), ...]`` with `raw_end` exclusive,
+    in reading order; ``[t[0] for t in token_spans(x)] == tokenize(x)``.
+
+    A token that spans markup (``ויל<big>ך</big>`` tokenizes to ``וילך``)
+    yields ONE span covering the markup. Replacing that span removes the tags
+    along with the word, which is correct for a whole-word correction — and
+    callers that would rather not touch markup can detect it by looking for
+    '<' inside the returned slice.
+    """
+    clean_text, omap, emap = clean_mapped(text)
+    spans = []
+    for m in TOKEN_RE.finditer(clean_text):
+        spans.append((m.group(), omap[m.start()], emap[m.end() - 1]))
+    return spans
+
+
+def phrase_spans(text, phrase):
+    """Raw spans of `phrase`, which may cover SEVERAL tokens.
+
+    The ``extra_space`` family reports a split word as one finding whose
+    ``word`` contains a space (``'ל קוחה'`` -> ``'לקוחה'``), so matching a
+    single token is not enough: a consecutive run of tokens is matched and the
+    span runs from the first token's start to the last token's end, which
+    swallows the erroneous space between them.
+    """
+    want = phrase.split()
+    if not want:
+        return []
+    spans = token_spans(text)
+    if len(want) == 1:
+        return [s for s in spans if s[0] == want[0]]
+    out = []
+    for i in range(len(spans) - len(want) + 1):
+        window = spans[i:i + len(want)]
+        if [w[0] for w in window] == want:
+            out.append((phrase, window[0][1], window[-1][2]))
+    return out
 
 
 def is_abbrev(token):

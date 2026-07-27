@@ -19,6 +19,11 @@ Python install needed.
 > `dist\`** — ושם יושבות תוצאות הסריקה (`report.db` יכול להיות מאות MB),
 > ההחלטות שלכם ב־`ui_review.db` וקובצי ה־CSV.
 >
+> **וגם — `magiah_data\file_backups\`:** הגיבויים של קובצי הספרים שתיקנתם
+> ב«מצב מתקן». אלה העותקים היחידים של הספרים כפי שהיו **לפני** התיקון, והם
+> מה שמאפשר את «שחזור מגיבוי». מחיקתם אינה פוגעת בספרים עצמם, אך מבטלת את
+> האפשרות לחזור אחורה.
+>
 > הדגלים `--noconfirm` ו־`--clean` מוחקים את תוכן `dist\` לפני הבנייה — כלומר
 > **הפקודה הרגילה תמחק את כל זה**.
 >
@@ -76,6 +81,11 @@ if it is missing).
 > If you ran the exe from inside `dist\`, its data folder `magiah_data` was
 > created **inside `dist\`** — holding scan output (`report.db` can be hundreds
 > of MB), your decisions in `ui_review.db`, and the CSV exports.
+>
+> **And `magiah_data\file_backups\`:** the backups of the book files you
+> corrected in fixer mode. These are the only copies of those books as they
+> were *before* the fix, and they are what "restore from backup" restores
+> from. Deleting them harms no book, but it does end the ability to go back.
 >
 > `--noconfirm` and `--clean` wipe `dist\` before building, so **the plain
 > command destroys all of it**.

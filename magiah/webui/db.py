@@ -131,11 +131,30 @@ CREATE TABLE IF NOT EXISTS owned_decisions(
   word TEXT NOT NULL, unit TEXT NOT NULL,
   PRIMARY KEY(word, unit)
 );
+
+-- Fixer mode: one row per batch of corrections written into a book file.
+-- This is the file-level audit trail, separate from `history` (which records
+-- status changes): reverting a status must not silently imply that the book
+-- on disk was reverted too, so the two are tracked independently and the UI
+-- offers two distinct undo actions.
+CREATE TABLE IF NOT EXISTS file_edits(
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  path TEXT NOT NULL,          -- absolute path actually written
+  book_key TEXT NOT NULL,      -- 'file:<rel>' / 'local:<abs>'
+  backup TEXT NOT NULL,        -- the .bak taken BEFORE the write
+  mode TEXT NOT NULL,          -- default mode of the batch
+  finding_ids TEXT NOT NULL,   -- JSON array
+  detail TEXT NOT NULL,        -- JSON: per-edit lineno/start/end/old/new
+  fp_before TEXT, fp_after TEXT,
+  undone_at TEXT               -- NULL until the file is restored
+);
+CREATE INDEX IF NOT EXISTS idx_fe_key ON file_edits(book_key);
 '''
 
 # Tables SCHEMA creates; connect() only runs the script when one is missing.
 SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
-                 'owned_decisions'}
+                 'owned_decisions', 'file_edits'}
 
 # effective status: per-finding review wins, else the word rule, else pending
 EFF = "COALESCE(r.status, w.status, 'pending')"
@@ -1135,6 +1154,215 @@ def get_fixlist(con, book=None, origin=None, statuses=None):
 
 
 # ---------------------------------------------------------------------------
+# Fixer mode — per-FILE worklists and the file-edit log
+# ---------------------------------------------------------------------------
+# Everything here keys on the file path carried by `unit`, never on `source`.
+# `source` is only the filename stem, and in the real corpus one stem covers
+# many different books (measured: 'פרק א' -> 35 distinct files), so grouping a
+# writable worklist by `source` would let a correction land in a book it was
+# never meant for.
+
+def get_fixer_books(con, origin=None, statuses=None, query=None):
+    """Books that still have work, grouped by the FILE they live in.
+
+    DB-backed books have no file to edit; they are still listed (so nothing
+    disappears from the corrector's view) but marked ``editable: False`` and
+    offered as an export instead.
+    """
+    from . import patcher
+    if not statuses:
+        statuses = ['approved']
+    if isinstance(statuses, str):
+        statuses = [s for s in statuses.split(',') if s]
+    sph = ','.join('?' * len(statuses))
+    params = list(statuses)
+    where = ''
+    if origin:
+        where = ' AND f.origin = ?'
+        params.append(origin)
+    rows = con.execute(f'''
+        SELECT f.unit, f.origin, f.source, {EFF} AS st, COUNT(*)
+        FROM findings f {JOINS}
+        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
+        GROUP BY f.unit, f.origin, f.source, st''', params).fetchall()
+
+    books = {}
+    for unit, origin_v, source, st, n in rows:
+        key = patcher.book_key_of(unit)
+        editable = key is not None
+        if key is None:                    # a DB book: one entry per title
+            key = 'db:%s|%s' % (origin_v or '', source or '')
+        b = books.get(key)
+        if b is None:
+            title, folder = source or '', ''
+            if editable:
+                rel = key.split(':', 1)[1]
+                title = os.path.splitext(rel.rsplit('/', 1)[-1])[0] or title
+                folder = rel.rsplit('/', 1)[0] if '/' in rel else ''
+                folder = folder.replace('\\', '/')
+            b = books[key] = {
+                'key': key, 'title': title, 'folder': folder,
+                'origin': origin_v or '',
+                'origin_hebrew': hebrew.origin_hebrew(origin_v),
+                'editable': editable, 'kind': key.split(':', 1)[0],
+                'remaining': 0, 'fixed': 0, 'total': 0}
+        b['total'] += n
+        if st == 'fixed':
+            b['fixed'] += n
+        else:
+            b['remaining'] += n
+    out = list(books.values())
+    if query:
+        q = query.strip()
+        if q:
+            out = [b for b in out
+                   if q in b['title'] or q in b['folder']]
+    out.sort(key=lambda b: (-b['remaining'], b['title']))
+    return out
+
+
+def get_fixer_items(con, key, statuses=None, origin=None):
+    """The worklist for ONE file, in reading order, with occurrence numbers.
+
+    Rows are matched by the file part of `unit` (see the module note above),
+    so two books sharing a filename never share a worklist.
+    """
+    from . import patcher
+    if not statuses:
+        statuses = ['approved']
+    if isinstance(statuses, str):
+        statuses = [s for s in statuses.split(',') if s]
+    sph = ','.join('?' * len(statuses))
+    params = list(statuses)
+    where = ''
+    if origin:
+        where = ' AND f.origin = ?'
+        params.append(origin)
+    # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
+    # each row by parsing its unit — LIKE alone could match a longer path
+    params.append(key + ':%')
+    rows = con.execute(f'''
+        SELECT f.*, {EFF} AS effective_status, r.note AS note,
+               r.custom_suggestion AS custom_suggestion
+        FROM findings f {JOINS}
+        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
+          AND f.unit LIKE ?
+        ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
+        params).fetchall()
+    items = []
+    for r in rows:
+        d = _rowdict(r)
+        if patcher.book_key_of(d.get('unit')) != key:
+            continue                       # LIKE over-matched a longer path
+        parsed = patcher.resolve_unit_lineno(d.get('unit'))
+        if parsed is None:
+            continue
+        d['lineno'] = parsed
+        d['correction'] = d.get('custom_suggestion') or d.get('suggestion') or ''
+        items.append(d)
+    patcher.assign_occurrences(items)
+    return items
+
+
+def get_fixer_mode(con, key, default='replace'):
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      ('fixer_mode:' + key,)).fetchone()
+    return (row[0] if row and row[0] in ('replace', 'bracket') else default)
+
+
+def set_fixer_mode(con, key, mode):
+    if mode not in ('replace', 'bracket'):
+        raise ValueError(hebrew.MESSAGES['bad_request'])
+    con.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                ('fixer_mode:' + key, mode))
+    con.commit()
+    return mode
+
+
+def record_file_edit(con, path, book_key, backup, mode, finding_ids, detail,
+                     fp_before, fp_after):
+    cur = con.execute(
+        'INSERT INTO file_edits(ts, path, book_key, backup, mode, '
+        'finding_ids, detail, fp_before, fp_after, undone_at) '
+        'VALUES(?,?,?,?,?,?,?,?,?,NULL)',
+        (_now(), path, book_key, backup, mode,
+         json.dumps(finding_ids), detail, fp_before, fp_after))
+    con.commit()
+    return cur.lastrowid
+
+
+def get_file_edits(con, key=None, limit=50, include_undone=True):
+    sql = 'SELECT * FROM file_edits'
+    params, where = [], []
+    if key:
+        where.append('book_key = ?')
+        params.append(key)
+    if not include_undone:
+        where.append('undone_at IS NULL')
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY id DESC LIMIT ?'
+    params.append(int(limit))
+    out = []
+    for r in con.execute(sql, params):
+        d = dict(r)
+        try:
+            d['finding_ids'] = json.loads(d['finding_ids'])
+        except (ValueError, TypeError):
+            d['finding_ids'] = []
+        try:
+            d['detail'] = json.loads(d['detail'])
+        except (ValueError, TypeError):
+            d['detail'] = []
+        out.append(d)
+    return out
+
+
+def get_file_edit(con, edit_id):
+    row = con.execute('SELECT * FROM file_edits WHERE id = ?',
+                      (edit_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    try:
+        d['finding_ids'] = json.loads(d['finding_ids'])
+    except (ValueError, TypeError):
+        d['finding_ids'] = []
+    return d
+
+
+def mark_edit_undone(con, edit_id):
+    con.execute('UPDATE file_edits SET undone_at = ? WHERE id = ?',
+                (_now(), edit_id))
+    con.commit()
+
+
+def edits_touching(con, finding_ids):
+    """Live (not undone) file edits that wrote any of these findings.
+
+    Used to warn that undoing a STATUS does not restore the book file. Every
+    live edit is scanned, with no cap: a missed match would silently drop that
+    warning, and a corrector who is not told the file still holds the
+    correction will assume Ctrl+Z put the book back. `detail` is the large
+    column and is not needed here, so it is left in the database.
+    """
+    want = set(finding_ids)
+    out = []
+    for row in con.execute('SELECT id, ts, path, book_key, backup, mode, '
+                           'finding_ids, fp_before, fp_after, undone_at '
+                           'FROM file_edits WHERE undone_at IS NULL '
+                           'ORDER BY id DESC'):
+        d = dict(row)
+        try:
+            d['finding_ids'] = json.loads(d['finding_ids'])
+        except (ValueError, TypeError):
+            d['finding_ids'] = []
+        if want & set(d['finding_ids']):
+            out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # §9b — backup / reset / restore
 # ---------------------------------------------------------------------------
 
@@ -1153,9 +1381,15 @@ def write_backup(con, outdir):
     word_rules = [dict(r) for r in con.execute('SELECT * FROM word_rules')]
     history = [dict(r) for r in con.execute(
         'SELECT * FROM history ORDER BY id')]
+    # the file-edit log records which books were physically rewritten and
+    # where their .bak files are; losing it to a reset would strand the
+    # backups, so it travels with every UI backup
+    file_edits = [dict(r) for r in con.execute(
+        'SELECT * FROM file_edits ORDER BY id')]
     with open(path, 'w', encoding='utf-8') as f:
         json.dump({'ts': _now(), 'review': review, 'word_rules': word_rules,
-                   'history': history}, f, ensure_ascii=False)
+                   'history': history, 'file_edits': file_edits},
+                  f, ensure_ascii=False)
     return path
 
 

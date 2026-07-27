@@ -666,3 +666,85 @@ MESSAGES = {
     'import_done': 'הייבוא הושלם',
     'export_done': 'הייצוא הושלם',
 }
+
+
+# ---------------------------------------------------------------------------
+# מצב מתקן — כתיבת תיקונים לקובץ הספר
+# ---------------------------------------------------------------------------
+# Every refusal the file patcher can produce. The wording matters: the whole
+# point of refusing is that the corrector understands WHAT the tool declined to
+# guess and what to do about it, so each message names the word and the line.
+
+FIXER_MESSAGES = {
+    # -- the book cannot be edited at all --
+    'db_book': 'הספר הזה מגיע ממסד הנתונים ולא מקובץ טקסט — אפשר לייצא '
+               'את רשימת התיקונים, אך לא לתקן את הקובץ מכאן',
+    'not_a_file': 'קובץ הספר לא נמצא: {path}',
+    'not_txt': 'רק קובצי טקסט (‎.txt‎) ניתנים לתיקון ישיר',
+    'outside_library': 'נתיב הקובץ חורג מתיקיית הספרייה — התיקון בוטל',
+    'bad_unit': 'מזהה מיקום לא תקין: {unit}',
+    'too_big': 'הקובץ גדול מדי לפתיחה במתקן ({mb:.0f} MB, המגבלה '
+               '{limit:.0f} MB)',
+    'undecodable': 'לא ניתן לפענח את קידוד הקובץ בבטחה, ולכן הוא לא ייערך: '
+                   '{path}',
+
+    # -- the file moved under our feet --
+    'file_changed': 'הקובץ השתנה מאז שנפתח כאן — יש לטעון אותו מחדש '
+                    'לפני החלת התיקונים',
+    # NOT necessarily a manual edit: applying a second batch of corrections
+    # changes the file too, and blaming the user for something the tool did is
+    # both wrong and alarming. Name both causes, and the way out.
+    'file_changed_since_edit': 'הקובץ השתנה אחרי התיקון הזה — או שהוחל עליו '
+                               'תיקון נוסף מאוחר יותר, או שנערך ידנית. '
+                               'שחזור הגיבוי הזה היה מוחק את השינויים '
+                               'המאוחרים, ולכן בוטל. כדי לחזור אחורה יש '
+                               'לשחזר תחילה את התיקון האחרון.',
+    'line_gone': 'שורה {n} כבר לא קיימת בקובץ (הקובץ התקצר)',
+
+    # -- the word is not where we expected --
+    'token_not_found': 'המילה «{word}» לא נמצאה בשורה {n} — ייתכן שהיא '
+                       'כבר תוקנה',
+    'occurrence_count_changed': 'המילה «{word}» מופיעה בשורה {n} מספר פעמים '
+                                'שונה מכפי שהיה בסריקה (ייתכן שחלק כבר '
+                                'תוקן) — יש ללחוץ בטקסט על המופע שיש לתקן.',
+    'ambiguous_occurrence': 'המילה «{word}» מופיעה {k} פעמים בשורה {n} — '
+                            'יש לסמן בטקסט את המופע שיש לתקן',
+    'word_spans_markup': 'המילה «{word}» בשורה {n} חצויה בקובץ על ידי תגית '
+                         'עיצוב (למשל אות מוגדלת בתחילת מילה). תיקון אוטומטי '
+                         'היה שובר את התגית, ולכן הוא בוטל — יש לתקן את '
+                         'המילה הזו ידנית בקובץ.',
+    'unit_mismatch': 'הממצא שייך לקובץ אחר — התיקון בוטל',
+    # "apply them separately" was not achievable advice — the second still
+    # overlaps the first. The real resolution is to drop one of them.
+    'overlapping_edits': 'שני ממצאים מצביעים על אותו מקום בשורה {n} — '
+                         'לא ניתן להחיל את שניהם. יש לבחור אחד מהם '
+                         'ולבטל את הסימון של השני.',
+    'bad_offsets': 'טווח התיקון אינו תקין',
+    'no_correction': 'אין תיקון מוצע לממצא הזה',
+    'not_approved': 'לא ניתן לכתוב לספר ממצאים שטרם אושרו ({n}) — '
+                    'יש לאשר אותם תחילה, או להסיר את סימונם.',
+
+    # -- backups --
+    'bad_backup': 'שם קובץ הגיבוי אינו תקין',
+    'backup_missing': 'קובץ הגיבוי לא נמצא',
+
+    # -- success --
+    'applied': 'התיקונים נכתבו לקובץ. גיבוי נשמר לפני הכתיבה.',
+    'restored': 'הקובץ שוחזר מהגיבוי, והממצאים חזרו לסטטוס «אושר».',
+    'nothing_to_apply': 'לא נבחרו תיקונים להחלה',
+    'apply_refused': 'חלק מהתיקונים לא אושרו — לא נכתב דבר לקובץ',
+    'locked': 'הקובץ נעול (כנראה פתוח בעורך אחר) — יש לסגור אותו ולנסות שוב',
+    'db_warning': 'התיקון נכתב לקובץ בהצלחה, אך עדכון הסטטוס במסד הנתונים '
+                  'נכשל — אפשר לסמן «תוקן בספר» ידנית',
+    'file_untouched': 'הסטטוס בוטל, אך הקובץ עצמו לא שוחזר — לשחזור הקובץ '
+                      'יש להשתמש בכפתור «שחזור מגיבוי»',
+}
+
+FIXER_MODES = [
+    {'key': 'replace', 'hebrew': 'החלפה',
+     'explanation': 'המילה השגויה מוחלפת בתיקון, והשגיאה נעלמת מהטקסט.'},
+    {'key': 'bracket', 'hebrew': 'סוגריים',
+     'explanation': 'נכתב «(תיקון) [שגיאה]» — התיקון בסוגריים עגולים '
+                    'ואחריו המילה המקורית בסוגריים מרובעים, כך שהקורא '
+                    'רואה את שניהם.'},
+]

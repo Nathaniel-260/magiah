@@ -62,7 +62,13 @@ async function api(path, opts) {
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
   if (!res.ok) {
     const msg = data && data.error ? data.error : "שגיאת שרת (HTTP " + res.status + ")";
-    throw new Error(msg);
+    const err = new Error(msg);
+    // the fixer refuses with a machine code and a per-finding failure list;
+    // callers need both to explain WHY nothing was written
+    err.status = res.status;
+    err.code = data && data.code;
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -114,13 +120,21 @@ const S = {
   cardLoading: false,
   cardStale: true,
   cardFixOpen: false,
-  // fixer
-  fixBook: "",
+  // fixer — keyed on the FILE (fixKey), never on the book title: one title can
+  // belong to many different files in the corpus
+  fixKey: "",
+  fixBooks: [],
+  fixDoc: null,             // /api/fixer/doc response (lines + fingerprint)
+  fixLines: new Map(),      // lineno -> {n, text, tokens?}
   fixInclude: false,
   fixRows: [],
-  fixIdx: 0,
-  fixAlready: 0,
-  fixSession: 0,
+  fixCurId: null,           // the selected finding, by id — survives filtering
+  fixView: "",              // "" | blocked | st:<status> | et:<errtype>
+  fixMode: "replace",       // per-book default
+  fixModeOverride: new Map(),  // finding id -> mode (session only)
+  fixPicked: new Set(),     // findings selected for the next apply
+  fixEdits: [],             // file_edits log for this book
+  fixDocStale: false,       // set when the server says the file changed
   // misc
   lastActions: [],           // local stack for card-restore on undo
   hashLock: false,
@@ -173,8 +187,12 @@ function writeHash() {
   if (f.q) p.set("q", f.q);
   if (f.sort !== "rank" || f.dir !== "desc") p.set("sort", f.sort + ":" + f.dir);
   if (S.page > 1) p.set("p", String(S.page));
-  if (S.fixBook) p.set("fb", S.fixBook);
+  if (S.fixKey) p.set("fk", S.fixKey);
   if (S.fixInclude) p.set("fi", "1");
+  // written whenever a book is open, so that reloading a link cannot flip the
+  // mode back to the book's stored default behind the corrector's back
+  if (S.fixKey) p.set("fm", S.fixMode);
+  if (S.fixView) p.set("fv", S.fixView);
   S.hashLock = true;
   location.hash = p.toString();
   setTimeout(() => { S.hashLock = false; }, 0);
@@ -194,8 +212,10 @@ function readHash() {
   f.sort = so[0] || "rank";
   f.dir = so[1] || "desc";
   S.page = parseInt(p.get("p") || "1", 10) || 1;
-  S.fixBook = p.get("fb") || "";
+  S.fixKey = p.get("fk") || "";
   S.fixInclude = p.get("fi") === "1";
+  S.fixMode = p.get("fm") === "bracket" ? "bracket" : "replace";
+  S.fixView = p.get("fv") || "";
 }
 window.addEventListener("hashchange", () => {
   if (S.hashLock) return;
@@ -467,7 +487,7 @@ async function setStatus(ids, status, opts) {
 
 function repaintStatuses() {
   if (S.view === "table") renderTableRows();
-  if (S.view === "fixer") renderFixList(false);
+  if (S.view === "fixer") { renderFixList(false); renderFixDoc(); }
 }
 
 async function doUndo() {
@@ -485,6 +505,14 @@ async function doUndo() {
     let msg = "הפעולה האחרונה בוטלה";
     if (resp && resp.reverted != null) msg += " (" + fmtNum(resp.reverted) + " ממצאים)";
     toast(msg, "ok");
+    // The server flags an undo whose correction is already ON DISK. Undoing a
+    // status does NOT rewrite the book, and a corrector who is not told that
+    // will assume the file went back too — so say it loudly, and in the fixer
+    // leave it on screen next to the button that WOULD revert the file.
+    if (resp && resp.file_warning) {
+      toast(resp.file_warning, "err", 12000);
+      if (S.view === "fixer") setFixBanner(resp.file_warning, "err");
+    }
     repaintStatuses();
     updateProgress();
     if (S.view === "table") loadTable();
@@ -523,6 +551,9 @@ function syncFilterControls() {
   $$("#fStatuses input[type=checkbox]").forEach(c => { c.checked = f.statuses.includes(c.value); });
   $$("#fBookList .book-item").forEach(b => b.classList.toggle("selected", b.dataset.name === f.book));
   $("#fixInclude").checked = S.fixInclude;
+  if ($("#fixBook")) $("#fixBook").value = S.fixKey;
+  syncModeButtons();
+  syncFixViewSelect();
 }
 
 function buildSidebar() {
@@ -1061,117 +1092,662 @@ function cardSkip() {
   ensureCardQueue();
 }
 
-/* ---------------------------------------------------------- fixer view */
+/* ============================================================ fixer view
+ * The corrector no longer leaves the tool to fix a book: the book's own .txt
+ * is opened here, the findings are highlighted inside the real text, and the
+ * approved corrections are written back into the file (after a backup).
+ *
+ * Every offset shown or sent comes from the SERVER. The browser never computes
+ * where a word sits in the file — it can only echo back an anchor the server
+ * already verified. That is what keeps a correction from ever landing on an
+ * unrelated passage, which is the whole point of this screen.
+ */
+function fixBookLabel(b) {
+  let s = b.title || b.key;
+  if (b.folder) s += "  ·  " + b.folder;
+  if (!b.editable) s += "  (מסד נתונים — ייצוא בלבד)";
+  else if (!b.exists) s += "  (הקובץ חסר)";
+  if (b.remaining != null) s += "  — נותרו " + fmtNum(b.remaining);
+  return s;
+}
+
 async function loadFixerBooks() {
-  const sel = $("#fixBook");
-  const keep = S.fixBook;
-  sel.replaceChildren(el("option", { value: "" }, "בחר ספר לתיקון…"));
-  let entries = [];
   try {
     const p = new URLSearchParams();
     if (S.filters.origin) p.set("origin", S.filters.origin);
-    const resp = await api("/api/fixlist" + (p.toString() ? "?" + p : ""));
-    const books = resp.books || resp.rows || [];
-    for (const b of books) {
-      const remaining = b.remaining != null ? b.remaining : b.count;
-      if (remaining > 0) entries.push({ name: b.source || b.name, remaining });
-    }
-  } catch (e) { /* fall through to /api/books */ }
-  if (!entries.length) {
-    try {
-      const resp = await api("/api/books" + (S.filters.origin ? "?origin=" + encodeURIComponent(S.filters.origin) : ""));
-      const books = Array.isArray(resp) ? resp : (resp.books || []);
-      entries = books
-        .filter(b => (b.approved_count != null ? b.approved_count : 1) > 0)
-        .map(b => ({ name: b.name || b.source, remaining: b.approved_count }));
-    } catch (e) {
-      toast("טעינת רשימת הספרים נכשלה: " + e.message, "err");
-    }
+    p.set("statuses", S.fixInclude ? "approved,unsure,pending" : "approved");
+    const resp = await api("/api/fixer/books?" + p);
+    S.fixBooks = resp.books || [];
+  } catch (e) {
+    toast("טעינת רשימת הספרים נכשלה: " + e.message, "err");
   }
-  entries.sort((a, b) => (b.remaining || 0) - (a.remaining || 0));
-  for (const en of entries) {
-    sel.append(el("option", { value: en.name }, en.name + (en.remaining != null ? " — נותרו " + fmtNum(en.remaining) : "")));
-  }
-  if (keep) sel.value = keep;
+  renderFixBookOptions();
 }
 
-async function loadFixlist() {
-  const box = $("#fixList");
-  if (!S.fixBook) {
-    box.replaceChildren(el("div", { class: "fixer-empty" }, "בחר ספר מהרשימה — מוצגים רק ספרים שיש בהם ממצאים מאושרים שטרם תוקנו."));
+/* The picker is filtered in the browser: the whole list is already here, and
+ * a corrector hunting for one book among hundreds should not wait for a round
+ * trip on every keystroke. The book currently open always stays listed, so
+ * typing can never make the selection silently vanish. */
+function renderFixBookOptions() {
+  const sel = $("#fixBook");
+  if (!sel) return;
+  const q = ($("#fixBookSearch") ? $("#fixBookSearch").value : "").trim();
+  const books = S.fixBooks || [];
+  const hits = q
+    ? books.filter(b => (b.title || "").indexOf(q) >= 0 ||
+                        (b.folder || "").indexOf(q) >= 0)
+    : books;
+  // the open book stays listed even when it does not match, so typing can
+  // never make the current selection disappear — but it is not counted as a
+  // search result, which would be a lie
+  const shown = hits.slice();
+  if (q && S.fixKey && !shown.some(b => b.key === S.fixKey)) {
+    const open = books.find(b => b.key === S.fixKey);
+    if (open) shown.push(open);
+  }
+  sel.replaceChildren(el("option", { value: "" },
+    q ? (hits.length ? "נמצאו " + fmtNum(hits.length) + " ספרים — בחר…"
+                     : "לא נמצא ספר התואם לחיפוש")
+      : "בחר ספר לתיקון…"));
+  for (const b of shown) {
+    sel.append(el("option", { value: b.key }, fixBookLabel(b)));
+  }
+  sel.value = S.fixKey || "";
+}
+
+function fixBookInfo(key) {
+  return (S.fixBooks || []).find(b => b.key === (key || S.fixKey)) || null;
+}
+
+/* the write mode named in the URL, if any */
+function hashMode() {
+  const v = new URLSearchParams(location.hash.replace(/^#/, "")).get("fm");
+  return v === "bracket" ? "bracket" : (v === "replace" ? "replace" : null);
+}
+
+async function loadFixDoc() {
+  const list = $("#fixList");
+  if (!S.fixKey) {
+    S.fixDoc = null;
+    S.fixRows = [];
+    list.replaceChildren(el("div", { class: "fixer-empty" },
+      "בחר ספר מהרשימה — הכלי יפתח את קובץ הטקסט עצמו ויסמן בו את המקומות לתיקון."));
+    $("#fixDoc").replaceChildren();
+    $("#fixDocPath").textContent = "";
+    $("#fixDocMeta").textContent = "";
+    setFixBanner(null);
     updateFixProgress();
+    updateApplyButton();
     return;
   }
-  box.replaceChildren(el("div", { class: "fixer-empty" }, "טוען רשימת עבודה…"));
-  const sts = S.fixInclude ? "approved,unsure,pending" : "approved";
-  const p = new URLSearchParams({ book: S.fixBook, statuses: sts });
+  list.replaceChildren(el("div", { class: "fixer-empty" }, "טוען את הספר…"));
+  const p = new URLSearchParams({
+    key: S.fixKey,
+    statuses: S.fixInclude ? "approved,unsure,pending" : "approved",
+  });
   if (S.filters.origin) p.set("origin", S.filters.origin);
+  // resolving an ambiguous occurrence is manual, per-word work; a reload
+  // rebuilds the rows from the server, so carry those choices across
+  const manual = new Map((S.fixRows || [])
+    .filter(r => r.explicit).map(r => [r.id, r.explicit]));
   try {
-    const [resp, fixedR] = await Promise.all([
-      api("/api/fixlist?" + p),
-      api("/api/findings?" + new URLSearchParams({ book: S.fixBook, status: "fixed", page: "1", page_size: "1", sort: "rank", dir: "desc" })),
-    ]);
-    S.fixRows = rowsOf(resp);
-    S.fixAlready = totalOf(fixedR);
-    S.fixSession = 0;
-    S.fixIdx = 0;
+    const resp = await api("/api/fixer/doc?" + p);
+    S.fixDoc = resp;
+    S.fixRows = resp.items || [];
+    for (const r of S.fixRows) {
+      const e = manual.get(r.id);
+      // only re-apply where the server still cannot place it itself; if it
+      // now anchors on its own, its answer is the better one
+      if (e && r.anchor && !r.anchor.ok) {
+        const line = (resp.lines || []).find(l => l.n === r.lineno);
+        const txt = line ? line.text : "";
+        r.explicit = e;
+        r.anchor = { ok: true, start: e.start, end: e.end,
+                     confidence: "manual",
+                     spans_markup: txt.slice(e.start, e.end).indexOf("<") >= 0 };
+      }
+    }
+    S.fixLines = new Map((resp.lines || []).map(l => [l.n, l]));
+    // an explicit #fm in the URL is a deliberate choice by whoever opened this
+    // link, so it outranks the book's stored default
+    S.fixMode = hashMode() || resp.default_mode || "replace";
+    S.fixModeOverride = new Map();
+    // Only APPROVED findings are pre-selected. A finding nobody has judged
+    // yet must never be written into a book just because it was on screen —
+    // the corrector opts in, per finding or with the quick-pick bar.
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved")
+      .map(r => r.id));
+    S.fixDocStale = false;
+    S.fixCurId = (S.fixRows[0] || {}).id ?? null;
+    S.fixEdits = resp.edits || [];
+    syncModeButtons();
+    renderFixDoc();
     renderFixList(true);
+    updateFixHead();
+    if (!resp.editable) {
+      setFixBanner(resp.message || "ספר זה אינו קובץ טקסט — אפשר לייצא את התיקונים בלבד.", "err");
+    } else {
+      showBlockedBanner();
+    }
   } catch (e) {
-    box.replaceChildren(el("div", { class: "fixer-empty" }, "הטעינה נכשלה: " + e.message));
-    toast(e.message, "err");
+    S.fixDoc = null;
+    S.fixRows = [];
+    list.replaceChildren(el("div", { class: "fixer-empty" }, "הטעינה נכשלה: " + e.message));
+    setFixBanner(e.message, "err");
   }
+  updateApplyButton();
 }
 
+/* ---- which findings the worklist shows -------------------------------
+ * The order is ALWAYS the order of the book (by line number). A corrector
+ * works a book front to back, and re-ordering the list would make them lose
+ * their place — so "show me the pending ones" narrows the list instead of
+ * shuffling it. Whatever is shown stays in reading order.
+ */
+function fixViewOptions() {
+  const counts = new Map();
+  for (const r of S.fixRows) {
+    const st = effStatus(r);
+    counts.set("st:" + st, (counts.get("st:" + st) || 0) + 1);
+    const et = r.errtype || "";
+    if (et) counts.set("et:" + et, (counts.get("et:" + et) || 0) + 1);
+  }
+  const opts = [{ key: "", label: "הכל", n: S.fixRows.length }];
+  const blocked = S.fixRows.filter(r => r.anchor && !r.anchor.ok).length;
+  if (blocked) {
+    opts.push({ key: "blocked", label: "⚠ דורשים אישור ידני", n: blocked });
+  }
+  for (const s of statuses()) {
+    const n = counts.get("st:" + s.key) || 0;
+    if (n) opts.push({ key: "st:" + s.key, label: s.icon + " " + s.hebrew, n });
+  }
+  for (const [k, n] of counts) {
+    if (!k.startsWith("et:")) continue;
+    const et = k.slice(3);
+    opts.push({ key: k, label: errtypeInfo(et).hebrew || et, n });
+  }
+  return opts;
+}
+
+function visibleFixRows() {
+  const f = S.fixView;
+  if (!f) return S.fixRows;
+  if (f === "blocked") {
+    return S.fixRows.filter(r => r.anchor && !r.anchor.ok);
+  }
+  if (f.startsWith("st:")) {
+    const st = f.slice(3);
+    return S.fixRows.filter(r => effStatus(r) === st);
+  }
+  if (f.startsWith("et:")) {
+    const et = f.slice(3);
+    return S.fixRows.filter(r => (r.errtype || "") === et);
+  }
+  return S.fixRows;
+}
+
+/* the selected finding, and how to move the selection within the view */
+function currentFixRow() {
+  const view = visibleFixRows();
+  if (S.fixCurId != null) {
+    const hit = view.find(r => r.id === S.fixCurId);
+    if (hit) return hit;
+  }
+  return view[0] || null;
+}
+
+function moveFixSelection(delta) {
+  const view = visibleFixRows();
+  if (!view.length) return;
+  const cur = currentFixRow();
+  const at = Math.max(0, view.findIndex(r => cur && r.id === cur.id));
+  const next = view[Math.min(view.length - 1, Math.max(0, at + delta))];
+  if (next) selectFixRowById(next.id);
+}
+
+/* a row can be written only when the server managed to anchor it */
+function canApply(r) {
+  return !!(r && r.anchor && r.anchor.ok && (r.correction || effFix(r)) &&
+            effStatus(r) !== "fixed");
+}
+
+function rowMode(r) {
+  return S.fixModeOverride.get(r.id) || S.fixMode;
+}
+
+/* -------------------------------------------------- the document pane */
+function renderFixDoc() {
+  const box = $("#fixDoc");
+  box.replaceChildren();
+  if (!S.fixDoc || !S.fixDoc.editable) return;
+  const byLine = new Map();
+  for (const r of S.fixRows) {
+    if (r.lineno == null) continue;
+    if (!byLine.has(r.lineno)) byLine.set(r.lineno, []);
+    byLine.get(r.lineno).push(r);
+  }
+  const nums = [...S.fixLines.keys()].sort((a, b) => a - b);
+  let prev = null;
+  for (const n of nums) {
+    // the pane may be windowed around the findings; say so rather than
+    // letting the corrector think the book is shorter than it is
+    if (prev != null && n > prev + 1) {
+      box.append(el("div", { class: "fdoc-gap" },
+        "… דילוג על " + fmtNum(n - prev - 1) + " שורות …"));
+    }
+    prev = n;
+    box.append(fixDocLine(n, byLine.get(n) || []));
+  }
+  if (!nums.length) box.append(el("div", { class: "fixer-empty" }, "הקובץ ריק."));
+}
+
+function fixDocLine(n, rows) {
+  const info = S.fixLines.get(n);
+  const text = info ? info.text : "";
+  const cur = currentFixRow();
+  const line = el("div", {
+    class: "fdoc-line" + (rows.length ? " has-fix" : "") +
+      (rows.some(r => effStatus(r) === "fixed") ? " edited" : "") +
+      (cur && cur.lineno === n ? " current" : ""),
+    dataset: { n: String(n) },
+  });
+  line.append(el("span", { class: "fdoc-num" }, String(n + 1)));
+  const body = el("bdi", { class: "fdoc-text" });
+
+  // anchored highlights, spliced in from RIGHT to LEFT (descending offset) —
+  // the same rule the writer uses, so what is shown is what will be written
+  const anchored = rows.filter(r => r.anchor && r.anchor.ok)
+    .sort((a, b) => b.anchor.start - a.anchor.start);
+  let tail = text.length;
+  const pieces = [];
+  for (const r of anchored) {
+    const a = r.anchor;
+    if (a.end > tail) continue;                 // overlapping: skip the later
+    pieces.unshift(text.slice(a.end, tail));
+    pieces.unshift(fixHitNode(r, text.slice(a.start, a.end),
+                              cur && cur.id === r.id));
+    tail = a.start;
+  }
+  pieces.unshift(text.slice(0, tail));
+
+  // A row the server refused to place is resolved by pointing at the word,
+  // which turns the whole line into clickable tokens. That mode is driven by
+  // the SELECTED row, not by whichever blocked row happens to be first:
+  // otherwise a second blocked finding on the same line could never be
+  // resolved, and the line's other — correctly anchored — marks would lose
+  // their previews for as long as any one row on it stayed blocked.
+  const pick = rows.find(r => r.anchor && !r.anchor.ok && cur &&
+                         r.id === cur.id && Array.isArray(info && info.tokens));
+  if (pick && info.tokens.length) {
+    body.append(...tokenPickLine(text, info.tokens, pick));
+  } else {
+    for (const p of pieces) {
+      body.append(typeof p === "string" ? document.createTextNode(p) : p);
+    }
+  }
+  line.append(body);
+  return line;
+}
+
+/* One marked word inside the book text.
+ *
+ * The corrector's question at every mark is "what goes and what comes?", so
+ * the mark answers it in place, using the printer's convention: the original
+ * struck through, the correction underlined right after it. Nothing is hidden
+ * behind a tooltip — the line reads as the corrected sentence would, with the
+ * old word still visible for comparison.
+ *
+ * In bracket mode the mark shows the literal string that will be written,
+ * "(תיקון) [שגיאה]", because there the original stays in the book too.
+ */
+function fixHitNode(r, rawSlice, isCurrent) {
+  const st = effStatus(r);
+  const fix = r.correction || effFix(r) || "";
+  const a = r.anchor || {};
+  const mode = rowMode(r);
+  const done = st === "fixed";
+  const wrap = el("span", {
+    class: "fdoc-hit st-" + st + (isCurrent ? " current" : "") +
+      (a.confidence === "weak" ? " weak" : ""),
+    dataset: { id: String(r.id) },
+    title: statusInfo(st).hebrew + " — " + (r.word || "") + " ⇐ " + (fix || "—"),
+  });
+  // status marker, so a glance over the page says what was decided where
+  wrap.append(el("span", { class: "fdoc-badge" }, statusInfo(st).icon));
+
+  // Nothing is going to be written here, so showing a correction would be a
+  // lie: a rejected or ignored finding leaves the book exactly as it is, and
+  // an already-applied one is the book as it is. Show the word plainly.
+  const keeps = st === "not_error" || st === "ignored";
+  if (done || keeps || !fix) {
+    wrap.append(el("bdi", { class: "fdoc-word" }, rawSlice));
+  } else if (mode === "bracket") {
+    wrap.append(el("bdi", { class: "fdoc-bracket" }, "(" + fix + ") [" + rawSlice + "]"));
+  } else {
+    wrap.append(el("bdi", { class: "fdoc-old" }, rawSlice),
+                el("bdi", { class: "fdoc-new" }, fix));
+  }
+  wrap.addEventListener("click", ev => {
+    ev.stopPropagation();
+    selectFixRowById(r.id);
+  });
+  return wrap;
+}
+
+/* every token clickable, so an ambiguous finding can be resolved by hand */
+function tokenPickLine(text, tokens, row) {
+  const out = [];
+  let pos = 0;
+  for (const [a, b] of tokens) {
+    if (a < pos) continue;
+    out.push(document.createTextNode(text.slice(pos, a)));
+    const t = el("span", { class: "fdoc-tok", title: "לחיצה תסמן שזה המופע לתיקון" },
+      text.slice(a, b));
+    t.addEventListener("click", ev => {
+      ev.stopPropagation();
+      resolveOccurrence(row, a, b);
+    });
+    out.push(t);
+    pos = b;
+  }
+  out.push(document.createTextNode(text.slice(pos)));
+  return out;
+}
+
+/* The human pointed at a word. `start`/`end` are a token span the SERVER sent
+ * with this line, echoed back unchanged — the browser still never measures the
+ * file. The server re-verifies the span really is this word before writing
+ * (patcher.plan_edit's `explicit` branch), so a stale pick is caught there. */
+function resolveOccurrence(row, start, end) {
+  const lineText = (S.fixLines.get(row.lineno) || {}).text || "";
+  const picked = lineText.slice(start, end);
+  row.explicit = { start, end };
+  row.anchor = { ok: true, start, end, confidence: "manual",
+                 spans_markup: picked.indexOf("<") >= 0 };
+  // Pointing at a word says WHERE, not WHETHER. Arming an undecided finding
+  // on a locational click would write into a book something nobody judged.
+  if (effStatus(row) === "approved") S.fixPicked.add(row.id);
+  toast(effStatus(row) === "approved"
+    ? "המופע סומן: «" + picked + "» — התיקון יוחל כאן בלבד"
+    : "המופע סומן: «" + picked + "». הממצא עדיין לא אושר — יש לאשר אותו כדי שייכלל בתיקון.",
+    "ok", 6000);
+  renderFixDoc();
+  renderFixList(false);
+  updateApplyButton();
+  showBlockedBanner();
+}
+
+/* Bring the finding into view — the WORD, not the top of its paragraph.
+ * Book lines can run for hundreds of characters, so scrolling to the line
+ * often left the marked word far below the fold, which is the opposite of
+ * the point. Scroll to the mark itself when it exists. */
+function scrollDocToLine(n, id) {
+  const doc = $("#fixDoc");
+  if (!doc) return;
+  const line = doc.querySelector(".fdoc-line[data-n='" + n + "']");
+  if (!line) return;
+  const hit = id != null
+    ? line.querySelector(".fdoc-hit[data-id='" + id + "']")
+    : line.querySelector(".fdoc-hit");
+  (hit || line).scrollIntoView({ block: "center", inline: "center",
+                                 behavior: "smooth" });
+}
+
+function updateFixHead() {
+  const b = fixBookInfo();
+  const d = S.fixDoc;
+  $("#fixDocPath").textContent = (d && d.book && d.book.path) || (b && b.path) || "";
+  if (!d || !d.editable) { $("#fixDocMeta").textContent = ""; return; }
+  const bits = [fmtNum(d.line_count) + " שורות", d.encoding];
+  if (d.windowed) bits.push("תצוגה מקוצרת סביב הממצאים");
+  $("#fixDocMeta").textContent = bits.join(" · ");
+}
+
+/* -------------------------------------------------- banners */
+function setFixBanner(node, kind) {
+  const bn = $("#fixerBanner");
+  if (!node) { bn.hidden = true; bn.replaceChildren(); return; }
+  bn.hidden = false;
+  bn.className = kind || "";
+  bn.replaceChildren(typeof node === "string"
+    ? el("div", { class: "bn-text" }, node) : node);
+}
+
+function showBlockedBanner() {
+  const blocked = S.fixRows.filter(r => r.anchor && !r.anchor.ok &&
+                                   effStatus(r) !== "fixed");
+  if (!blocked.length) { setFixBanner(null); return; }
+  const byCode = new Map();
+  for (const r of blocked) {
+    const c = r.anchor.code || "";
+    if (!byCode.has(c)) byCode.set(c, { message: r.anchor.message, n: 0 });
+    byCode.get(c).n++;
+  }
+  const ul = el("ul");
+  for (const [, v] of byCode) {
+    ul.append(el("li", null, v.message + " (" + fmtNum(v.n) + ")"));
+  }
+  setFixBanner(el("div", { class: "bn-text" },
+    el("b", null, fmtNum(blocked.length) + " ממצאים לא יוחלו אוטומטית — "),
+    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש. " +
+    "אפשר ללחוץ על המילה הנכונה בטקסט כדי לסמן אותה ידנית.",
+    ul));
+}
+
+/* -------------------------------------------------- worklist */
 function renderFixList(scroll) {
   const box = $("#fixList");
   box.replaceChildren();
+  if (!S.fixKey) {
+    box.append(el("div", { class: "fixer-empty" },
+      "בחר ספר מהרשימה — הכלי יפתח את קובץ הטקסט עצמו ויסמן בו את המקומות לתיקון."));
+    updateFixProgress();
+    return;
+  }
   if (!S.fixRows.length) {
     box.append(el("div", { class: "fixer-empty" }, "אין ממצאים לתיקון בספר זה 🎉"));
     updateFixProgress();
     return;
   }
+  const editable = !!(S.fixDoc && S.fixDoc.editable);
+  // filtered, but never re-ordered: the list always runs down the book
+  const view = visibleFixRows();
+  syncFixViewSelect();
+  if (!view.length) {
+    box.append(el("div", { class: "fixer-empty" },
+      "אין ממצאים מהסוג שנבחר בספר זה. אפשר לבחור «הכל» כדי לראות את השאר."));
+    updateFixProgress();
+    updateApplyButton();
+    return;
+  }
   let lastRef = null;
-  S.fixRows.forEach((r, idx) => {
+  view.forEach((r, idx) => {
     const ref = r.ref || "(ללא מראה מקום)";
     if (ref !== lastRef) {
       box.append(el("div", { class: "fix-refgroup" }, el("bdi", null, ref)));
       lastRef = ref;
     }
-    const done = effStatus(r) === "fixed";
-    const row = el("div", { class: "fix-row" + (idx === S.fixIdx ? " current" : "") + (done ? " done-row" : ""), dataset: { idx: String(idx) } });
-    const main = el("div", { class: "fix-main" });
-    const rfix = effFix(r);
-    main.append(el("div", { class: "fix-wordline" },
-      wordDiffNode(r.word || "", rfix || "", "err", "w-err"),
-      el("span", { class: "arr" }, "⇐"),
-      rfix ? wordDiffNode(rfix, r.word || "", "fix", "w-fix") : el("bdi", { class: "w-fix" }, "—"),
-      r.custom_suggestion ? el("span", { class: "et-tag", style: "margin-inline-start:8px" }, "תיקון ידני") : null));
-    main.append(el("div", { class: "fix-snip" }, renderSnippet(r.snippet, r.word, null, rfix)));
-    const pf = parseFileUnit(r.unit);
-    if (pf) main.append(el("div", { class: "fix-file" }, fileUnitNode(pf)));
-    row.append(main);
-    const side = el("div", { class: "fix-side" });
-    const cp = el("div", { class: "copybtns" });
-    const b1 = el("button", { title: "העתקת המילה השגויה" }, "📋 מילה");
-    b1.addEventListener("click", () => copyText(r.word || ""));
-    const b2 = el("button", { title: "העתקת התיקון" }, "📋 תיקון");
-    b2.addEventListener("click", () => copyText(effFix(r)));
-    cp.append(b1, b2);
-    side.append(cp);
-    const fx = el("button", { class: "btn-fixed" }, done ? "✓ תוקן" : "תוקן ✓");
-    fx.disabled = done;
-    fx.addEventListener("click", () => markFixed(idx));
-    side.append(fx);
-    row.append(side);
-    row.addEventListener("click", ev => {
-      if (ev.target.tagName === "BUTTON") return;
-      S.fixIdx = idx;
-      renderFixList(false);
-    });
-    box.append(row);
+    box.append(fixRowNode(r, idx, editable));
   });
   updateFixProgress();
+  updateApplyButton();
   if (scroll) scrollFixCurrent();
+}
+
+/* rebuild the view picker, showing how many findings each choice holds */
+function syncFixViewSelect() {
+  const sel = $("#fixView");
+  if (!sel) return;
+  const opts = fixViewOptions();
+  sel.replaceChildren();
+  for (const o of opts) {
+    sel.append(el("option", { value: o.key },
+      o.label + " (" + fmtNum(o.n) + ")"));
+  }
+  if (!opts.some(o => o.key === S.fixView)) S.fixView = "";
+  sel.value = S.fixView;
+}
+
+function fixRowNode(r, idx, editable) {
+  const done = effStatus(r) === "fixed";
+  const blocked = !!(r.anchor && !r.anchor.ok) && !done;
+  const cur = currentFixRow();
+  const row = el("div", {
+    class: "fix-row" + (cur && cur.id === r.id ? " current" : "") +
+      (done ? " done-row" : "") + (blocked ? " row-blocked" : ""),
+    dataset: { idx: String(idx) },
+  });
+  const main = el("div", { class: "fix-main" });
+  const rfix = r.correction || effFix(r);
+  const mode = rowMode(r);
+  const st = effStatus(r);
+  const sinfo = statusInfo(st);
+  // the status of THIS finding, stated rather than implied by row colour
+  const chip = el("span", { class: "chip st-" + st, title: "לחיצה לשינוי הסטטוס" },
+    (sinfo.icon ? sinfo.icon + " " : "") + sinfo.hebrew);
+  chip.addEventListener("click", ev => {
+    ev.stopPropagation();
+    openStatusMenu(ev.currentTarget, key => fixAct(r, key));
+  });
+  main.append(el("div", { class: "fix-wordline" },
+    chip,
+    wordDiffNode(r.word || "", rfix || "", "err", "w-err"),
+    el("span", { class: "arr" }, "⇐"),
+    rfix ? wordDiffNode(rfix, r.word || "", "fix", "w-fix")
+         : el("bdi", { class: "w-fix" }, "—"),
+    r.custom_suggestion ? el("span", { class: "et-tag" }, "תיקון ידני") : null,
+    mode === "bracket" ? el("span", { class: "fix-mode-tag" }, "סוגריים") : null));
+  main.append(el("div", { class: "fix-snip" },
+    renderSnippet(r.snippet, r.word, null, rfix)));
+  if (r.lineno != null && editable) {
+    const loc = el("span", { class: "fix-loc" }, "📍 שורה " + fmtNum(r.lineno + 1));
+    loc.addEventListener("click", ev => { ev.stopPropagation(); scrollDocToLine(r.lineno, r.id); });
+    main.append(loc);
+  }
+  if (blocked) main.append(el("div", { class: "fix-warn" }, r.anchor.message || ""));
+  else if (r.anchor && r.anchor.confidence === "weak") {
+    // the surrounding text does not look like the text the finding was made
+    // against — probably fine, but worth a human glance before writing
+    main.append(el("div", { class: "fix-warn weak-warn" },
+      "⚠ הקטע בקובץ אינו תואם במלואו לקטע שנסרק — כדאי לוודא לפני ההחלה."));
+  }
+  if (r.anchor && r.anchor.ok && r.anchor.spans_markup) {
+    // replacing takes the tag with the word (fine); bracketing would wrap
+    // half of it and mis-nest the markup, so that combination is refused
+    main.append(el("div", { class: "fix-warn" },
+      "⚠ המילה חצויה בקובץ על ידי תגית עיצוב — תיקון אוטומטי היה שובר אותה. יש לתקן ידנית."));
+  }
+  row.append(main);
+
+  const side = el("div", { class: "fix-side" });
+  // the whole decision set from the cards tab, so a corrector can also settle
+  // findings that were never triaged instead of leaving the screen
+  const acts = el("div", { class: "fix-acts" });
+  const act = (label, title, fn, cls) => {
+    const b = el("button", { title: title || label, class: cls || null }, label);
+    b.addEventListener("click", ev => { ev.stopPropagation(); fn(); });
+    return b;
+  };
+  acts.append(
+    act("✅ אושר", "זו שגיאה — לאשר את התיקון", () => fixAct(r, "approved"), "act-approve"),
+    act("❌ לא שגיאה", "המילה תקינה", () => fixAct(r, "not_error"), "act-reject"),
+    act("❌ בכל מקום", "המילה תקינה בכל הספרים", () => fixAct(r, "not_error", { scope: "word" })),
+    act("✏ תיקון ידני", "הקלדת תיקון משלך", () => toggleFixEdit(row, r)),
+    act("❓ בירור", "דרוש בירור", () => fixAct(r, "unsure")),
+    act("🚫 התעלם", "התעלם מהממצא", () => fixAct(r, "ignored")),
+    act("🔧 תוקן", "סמן כתוקן בלי לכתוב לקובץ", () => fixAct(r, "fixed")));
+  side.append(acts);
+
+  if (editable) {
+    const seg = el("div", { class: "seg mini" });
+    for (const m of [["replace", "החלפה"], ["bracket", "סוגריים"]]) {
+      const b = el("button", {
+        class: "seg-btn" + (mode === m[0] ? " active" : ""),
+        title: m[0] === "bracket" ? "(תיקון) [שגיאה]" : "החלפה מלאה",
+      }, m[1]);
+      b.addEventListener("click", ev => {
+        ev.stopPropagation();
+        S.fixModeOverride.set(r.id, m[0]);
+        renderFixList(false);
+      });
+      seg.append(b);
+    }
+    side.append(seg);
+
+    const pick = el("label", { class: "fix-pick" });
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = S.fixPicked.has(r.id);
+    cb.disabled = !canApply(r);
+    cb.addEventListener("click", ev => ev.stopPropagation());
+    cb.addEventListener("change", () => {
+      if (cb.checked) S.fixPicked.add(r.id); else S.fixPicked.delete(r.id);
+      updateApplyButton();
+    });
+    pick.append(cb, el("span", null, done ? "תוקן בקובץ" : "לכלול בהחלה"));
+    side.append(pick);
+  }
+  row.append(side);
+
+  // inline manual-correction box
+  const edit = el("div", { class: "fix-edit" },
+    el("input", { type: "text", dir: "rtl", value: rfix || "",
+                  placeholder: "הקלד את התיקון הנכון…" }),
+    el("button", { class: "btn primary" }, "שמור ואשר"));
+  const inp = edit.querySelector("input");
+  const save = async () => {
+    const v = inp.value.trim();
+    if (!v) { toast("יש להקליד תיקון תחילה", "err"); return; }
+    r.correction = v;
+    await fixAct(r, "approved", { custom_suggestion: v });
+  };
+  edit.querySelector("button").addEventListener("click", ev => { ev.stopPropagation(); save(); });
+  inp.addEventListener("keydown", ev => {
+    ev.stopPropagation();
+    if (ev.key === "Enter") { ev.preventDefault(); save(); }
+    if (ev.key === "Escape") { ev.preventDefault(); edit.classList.remove("visible"); }
+  });
+  row.append(edit);
+
+  row.addEventListener("click", ev => {
+    if (ev.target.closest("button, input, label, mark")) return;
+    selectFixRowById(r.id);
+  });
+  return row;
+}
+
+function toggleFixEdit(row, r) {
+  const box = row.querySelector(".fix-edit");
+  if (!box) return;
+  const open = !box.classList.contains("visible");
+  box.classList.toggle("visible", open);
+  if (open) { const i = box.querySelector("input"); i.focus(); i.select(); }
+}
+
+function selectFixRowById(id) {
+  const r = S.fixRows.find(x => x.id === id);
+  if (!r) return;
+  S.fixCurId = id;
+  renderFixList(false);
+  renderFixDoc();
+  if (r.lineno != null) scrollDocToLine(r.lineno, r.id);
+  scrollFixCurrent();
+}
+
+/* a status decision from inside the fixer — reuses the shared writer, so the
+ * optimistic update, the rollback and Ctrl+Z all behave as everywhere else */
+async function fixAct(r, status, opts) {
+  try {
+    await setStatus([r.id], status, opts || {});
+    // Only an approved finding stays armed. "Needs clarification" in
+    // particular is the opposite of "write this now", so leaving it ticked
+    // would apply the very thing the corrector just flagged as unresolved.
+    if (status === "approved") S.fixPicked.add(r.id);
+    else S.fixPicked.delete(r.id);
+    renderFixList(false);
+    renderFixDoc();
+    updateApplyButton();
+  } catch (e) { /* toast already shown */ }
 }
 
 function scrollFixCurrent() {
@@ -1179,32 +1755,214 @@ function scrollFixCurrent() {
   if (cur) cur.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
-async function markFixed(idx) {
-  const r = S.fixRows[idx];
+/* Mark this finding fixed and move on to the next one still needing work.
+ * Takes the ROW, like every other action here — and advances through the
+ * VISIBLE list, so a filtered view does not jump to a finding off screen. */
+async function markFixed(r) {
   if (!r || effStatus(r) === "fixed") return;
-  try {
-    await setStatus([r.id], "fixed");
-    S.fixSession++;
-    // advance to next unfixed
-    let next = idx + 1;
-    while (next < S.fixRows.length && effStatus(S.fixRows[next]) === "fixed") next++;
-    if (next >= S.fixRows.length) {
-      next = S.fixRows.findIndex(x => effStatus(x) !== "fixed");
-      if (next < 0) next = idx;
-    }
-    S.fixIdx = next;
-    renderFixList(true);
-  } catch (e) { /* toast shown */ }
+  await fixAct(r, "fixed");
+  const view = visibleFixRows();
+  const at = view.findIndex(x => x.id === r.id);
+  const next = view.slice(at + 1).find(x => effStatus(x) !== "fixed");
+  if (next) selectFixRowById(next.id);
 }
 
 function updateFixProgress() {
-  const total = S.fixRows.length + S.fixAlready;
-  const done = S.fixAlready + S.fixRows.filter(r => effStatus(r) === "fixed").length;
+  // progress is always about the BOOK, never the current filter — otherwise
+  // narrowing the view would appear to change how much work is left
+  const total = S.fixRows.length;
+  const done = S.fixRows.filter(r => effStatus(r) === "fixed").length;
   const pct = total ? Math.round(done * 100 / total) : 0;
-  $("#fixProgressText").textContent = S.fixBook
-    ? "תוקנו " + fmtNum(done) + " מתוך " + fmtNum(total) + " בספר זה (" + pct + "%)"
-    : "";
+  let txt = "";
+  if (S.fixKey) {
+    txt = "תוקנו " + fmtNum(done) + " מתוך " + fmtNum(total) +
+          " בספר זה (" + pct + "%)";
+    const shown = visibleFixRows().length;
+    if (S.fixView && shown !== total) txt += " · מוצגים " + fmtNum(shown);
+  }
+  $("#fixProgressText").textContent = txt;
   $("#fixProgressBar").style.width = pct + "%";
+}
+
+/* -------------------------------------------------- mode + apply */
+function syncModeButtons() {
+  $("#fixModeReplace").classList.toggle("active", S.fixMode !== "bracket");
+  $("#fixModeBracket").classList.toggle("active", S.fixMode === "bracket");
+}
+
+async function setFixMode(mode) {
+  S.fixMode = mode;
+  syncModeButtons();
+  renderFixList(false);
+  writeHash();          // keep the URL honest: the mode changes what gets WRITTEN
+  if (S.fixKey && S.fixDoc && S.fixDoc.editable) {
+    try {
+      await api("/api/fixer/mode", { method: "POST", body: { key: S.fixKey, mode } });
+    } catch (e) { /* a failed preference is not worth interrupting for */ }
+  }
+}
+
+function applicableRows() {
+  return S.fixRows.filter(r => S.fixPicked.has(r.id) && canApply(r));
+}
+
+/* Quick selection.
+ *
+ * Writing into a book is a decision, so the set of corrections to write is
+ * built explicitly. Findings nobody has judged are never pre-selected; these
+ * buttons are how a corrector opts a whole group in, without ticking dozens
+ * of boxes by hand.
+ */
+function fixPick(which) {
+  if (which === "none") {
+    S.fixPicked.clear();
+  } else if (which === "approved") {
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved")
+      .map(r => r.id));
+  } else if (which === "verified") {
+    S.fixPicked = new Set(S.fixRows
+      .filter(r => canApply(r) && effStatus(r) === "approved" && r.verified)
+      .map(r => r.id));
+  } else if (which === "view") {
+    // whatever the current filter shows — the corrector can see exactly what
+    // they are about to select
+    S.fixPicked = new Set(visibleFixRows().filter(canApply).map(r => r.id));
+  }
+  renderFixList(false);
+  renderFixDoc();
+  updateApplyButton();
+}
+
+function updateFixPickBar() {
+  const bar = $("#fixPickBar");
+  if (!bar) return;
+  const editable = !!(S.fixDoc && S.fixDoc.editable) && S.fixRows.length;
+  bar.hidden = !editable;
+  if (!editable) return;
+  const n = applicableRows().length;
+  const avail = S.fixRows.filter(canApply).length;
+  const undecided = S.fixRows.filter(
+    r => canApply(r) && effStatus(r) !== "approved").length;
+  const parts = ["נבחרו " + fmtNum(n) + " מתוך " + fmtNum(avail) +
+                 " הניתנים לתיקון"];
+  if (undecided) {
+    parts.push(fmtNum(undecided) + " טרם הוחלטו — לא ייכנסו אלא אם תבחר בהם");
+  }
+  $("#fixPickCount").textContent = parts.join(" · ");
+}
+
+function updateApplyButton() {
+  updateFixPickBar();
+  const btn = $("#fixApply");
+  const editable = !!(S.fixDoc && S.fixDoc.editable) && !S.fixDocStale;
+  const n = applicableRows().length;
+  btn.disabled = !editable || !n;
+  btn.textContent = n ? "✔ החלה על הקובץ (" + fmtNum(n) + ")" : "✔ החלה על הקובץ";
+  const undo = $("#fixUndoFile");
+  const last = (S.fixEdits || []).find(e => !e.undone_at);
+  undo.hidden = !last;
+  if (last) undo.dataset.editId = String(last.id);
+}
+
+async function applyFixes() {
+  const rows = applicableRows();
+  if (!rows.length || !S.fixDoc) return;
+  const bracket = rows.filter(r => rowMode(r) === "bracket").length;
+  const what = bracket
+    ? "מתוכם " + fmtNum(bracket) + " ייכתבו במצב סוגריים «(תיקון) [שגיאה]».\n"
+    : "";
+  // This is the moment of commitment, and the corrector may have scrolled far
+  // from the marks — so name the actual changes here, not just a count.
+  const sample = rows.slice(0, 6).map(r => {
+    const fix = r.correction || effFix(r) || "";
+    return "  שורה " + fmtNum((r.lineno || 0) + 1) + ":  " + r.word + " ⇐ " +
+           (rowMode(r) === "bracket" ? "(" + fix + ") [" + r.word + "]" : fix);
+  }).join("\n");
+  const more = rows.length > 6
+    ? "\n  …ועוד " + fmtNum(rows.length - 6) + " תיקונים" : "";
+  if (!confirm("להחיל " + fmtNum(rows.length) + " תיקונים על הקובץ?\n\n" +
+               sample + more + "\n\n" + what +
+               "גיבוי של הקובץ יישמר לפני הכתיבה.")) return;
+  const btn = $("#fixApply");
+  btn.disabled = true;
+  const items = rows.map(r => {
+    const it = { id: r.id, mode: rowMode(r) };
+    if (r.correction && r.correction !== r.suggestion) it.correction = r.correction;
+    if (r.explicit) {
+      it.explicit_start = r.explicit.start;
+      it.explicit_end = r.explicit.end;
+    }
+    return it;
+  });
+  try {
+    const resp = await api("/api/fixer/apply", {
+      method: "POST",
+      body: { key: S.fixKey, fingerprint: S.fixDoc.fingerprint,
+              default_mode: S.fixMode, items, mark_fixed: true },
+    });
+    S.fixDoc.fingerprint = resp.fingerprint || S.fixDoc.fingerprint;
+    for (const l of resp.changed_lines || []) S.fixLines.set(l.n, l);
+    for (const a of resp.applied || []) {
+      const r = S.fixRows.find(x => x.id === a.id);
+      if (r) { r.effective_status = "fixed"; r.applied = true; }
+      S.fixPicked.delete(a.id);
+    }
+    if (resp.db_warning) toast(resp.db_warning, "err", 9000);
+    toast(resp.message + " (" + fmtNum((resp.applied || []).length) + " תיקונים)", "ok", 6000);
+    // the anchors of everything left now refer to the OLD text, so reload
+    await loadFixDoc();
+    await loadFixerBooks();
+    $("#fixBook").value = S.fixKey;
+  } catch (e) {
+    handleApplyFailure(e);
+  }
+  updateApplyButton();
+}
+
+/* a refusal is informative, not a dead end: say which findings were refused
+ * and why, and offer the reload that makes them applicable again */
+function handleApplyFailure(e) {
+  const failed = (e.data && e.data.failed) || [];
+  if (failed.length) {
+    const ul = el("ul");
+    for (const f of failed.slice(0, 8)) {
+      const r = S.fixRows.find(x => x.id === f.id);
+      ul.append(el("li", null, (r ? "«" + (r.word || "") + "» — " : "") + f.message));
+      if (r) { r.anchor = { ok: false, code: f.code, message: f.message }; S.fixPicked.delete(r.id); }
+    }
+    if (failed.length > 8) ul.append(el("li", null, "…ועוד " + fmtNum(failed.length - 8)));
+    setFixBanner(el("div", { class: "bn-text" },
+      el("b", null, "לא נכתב דבר לקובץ. "),
+      "חלק מהתיקונים לא אושרו:", ul), "err");
+    renderFixList(false);
+    renderFixDoc();
+  } else {
+    setFixBanner(el("div", { class: "bn-text" }, e.message), "err");
+  }
+  if (e.code === "file_changed") {
+    S.fixDocStale = true;
+    const bn = $("#fixerBanner");
+    const b = el("button", { class: "btn primary" }, "🔄 טען מחדש");
+    b.addEventListener("click", () => loadFixDoc());
+    bn.append(b);
+  }
+  toast(e.message, "err", 8000);
+}
+
+async function undoFileEdit() {
+  const id = $("#fixUndoFile").dataset.editId;
+  if (!id) return;
+  if (!confirm("לשחזר את הקובץ מהגיבוי?\nהתיקונים שנכתבו בו יבוטלו, " +
+               "והממצאים יחזרו לסטטוס «אושר».")) return;
+  try {
+    const resp = await api("/api/fixer/undo_file", {
+      method: "POST", body: { edit_id: Number(id) } });
+    toast(resp.message, "ok", 6000);
+    await loadFixDoc();
+  } catch (e) {
+    toast(e.message, "err", 8000);
+  }
 }
 
 /* ---------------------------------------------------------- stats view */
@@ -1335,9 +2093,67 @@ function renderHelp() {
     el("tr", null, el("td", null, kbd("ק")), el("td", null, "תוקן בספר"), el("td", null, "כרטיסים / מצב מתקן")),
     el("tr", null, el("td", null, kbd("רווח")), el("td", null, "דילוג לממצא הבא (ללא החלטה)"), el("td", null, "כרטיסים")),
     el("tr", null, el("td", null, kbd("Enter")), el("td", null, "סימון «תוקן» ומעבר לבא"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("↑")), el("td", null, "מעבר בין הממצאים ברשימה"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("1")), el("td", null, "סטטוסים 1‑6: אושר / לא שגיאה / בירור / התעלם / תוקן / טרם נבדק"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("ס")), el("td", null, "החלפת מצב הכתיבה של התיקון הנוכחי (החלפה ⇄ סוגריים)"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("פ")), el("td", null, "סימון / ביטול סימון התיקון להחלה"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("Home")), el("td", null, "מעבר לממצא הראשון / האחרון ברשימה"), el("td", null, "מצב מתקן")),
+    el("tr", null, el("td", null, kbd("Ctrl+S")), el("td", null, "החלת התיקונים המסומנים על הקובץ"), el("td", null, "מצב מתקן")),
     el("tr", null, el("td", null, kbd("Ctrl+Z")), el("td", null, "ביטול הפעולה האחרונה"), el("td", null, "בכל מקום")),
     el("tr", null, el("td", null, kbd("Esc")), el("td", null, "סגירת חלונית / תפריט"), el("td", null, "בכל מקום")));
   body.append(el("div", { class: "help-block" }, el("h3", null, "⌨ קיצורי מקלדת"), shTable));
+  // fixer mode — the file-writing screen needs its own explanation, above all
+  // because there are two different "undo"s and they do different things
+  body.append(el("div", { class: "help-block" },
+    el("h3", null, "🛠 מצב מתקן — תיקון בתוך הקובץ"),
+    el("p", null, "בוחרים ספר, והכלי פותח את קובץ הטקסט עצמו ומסמן בו את " +
+      "המקומות לתיקון. אין צורך לפתוח את הספר בעורך חיצוני."),
+    el("ul", null,
+      el("li", null, el("b", null, "רשימת הספרים: "),
+        "מזוהים לפי הקובץ, לא לפי השם. לכן שני ספרים בשם «פרק א» בתיקיות " +
+        "שונות מופיעים בנפרד, ולצד כל אחד מוצגת התיקייה שלו."),
+      el("li", null, el("b", null, "הסימון בטקסט: "),
+        "כל מילה מסומנת מראה גם ", el("b", null, "מה ירד"),
+        " (המילה המקורית, מחוקה בקו) וגם ", el("b", null, "מה יהיה"),
+        " (התיקון, בקו תחתון ירוק) — כך רואים בדיוק מה ייכתב, בלי לרחף עם " +
+        "העכבר. לצד כל סימון מופיע גם סמל הסטטוס שלו."),
+      el("li", null, el("b", null, "הצגה לפי סוג: "),
+        "התיבה שבסרגל מציגה רק ממצאים מסטטוס או מסוג מסוים (למשל רק «טרם " +
+        "נבדק», או רק אלה שדורשים אישור ידני). ",
+        el("b", null, "הסדר תמיד נשאר לפי מספר השורה בספר"),
+        " — הסינון מצמצם את הרשימה ולא מערבב אותה, כדי לא לאבד את המקום."),
+      el("li", null, el("b", null, "אופן הכתיבה: "),
+        "«החלפה» — המילה השגויה מוחלפת בתיקון. «סוגריים» — נכתב " +
+        "«(תיקון) [שגיאה]», כלומר התיקון בסוגריים עגולים ואחריו המילה " +
+        "המקורית במרובעים. אפשר לקבוע ברירת מחדל לספר (בסרגל העליון) " +
+        "ולדרוס אותה לכל תיקון בנפרד (הכפתורים בשורת התיקון)."),
+      el("li", null, el("b", null, "כל פעולות הסקירה זמינות כאן: "),
+        "אפשר גם לאשר, לדחות, להקליד תיקון ידני או לסמן «דרוש בירור» — " +
+        "כך אפשר לטפל גם בממצאים שטרם נבדקו בלי לצאת מהמסך."),
+      el("li", null, el("b", null, "מה נכנס לתיקון: "),
+        el("b", null, "ממצא שטרם הוחלט לגביו לעולם אינו נכנס אוטומטית"),
+        " — רק ממצאים ב«אושר» מסומנים מראש. בסרגל הבחירה אפשר לבחור במכה " +
+        "אחת «רק מאושרים», «מאושרים ומאומתים», או «הנראים כעת»."),
+      el("li", null, el("b", null, "גיבוי אוטומטי: "),
+        "לפני כל כתיבה נשמר עותק מלא של הקובץ. שום דבר בקובץ אינו משתנה " +
+        "מלבד המילים שתוקנו."),
+      el("li", null, el("b", null, "אם הספר השתנה מאז הסריקה: "),
+        "אין צורך בסריקה חדשה — הקובץ נקרא מהדיסק בכל פתיחה. אם שורות זזו, " +
+        "הכלי מאתר את המילה במקומה החדש, אך ורק כשהוא מזהה בוודאות שזה " +
+        "אותו קטע ממש — בספרות הזו נוסחאות חוזרות בפסוקים מקבילים, ודמיון " +
+        "לבדו אינו מספיק. מילה שכבר תוקנה ידנית תסומן באדום ולא תיגע."),
+      el("li", null, el("b", null, "ממצאים שלא יוחלו אוטומטית: "),
+        "אם הכלי אינו יכול לקבוע בוודאות היכן המילה נמצאת (למשל כשהיא " +
+        "מופיעה כמה פעמים באותה שורה, או שהקובץ השתנה מאז הסריקה) — הוא " +
+        "לא ינחש. הממצא יסומן באדום, ואפשר ללחוץ על המילה הנכונה בטקסט " +
+        "כדי לסמן אותה ידנית.")),
+    el("p", null, el("b", null, "שימו לב — שני סוגי ביטול: ")),
+    el("ul", null,
+      el("li", null, el("b", null, "Ctrl+Z / «ביטול» "),
+        "מבטל את ההחלטה (הסטטוס) בלבד — ", el("b", null, "הקובץ עצמו לא משתנה"), "."),
+      el("li", null, el("b", null, "«↩ שחזור מגיבוי» "),
+        "מחזיר את הקובץ עצמו למצבו לפני התיקון, ומחזיר את הממצאים " +
+        "לסטטוס «אושר»."))));
   // statuses (labels from API; usage guidance is chrome)
   const stGuide = {
     pending: "מצב ההתחלה של כל ממצא — טרם התקבלה החלטה.",
@@ -1982,7 +2798,7 @@ function refreshCurrentView() {
   switch (S.view) {
     case "table": loadTable(); break;
     case "cards": if (S.cardStale) resetCardQueue(); else { renderCard(); ensureCardQueue(); } break;
-    case "fixer": loadFixerBooks(); loadFixlist(); break;
+    case "fixer": loadFixerBooks().then(loadFixDoc); break;
     case "stats": loadStats(); break;
     case "help": renderHelp(); break;
   }
@@ -2030,9 +2846,38 @@ document.addEventListener("keydown", ev => {
     else if (keyIs(ev, "fixedBook")) { ev.preventDefault(); cardAct("fixed"); }
     else if (ev.code === "Space" || ev.key === " ") { ev.preventDefault(); cardSkip(); }
   } else if (S.view === "fixer") {
-    if (ev.key === "Enter" || keyIs(ev, "fixedBook")) { ev.preventDefault(); markFixed(S.fixIdx); }
-    else if (ev.code === "ArrowDown") { ev.preventDefault(); S.fixIdx = Math.min(S.fixRows.length - 1, S.fixIdx + 1); renderFixList(true); }
-    else if (ev.code === "ArrowUp") { ev.preventDefault(); S.fixIdx = Math.max(0, S.fixIdx - 1); renderFixList(true); }
+    const cur = currentFixRow();
+    if ((ev.ctrlKey || ev.metaKey) && (ev.code === "KeyS" || ev.key === "s")) {
+      ev.preventDefault();                       // beats the browser's Save
+      applyFixes();
+    } else if (ev.key === "Enter" || keyIs(ev, "fixedBook")) {
+      ev.preventDefault(); if (cur) markFixed(cur);
+    } else if (ev.code === "ArrowDown") {
+      ev.preventDefault(); moveFixSelection(1);
+    } else if (ev.code === "ArrowUp") {
+      ev.preventDefault(); moveFixSelection(-1);
+    } else if (ev.code === "Home") {
+      ev.preventDefault(); { const v = visibleFixRows(); if (v.length) selectFixRowById(v[0].id); }
+    } else if (ev.code === "End") {
+      ev.preventDefault(); { const v = visibleFixRows(); if (v.length) selectFixRowById(v[v.length - 1].id); }
+    } else if (ev.key === "ס" || ev.code === "KeyX") {
+      // toggle THIS correction between plain replace and (תיקון) [שגיאה]
+      if (cur) {
+        ev.preventDefault();
+        S.fixModeOverride.set(cur.id, rowMode(cur) === "bracket" ? "replace" : "bracket");
+        renderFixList(false);
+      }
+    } else if (ev.key === "פ" || ev.code === "KeyP") {
+      if (cur && canApply(cur)) {
+        ev.preventDefault();
+        if (S.fixPicked.has(cur.id)) S.fixPicked.delete(cur.id);
+        else S.fixPicked.add(cur.id);
+        renderFixList(false);
+      }
+    } else if (ev.key >= "1" && ev.key <= "6" && !ev.ctrlKey && !ev.altKey) {
+      const st = ["approved", "not_error", "unsure", "ignored", "fixed", "pending"][+ev.key - 1];
+      if (cur && st) { ev.preventDefault(); fixAct(cur, st); }
+    }
   }
 });
 
@@ -2110,8 +2955,39 @@ function bindControls() {
   $("#drawerScrim").addEventListener("click", closeDrawer);
   $("#bulkClear").addEventListener("click", () => { S.sel.clear(); renderTableRows(); updateBulkBar(); });
   $("#btnSidebar").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
-  $("#fixBook").addEventListener("change", () => { S.fixBook = $("#fixBook").value; writeHash(); loadFixlist(); });
-  $("#fixInclude").addEventListener("change", () => { S.fixInclude = $("#fixInclude").checked; writeHash(); loadFixlist(); });
+  $("#fixBook").addEventListener("change", () => { S.fixKey = $("#fixBook").value; writeHash(); loadFixDoc(); });
+  $("#fixInclude").addEventListener("change", () => {
+    S.fixInclude = $("#fixInclude").checked;
+    writeHash();
+    loadFixerBooks().then(loadFixDoc);
+  });
+  for (const b of $$("#fixPickBar .fp-btn")) {
+    b.addEventListener("click", () => fixPick(b.dataset.pick));
+  }
+  $("#fixBookSearch").addEventListener("input", debounce(renderFixBookOptions, 120));
+  $("#fixBookSearch").addEventListener("keydown", ev => {
+    // Enter on a single match opens it, so searching never needs the mouse
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const sel = $("#fixBook");
+    const opts = [...sel.children].filter(o => o.value);
+    if (opts.length === 1) {
+      sel.value = opts[0].value;
+      S.fixKey = sel.value;
+      writeHash();
+      loadFixDoc();
+    }
+  });
+  $("#fixView").addEventListener("change", () => {
+    S.fixView = $("#fixView").value;
+    writeHash();
+    renderFixList(true);
+    renderFixDoc();
+  });
+  $("#fixModeReplace").addEventListener("click", () => setFixMode("replace"));
+  $("#fixModeBracket").addEventListener("click", () => setFixMode("bracket"));
+  $("#fixApply").addEventListener("click", applyFixes);
+  $("#fixUndoFile").addEventListener("click", undoFileEdit);
   document.addEventListener("click", ev => {
     const em = $("#exportMenu");
     if (em.hasAttribute("open") && !em.contains(ev.target)) em.removeAttribute("open");
