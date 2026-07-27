@@ -691,26 +691,38 @@ FIXER_MESSAGES = {
     # -- the file moved under our feet --
     'file_changed': 'הקובץ השתנה מאז שנפתח כאן — יש לטעון אותו מחדש '
                     'לפני החלת התיקונים',
-    'file_changed_since_edit': 'הקובץ נערך ידנית אחרי התיקון האחרון — '
-                               'שחזור מגיבוי היה מוחק את השינויים האלה, '
-                               'ולכן הוא בוטל',
+    # NOT necessarily a manual edit: applying a second batch of corrections
+    # changes the file too, and blaming the user for something the tool did is
+    # both wrong and alarming. Name both causes, and the way out.
+    'file_changed_since_edit': 'הקובץ השתנה אחרי התיקון הזה — או שהוחל עליו '
+                               'תיקון נוסף מאוחר יותר, או שנערך ידנית. '
+                               'שחזור הגיבוי הזה היה מוחק את השינויים '
+                               'המאוחרים, ולכן בוטל. כדי לחזור אחורה יש '
+                               'לשחזר תחילה את התיקון האחרון.',
     'line_gone': 'שורה {n} כבר לא קיימת בקובץ (הקובץ התקצר)',
 
     # -- the word is not where we expected --
     'token_not_found': 'המילה «{word}» לא נמצאה בשורה {n} — ייתכן שהיא '
                        'כבר תוקנה',
     'occurrence_count_changed': 'המילה «{word}» מופיעה בשורה {n} מספר פעמים '
-                                'שונה מהצפוי — נדרש אישור ידני כדי לא לתקן '
-                                'את המופע הלא נכון',
+                                'שונה מכפי שהיה בסריקה (ייתכן שחלק כבר '
+                                'תוקן) — יש ללחוץ בטקסט על המופע שיש לתקן.',
     'ambiguous_occurrence': 'המילה «{word}» מופיעה {k} פעמים בשורה {n} — '
                             'יש לסמן בטקסט את המופע שיש לתקן',
-    'occurrence_mismatch': 'נתוני המופע אינם תואמים לנתוני השרת — יש לרענן '
-                           'את רשימת העבודה',
+    'word_spans_markup': 'המילה «{word}» בשורה {n} חצויה בקובץ על ידי תגית '
+                         'עיצוב (למשל אות מוגדלת בתחילת מילה). תיקון אוטומטי '
+                         'היה שובר את התגית, ולכן הוא בוטל — יש לתקן את '
+                         'המילה הזו ידנית בקובץ.',
     'unit_mismatch': 'הממצא שייך לקובץ אחר — התיקון בוטל',
-    'overlapping_edits': 'שני תיקונים חופפים באותה מילה בשורה {n} — '
-                         'יש להחיל אותם בנפרד',
+    # "apply them separately" was not achievable advice — the second still
+    # overlaps the first. The real resolution is to drop one of them.
+    'overlapping_edits': 'שני ממצאים מצביעים על אותו מקום בשורה {n} — '
+                         'לא ניתן להחיל את שניהם. יש לבחור אחד מהם '
+                         'ולבטל את הסימון של השני.',
     'bad_offsets': 'טווח התיקון אינו תקין',
     'no_correction': 'אין תיקון מוצע לממצא הזה',
+    'not_approved': 'לא ניתן לכתוב לספר ממצאים שטרם אושרו ({n}) — '
+                    'יש לאשר אותם תחילה, או להסיר את סימונם.',
 
     # -- backups --
     'bad_backup': 'שם קובץ הגיבוי אינו תקין',

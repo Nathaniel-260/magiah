@@ -1240,11 +1240,7 @@ def get_fixer_items(con, key, statuses=None, origin=None):
         params.append(origin)
     # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
     # each row by parsing its unit — LIKE alone could match a longer path
-    if key.startswith('file:'):
-        like = 'file:' + key[len('file:'):] + ':%'
-    else:
-        like = 'local:' + key[len('local:'):] + ':%'
-    params.append(like)
+    params.append(key + ':%')
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion
@@ -1344,11 +1340,24 @@ def mark_edit_undone(con, edit_id):
 def edits_touching(con, finding_ids):
     """Live (not undone) file edits that wrote any of these findings.
 
-    Used to warn that undoing a STATUS does not restore the book file.
+    Used to warn that undoing a STATUS does not restore the book file. Every
+    live edit is scanned, with no cap: a missed match would silently drop that
+    warning, and a corrector who is not told the file still holds the
+    correction will assume Ctrl+Z put the book back. `detail` is the large
+    column and is not needed here, so it is left in the database.
     """
+    want = set(finding_ids)
     out = []
-    for d in get_file_edits(con, limit=200, include_undone=False):
-        if set(d['finding_ids']) & set(finding_ids):
+    for row in con.execute('SELECT id, ts, path, book_key, backup, mode, '
+                           'finding_ids, fp_before, fp_after, undone_at '
+                           'FROM file_edits WHERE undone_at IS NULL '
+                           'ORDER BY id DESC'):
+        d = dict(row)
+        try:
+            d['finding_ids'] = json.loads(d['finding_ids'])
+        except (ValueError, TypeError):
+            d['finding_ids'] = []
+        if want & set(d['finding_ids']):
             out.append(d)
     return out
 

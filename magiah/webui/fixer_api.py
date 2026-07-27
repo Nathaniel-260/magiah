@@ -21,6 +21,7 @@ the filename stem 'פרק א' belongs to 35 different books, and this check is t
 reason a correction for one of them can never reach another.
 """
 import os
+import traceback
 
 from . import db, hebrew, patcher, scanner
 
@@ -34,6 +35,10 @@ def _library_dir(outdir):
         return scanner.scan_config(outdir)['corpus'].get('library_dir')
     except Exception:                       # config unreadable -> the default
         return None
+
+
+def _msg_not_approved(n):
+    return hebrew.FIXER_MESSAGES['not_approved'].format(n=n)
 
 
 def _statuses(raw, default='approved'):
@@ -177,9 +182,27 @@ def apply(con, outdir, body):
 
     # occurrence numbers are recomputed from the DB, never taken from the
     # client, so a stale tab cannot point an edit at the wrong occurrence
+    # Every status, deliberately: assign_occurrences numbers findings that
+    # share (unit, word), and it can only number them correctly if it sees ALL
+    # the siblings on that line. Narrowing this list to the statuses being
+    # written would renumber the occurrences and point an edit at the wrong
+    # copy of the word.
     live = {i['id']: i for i in db.get_fixer_items(
         con, key, statuses=['approved', 'fixed', 'unsure', 'pending',
                             'not_error', 'ignored'])}
+
+    # Nothing gets written into a book unless a human judged it an error.
+    # The UI enforces this too, but the UI is not a security boundary: a stale
+    # tab, a bookmarked request or a future code path must not be able to
+    # commit an unreviewed finding to somebody's text.
+    undecided = sorted(
+        fid for fid in by_id
+        if (live.get(fid, {}).get('effective_status')
+            or 'pending') not in ('approved', 'fixed'))
+    if undecided:
+        raise patcher.PatchError('not_approved',
+                                 _msg_not_approved(len(undecided)),
+                                 ids=undecided)
 
     findings, modes, explicit = [], {}, {}
     for fid, r in by_id.items():
@@ -233,7 +256,10 @@ def apply(con, outdir, body):
             out['fixed'] = len(ids)
         except Exception:
             # the file is already correct and backed up; re-marking is
-            # idempotent, so this is a warning rather than a failure
+            # idempotent, so this is a warning rather than a failure. It is
+            # still a bug worth seeing, so it goes to the console — never
+            # swallowed silently.
+            traceback.print_exc()
             out['db_warning'] = hebrew.FIXER_MESSAGES['db_warning']
     return out, 200
 
@@ -256,16 +282,19 @@ def undo_file(con, outdir, body):
                            rec.get('fp_after'))
     db.mark_edit_undone(con, rec['id'])
     ids = rec['finding_ids']
-    restored = 0
+    out = {'ok': True, 'restored': 0,
+           'fingerprint': patcher.fingerprint(rec['path']),
+           'message': hebrew.FIXER_MESSAGES['restored']}
     if ids:
         try:
             db.set_status(con, outdir, ids, 'approved')
-            restored = len(ids)
+            out['restored'] = len(ids)
         except Exception:
-            pass
-    return {'ok': True, 'restored': restored,
-            'fingerprint': patcher.fingerprint(rec['path']),
-            'message': hebrew.FIXER_MESSAGES['restored']}
+            # the FILE is already back, which is the half that mattered; a
+            # failed status update is surfaced, never swallowed
+            traceback.print_exc()
+            out['db_warning'] = hebrew.FIXER_MESSAGES['db_warning']
+    return out
 
 
 # ---------------------------------------------------------------------------

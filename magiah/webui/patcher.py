@@ -61,9 +61,10 @@ MODES = (MODE_REPLACE, MODE_BRACKET)
 # Conflicts: the file (or our knowledge of it) moved under the user's feet.
 # They are recoverable by reloading, so they get 409 rather than 400.
 CONFLICT_CODES = frozenset((
-    'file_changed', 'line_gone', 'token_not_found', 'occurrence_mismatch',
+    'file_changed', 'line_gone', 'token_not_found',
     'occurrence_count_changed', 'ambiguous_occurrence', 'overlapping_edits',
-    'unit_mismatch', 'file_changed_since_edit',
+    'unit_mismatch', 'file_changed_since_edit', 'word_spans_markup',
+    'not_approved',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -163,8 +164,10 @@ def resolve_key(key, library_dir=None):
     kind, _, rest = key.partition(':')
     if kind not in ('file', 'local'):
         raise PatchError('db_book', _msg('db_book'))
-    probe = '%s:%s:0' % (kind if kind == 'file' else 'local', rest)
-    _kind, path, _ln = resolve_unit(probe, library_dir)
+    # deliberately round-trips through resolve_unit with a dummy line number,
+    # so key resolution inherits exactly the same containment and
+    # names-a-file checks as unit resolution — one place to get right
+    _kind, path, _ln = resolve_unit('%s:%s:0' % (kind, rest), library_dir)
     return _kind, path
 
 
@@ -337,6 +340,31 @@ def _snippet_supports(line_clean, snippet, tok_index_hint=None):
     return hits >= max(2, len(toks) // 4)
 
 
+def _snippet_identifies(line, snippet):
+    """Strict variant of :func:`_snippet_supports`, for RELOCATING a finding.
+
+    The tolerant test above is right for downgrading confidence, but far too
+    weak to prove "this is the same passage". Hebrew religious texts repeat
+    long formulas verbatim across many verses ("וידבר ה' אל משה לאמר דבר אל
+    בני ישראל ואמרת אלהם…"), and that shared formula alone clears the tolerant
+    threshold — so every parallel verse looks like a match and the finding
+    lands on whichever one happens to be nearest.
+
+    Identity therefore rests on what the verses do NOT share: most of the
+    snippet's tokens must be present, and the distinctive ones — those absent
+    from the passage's neighbours — matter most. Requiring a large majority is
+    what separates "the same verse, moved" from "its twin, three verses down".
+    """
+    if not snippet:
+        return False           # cannot identify anything without evidence
+    toks = [t for t in normalize.tokenize(snippet) if len(t) > 1]
+    if len(toks) < 3:
+        return False           # too little to identify a line by
+    line_toks = set(normalize.tokenize(line))
+    hits = sum(1 for t in toks if t in line_toks)
+    return hits >= max(3, int(len(toks) * 0.75))
+
+
 # How far to look for a line that drifted. Books get lines inserted and
 # removed between a scan and a fix; a few dozen lines covers ordinary editing
 # while staying far too small to reach an unrelated chapter.
@@ -346,15 +374,31 @@ DRIFT_WINDOW = 60
 def _find_drifted_line(doc, lineno, word, snippet):
     """The line this finding now sits on, after the file was edited.
 
-    Only ever returns a line that is unambiguous on two counts: the word must
-    occur there exactly once, and exactly ONE nearby line may qualify. The
-    report's snippet must corroborate it too — without that, a word common in
-    the book would relocate a finding to whichever line happened to be closest,
-    which is precisely the "correction on an unrelated passage" this module
-    exists to prevent. Returns None when anything is in doubt.
+    Two situations look identical from the word's absence alone, and they need
+    opposite answers:
+
+    * the passage MOVED (a line was inserted above it) -> relocate
+    * the passage is still there and only the WORD is gone, because a human
+      already corrected it -> there is nothing to do, refuse
+
+    Telling them apart is not optional. Hebrew religious texts are full of
+    parallel verses sharing a formula ("וידבר ה' אל משה לאמר…"), so in the
+    second case the nearest surviving occurrence of the word is typically a
+    DIFFERENT verse that satisfies every other test — and correcting it would
+    be exactly the unrelated-passage edit this module exists to prevent.
+    The discriminator is the scanned line itself: if the snippet still matches
+    it, the passage never moved, so nothing may be relocated.
+
+    Beyond that, a candidate is only accepted when it is unambiguous: the word
+    occurs there exactly once, exactly one nearby line qualifies, and the
+    snippet corroborates it. Returns None whenever anything is in doubt.
     """
     if not snippet:
         return None            # nothing to corroborate with: do not guess
+    # the scanned passage is still sitting where it was -> it did not drift
+    if lineno < len(doc.lines) and _snippet_identifies(doc.lines[lineno],
+                                                       snippet):
+        return None
     lo = max(0, lineno - DRIFT_WINDOW)
     hi = min(len(doc.lines), lineno + DRIFT_WINDOW + 1)
     hits = []
@@ -364,7 +408,7 @@ def _find_drifted_line(doc, lineno, word, snippet):
         line = doc.lines[n]
         if len(normalize.phrase_spans(line, word)) != 1:
             continue
-        if not _snippet_supports(line, snippet):
+        if not _snippet_identifies(line, snippet):
             continue
         hits.append(n)
         if len(hits) > 1:
@@ -462,6 +506,17 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
         start, end = spans[occurrence][1], spans[occurrence][2]
 
     old_raw = line[start:end]
+    # A word can span markup: ויל<big>ך</big> tokenizes to the single token
+    # וילך, whose raw span is 'ויל<big>ך' — it contains the OPENING tag but
+    # not the closing one, because the tag opens mid-word and closes after it.
+    # Neither mode can write that safely: replacing yields 'וילכו</big>' (an
+    # orphaned close tag) and bracketing yields '[ויל<big>ך]</big>' (mis-nested
+    # brackets). Both corrupt the book's markup, so refuse and let the human
+    # decide — this is rare, and a wrong guess here is silent damage.
+    if '<' in old_raw or '>' in old_raw:
+        raise PatchError('word_spans_markup',
+                         _msg('word_spans_markup', word=word,
+                              n=lineno + 1), id=fid)
     if confidence != 'manual' and not _snippet_supports(
             line, finding.get('snippet')):
         confidence = 'weak'

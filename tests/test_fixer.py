@@ -275,6 +275,32 @@ class TestPlanAndApply(TempCase):
             results.append(doc.lines[0])
         self.assertEqual(len(set(results)), 1, results)
 
+    def test_a_word_split_by_a_tag_is_refused_in_both_modes(self):
+        """``ויל<big>ך</big>`` is one token whose raw span is ``ויל<big>ך`` —
+        it swallows the OPENING tag but not the closing one, because the tag
+        opens mid-word. Replacing leaves an orphaned ``</big>``; bracketing
+        yields ``[ויל<big>ך]</big>``. Both corrupt the markup, so both refuse.
+        """
+        for mode in (patcher.MODE_REPLACE, patcher.MODE_BRACKET):
+            with self.subTest(mode=mode):
+                doc = self.doc('ויל<big>ך</big> משה אל העיר')
+                _plans, failures = patcher.plan_all(
+                    doc, [{'id': 1, 'lineno': 0, 'word': 'וילך',
+                           'correction': 'וילכו'}], default_mode=mode)
+                self.assertEqual([f['code'] for f in failures],
+                                 ['word_spans_markup'])
+
+    def test_a_clean_word_on_a_marked_up_line_still_applies(self):
+        """The refusal is about the word, not the line: a normal word sharing
+        a line with markup must still be correctable, tags intact."""
+        doc = self.doc('ויל<big>ך</big> משה אל העיר')
+        plans, failures = patcher.plan_all(
+            doc, [{'id': 1, 'lineno': 0, 'word': 'משה',
+                   'correction': 'מושה'}])
+        self.assertEqual(failures, [])
+        patcher.apply_edits(doc, plans)
+        self.assertEqual(doc.lines[0], 'ויל<big>ך</big> מושה אל העיר')
+
     def test_bracket_mode_with_several_edits_on_one_line(self):
         """Bracket mode makes each replacement LONGER than what it replaced,
         so a line carrying three of them is the case where left-to-right
@@ -799,6 +825,58 @@ class TestApi(TempCase):
         # the hand-inserted preface, and everything else, is untouched
         self.assertEqual(after[:3],
                          ['כותרת', 'הקדמה חדשה א', 'הקדמה חדשה ב'])
+
+    def test_an_unapproved_finding_is_never_written(self):
+        """The server, not the browser, is the boundary.
+
+        The UI declines to arm an undecided finding, but a stale tab, a
+        replayed request or a future client path must not be able to commit
+        something nobody judged into a book.
+        """
+        con = db.connect(self.outdir)
+        con.execute(
+            'INSERT INTO findings(id, family, errtype, word, suggestion, '
+            'rank, verified, origin, source, ref, unit, doc, snippet) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (11, 'error', 'edit1_sub', 'זומא', 'זומה', 5.0, 1, 'testOrigin',
+             'פרק א', 'r', 'file:ספר שני/פרק א.txt:1', None, ''))
+        con.commit()          # no review row -> effective status 'pending'
+        con.close()
+
+        key = 'file:ספר שני/פרק א.txt'
+        code, d = self.call('/api/fixer/doc?' + urllib.parse.urlencode(
+            {'key': key, 'statuses': 'approved,unsure,pending'}))
+        self.assertEqual(code, 200, d)
+        before = [raw(p) for p in self.paths]
+
+        code, res = self.call('/api/fixer/apply', {
+            'key': key, 'fingerprint': d['fingerprint'],
+            'items': [{'id': 11}]})
+        self.assertEqual(code, 409, res)
+        self.assertEqual(res.get('code'), 'not_approved', res)
+        self.assertEqual([raw(p) for p in self.paths], before)
+
+    def test_one_unapproved_finding_blocks_the_whole_batch(self):
+        """All-or-nothing still holds: an approved sibling is not written
+        either, so the corrector is never left with a half-applied book."""
+        con = db.connect(self.outdir)
+        con.execute(
+            'INSERT INTO findings(id, family, errtype, word, suggestion, '
+            'rank, verified, origin, source, ref, unit, doc, snippet) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (12, 'error', 'edit1_sub', 'זומא', 'זומה', 5.0, 1, 'testOrigin',
+             'פרק א', 'r', 'file:ספר שני/פרק א.txt:1', None, ''))
+        con.commit()
+        con.close()
+        key = 'file:ספר שני/פרק א.txt'
+        code, d = self.call('/api/fixer/doc?' + urllib.parse.urlencode(
+            {'key': key, 'statuses': 'approved,unsure,pending'}))
+        before = [raw(p) for p in self.paths]
+        code, res = self.call('/api/fixer/apply', {
+            'key': key, 'fingerprint': d['fingerprint'],
+            'items': [{'id': 1}, {'id': 12}]})     # 1 approved, 12 pending
+        self.assertEqual(code, 409, res)
+        self.assertEqual([raw(p) for p in self.paths], before)
 
     def test_db_book_is_listed_but_not_editable(self):
         con = db.connect(self.outdir)

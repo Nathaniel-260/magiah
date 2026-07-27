@@ -505,6 +505,14 @@ async function doUndo() {
     let msg = "הפעולה האחרונה בוטלה";
     if (resp && resp.reverted != null) msg += " (" + fmtNum(resp.reverted) + " ממצאים)";
     toast(msg, "ok");
+    // The server flags an undo whose correction is already ON DISK. Undoing a
+    // status does NOT rewrite the book, and a corrector who is not told that
+    // will assume the file went back too — so say it loudly, and in the fixer
+    // leave it on screen next to the button that WOULD revert the file.
+    if (resp && resp.file_warning) {
+      toast(resp.file_warning, "err", 12000);
+      if (S.view === "fixer") setFixBanner(resp.file_warning, "err");
+    }
     repaintStatuses();
     updateProgress();
     if (S.view === "table") loadTable();
@@ -1178,10 +1186,27 @@ async function loadFixDoc() {
     statuses: S.fixInclude ? "approved,unsure,pending" : "approved",
   });
   if (S.filters.origin) p.set("origin", S.filters.origin);
+  // resolving an ambiguous occurrence is manual, per-word work; a reload
+  // rebuilds the rows from the server, so carry those choices across
+  const manual = new Map((S.fixRows || [])
+    .filter(r => r.explicit).map(r => [r.id, r.explicit]));
   try {
     const resp = await api("/api/fixer/doc?" + p);
     S.fixDoc = resp;
     S.fixRows = resp.items || [];
+    for (const r of S.fixRows) {
+      const e = manual.get(r.id);
+      // only re-apply where the server still cannot place it itself; if it
+      // now anchors on its own, its answer is the better one
+      if (e && r.anchor && !r.anchor.ok) {
+        const line = (resp.lines || []).find(l => l.n === r.lineno);
+        const txt = line ? line.text : "";
+        r.explicit = e;
+        r.anchor = { ok: true, start: e.start, end: e.end,
+                     confidence: "manual",
+                     spans_markup: txt.slice(e.start, e.end).indexOf("<") >= 0 };
+      }
+    }
     S.fixLines = new Map((resp.lines || []).map(l => [l.n, l]));
     // an explicit #fm in the URL is a deliberate choice by whoever opened this
     // link, so it outranks the book's stored default
@@ -1346,12 +1371,16 @@ function fixDocLine(n, rows) {
   }
   pieces.unshift(text.slice(0, tail));
 
-  // rows the server refused to place: offer the tokens so the corrector can
-  // point at the right occurrence instead of the tool guessing
-  const unresolved = rows.filter(r => r.anchor && !r.anchor.ok &&
-                                 Array.isArray(info && info.tokens));
-  if (unresolved.length && info.tokens.length) {
-    body.append(...tokenPickLine(text, info.tokens, unresolved[0]));
+  // A row the server refused to place is resolved by pointing at the word,
+  // which turns the whole line into clickable tokens. That mode is driven by
+  // the SELECTED row, not by whichever blocked row happens to be first:
+  // otherwise a second blocked finding on the same line could never be
+  // resolved, and the line's other — correctly anchored — marks would lose
+  // their previews for as long as any one row on it stayed blocked.
+  const pick = rows.find(r => r.anchor && !r.anchor.ok && cur &&
+                         r.id === cur.id && Array.isArray(info && info.tokens));
+  if (pick && info.tokens.length) {
+    body.append(...tokenPickLine(text, info.tokens, pick));
   } else {
     for (const p of pieces) {
       body.append(typeof p === "string" ? document.createTextNode(p) : p);
@@ -1426,15 +1455,23 @@ function tokenPickLine(text, tokens, row) {
   return out;
 }
 
-/* the human pointed at a word: keep the offsets the SERVER gave us for it */
+/* The human pointed at a word. `start`/`end` are a token span the SERVER sent
+ * with this line, echoed back unchanged — the browser still never measures the
+ * file. The server re-verifies the span really is this word before writing
+ * (patcher.plan_edit's `explicit` branch), so a stale pick is caught there. */
 function resolveOccurrence(row, start, end) {
-  const clean = (S.fixLines.get(row.lineno) || {}).text || "";
-  const picked = clean.slice(start, end);
+  const lineText = (S.fixLines.get(row.lineno) || {}).text || "";
+  const picked = lineText.slice(start, end);
   row.explicit = { start, end };
   row.anchor = { ok: true, start, end, confidence: "manual",
-                 total_occurrences: 1, spans_markup: picked.indexOf("<") >= 0 };
-  S.fixPicked.add(row.id);
-  toast("המופע סומן: «" + picked + "» — התיקון יוחל כאן בלבד", "ok");
+                 spans_markup: picked.indexOf("<") >= 0 };
+  // Pointing at a word says WHERE, not WHETHER. Arming an undecided finding
+  // on a locational click would write into a book something nobody judged.
+  if (effStatus(row) === "approved") S.fixPicked.add(row.id);
+  toast(effStatus(row) === "approved"
+    ? "המופע סומן: «" + picked + "» — התיקון יוחל כאן בלבד"
+    : "המופע סומן: «" + picked + "». הממצא עדיין לא אושר — יש לאשר אותו כדי שייכלל בתיקון.",
+    "ok", 6000);
   renderFixDoc();
   renderFixList(false);
   updateApplyButton();
@@ -1596,8 +1633,10 @@ function fixRowNode(r, idx, editable) {
       "⚠ הקטע בקובץ אינו תואם במלואו לקטע שנסרק — כדאי לוודא לפני ההחלה."));
   }
   if (r.anchor && r.anchor.ok && r.anchor.spans_markup) {
-    main.append(el("div", { class: "fix-warn weak-warn" },
-      "⚠ המילה כוללת תגית עיצוב בקובץ — התיקון יסיר אותה."));
+    // replacing takes the tag with the word (fine); bracketing would wrap
+    // half of it and mis-nest the markup, so that combination is refused
+    main.append(el("div", { class: "fix-warn" },
+      "⚠ המילה חצויה בקובץ על ידי תגית עיצוב — תיקון אוטומטי היה שובר אותה. יש לתקן ידנית."));
   }
   row.append(main);
 
@@ -1700,9 +1739,11 @@ function selectFixRowById(id) {
 async function fixAct(r, status, opts) {
   try {
     await setStatus([r.id], status, opts || {});
-    if (status === "fixed" || status === "not_error" || status === "ignored") {
-      S.fixPicked.delete(r.id);
-    }
+    // Only an approved finding stays armed. "Needs clarification" in
+    // particular is the opposite of "write this now", so leaving it ticked
+    // would apply the very thing the corrector just flagged as unresolved.
+    if (status === "approved") S.fixPicked.add(r.id);
+    else S.fixPicked.delete(r.id);
     renderFixList(false);
     renderFixDoc();
     updateApplyButton();
@@ -1714,13 +1755,16 @@ function scrollFixCurrent() {
   if (cur) cur.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
-async function markFixed(idx) {
-  const r = S.fixRows[idx];
+/* Mark this finding fixed and move on to the next one still needing work.
+ * Takes the ROW, like every other action here — and advances through the
+ * VISIBLE list, so a filtered view does not jump to a finding off screen. */
+async function markFixed(r) {
   if (!r || effStatus(r) === "fixed") return;
   await fixAct(r, "fixed");
-  let next = idx + 1;
-  while (next < S.fixRows.length && effStatus(S.fixRows[next]) === "fixed") next++;
-  if (next < S.fixRows.length) selectFixRowById(S.fixRows[next].id);
+  const view = visibleFixRows();
+  const at = view.findIndex(x => x.id === r.id);
+  const next = view.slice(at + 1).find(x => effStatus(x) !== "fixed");
+  if (next) selectFixRowById(next.id);
 }
 
 function updateFixProgress() {
@@ -1828,8 +1872,18 @@ async function applyFixes() {
   const what = bracket
     ? "מתוכם " + fmtNum(bracket) + " ייכתבו במצב סוגריים «(תיקון) [שגיאה]».\n"
     : "";
-  if (!confirm("להחיל " + fmtNum(rows.length) + " תיקונים על הקובץ?\n" + what +
-               "\nגיבוי של הקובץ יישמר לפני הכתיבה.")) return;
+  // This is the moment of commitment, and the corrector may have scrolled far
+  // from the marks — so name the actual changes here, not just a count.
+  const sample = rows.slice(0, 6).map(r => {
+    const fix = r.correction || effFix(r) || "";
+    return "  שורה " + fmtNum((r.lineno || 0) + 1) + ":  " + r.word + " ⇐ " +
+           (rowMode(r) === "bracket" ? "(" + fix + ") [" + r.word + "]" : fix);
+  }).join("\n");
+  const more = rows.length > 6
+    ? "\n  …ועוד " + fmtNum(rows.length - 6) + " תיקונים" : "";
+  if (!confirm("להחיל " + fmtNum(rows.length) + " תיקונים על הקובץ?\n\n" +
+               sample + more + "\n\n" + what +
+               "גיבוי של הקובץ יישמר לפני הכתיבה.")) return;
   const btn = $("#fixApply");
   btn.disabled = true;
   const items = rows.map(r => {
