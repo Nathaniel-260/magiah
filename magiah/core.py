@@ -24,8 +24,9 @@ from collections import Counter
 from multiprocessing import Pool
 
 from .config import Config
+from . import tanach
 from .corpus import make_corpus
-from .textsource import OtzariaDB, ReadStats
+from .textsource import ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
@@ -551,70 +552,66 @@ def detect(spec, cfg, out_dir):
 
 
 # ---------------------------------------------------------------------------
-# Tanach reference (Otzaria corpora): the DB holds many cantillated editions
-# of the same biblical books. The reference is self-validating — a reading
-# counts as canonical only when 2+ distinct editions agree, so an error inside
-# one Tanach edition cannot poison the reference; instead, minority readings
-# are reported separately as suspected edition errors.
+# Tanach reference (Otzaria corpora). magiah.tanach identifies the Bible books
+# explicitly (category + title + verse heRefs), aligns their editions per
+# (work, chapter, verse) and groups them into independent sources. A quotation
+# counts as evidence only when it aligns with ONE verse position; nothing here
+# replaces the detector's suggestion — a Tanach reading is an alternative.
 # ---------------------------------------------------------------------------
 
-def _within2(a, b):
-    """Levenshtein distance <= 2 (with adjacent transposition counted as 1)."""
-    la, lb = len(a), len(b)
-    if abs(la - lb) > 2:
-        return False
-    prev2, prev, cur = None, list(range(lb + 1)), None
-    for i in range(1, la + 1):
-        cur = [i] + [0] * lb
-        for j in range(1, lb + 1):
-            c = 0 if a[i - 1] == b[j - 1] else 1
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + c)
-            if (i > 1 and j > 1 and a[i - 1] == b[j - 2]
-                    and a[i - 2] == b[j - 1]):
-                cur[j] = min(cur[j], prev2[j - 2] + 1)
-        prev2, prev = prev, cur
-    return prev[lb] <= 2
-
-
 def _build_verse_index(db_path):
-    """(prev, next) -> {middle: set(bookId)} over all cantillated editions."""
-    idx = {}
-    stats = ReadStats()
-    with OtzariaDB(db_path) as odb:
-        lo, hi = odb.id_range()
-        for _, book_id, content in odb.iter_range(
-                lo, hi + 1, stats,
-                book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
-            toks = tokenize(content)
-            for i in range(1, len(toks) - 1):
-                key = (toks[i - 1], toks[i + 1])
-                idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
-    if stats.decode_errors:
-        raise PartialRead(f'Tanach index: {stats.decode_errors:,} rows '
+    """The verified-editions index (see magiah.tanach)."""
+    idx = tanach.build_index(db_path)
+    if idx.stats.decode_errors:
+        raise PartialRead(f'Tanach index: {idx.stats.decode_errors:,} rows '
                           f'could not be decoded')
     return idx
 
 
 def _tanach_edition_errors(db_path, vidx):
-    """Places where one Tanach edition deviates from 3+ agreeing editions."""
-    rows = []
-    odb = OtzariaDB(db_path)
-    lo, hi = odb.id_range()
-    for uid, _, content in odb.iter_range(
-            lo, hi + 1, ReadStats(),
-            book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
-        toks = tokenize(content)
-        for i in range(1, len(toks) - 1):
-            m = toks[i]
-            entry = vidx.get((toks[i - 1], toks[i + 1]), {})
-            if len(entry.get(m, ())) == 1:      # this edition alone
-                canon = [x for x, bs in entry.items()
-                         if len(bs) >= 3 and _within2(m, x)]
-                if len(canon) == 1:
-                    snip = ' '.join(toks[max(0, i - 6):i + 7])
-                    rows.append((str(uid), m, canon[0], snip))
-    odb.close()
+    """Minority readings of one independent source against >= 2 agreeing
+    independent sources, within the same work and verse."""
+    rows, st = vidx.edition_errors()
+    print(f'[tanach] edition disagreements: {st}', flush=True)
     return rows
+
+
+def _tanach_check(db_path, all_occ, flagged):
+    """Compare occurrences with the verse they quote.
+
+    Returns ``(kept, tan_info, matches, edition_rows, evidence_rows)``.
+    An occurrence leaves the main report only when >= 2 independent sources
+    read exactly that word at the aligned verse position."""
+    t1 = time.time()
+    vidx = _build_verse_index(db_path)
+    c = vidx.counts()
+    print(f"[tanach] index: {c['works']} works, {c['verses']:,} verses, "
+          f"{c['editions']} editions, {c['independent_sources']} independent "
+          f"sources ({time.time()-t1:.0f}s)", flush=True)
+    kept, tan_info, matches, evidence_rows = [], [], [], []
+    kinds = Counter()
+    cache = {}
+    for oc in all_occ:
+        w, uid, doc, prev, nxt, snip = oc
+        key = (w, prev, nxt, snip)
+        if key not in cache:
+            cache[key] = vidx.evidence(w, prev, nxt, snip)
+        ev = cache[key]
+        if ev is not None:
+            kinds[ev.kind] += 1
+            fr = flagged.get(w)
+            evidence_rows.append(tanach.evidence_row(
+                vidx, ev, w, uid, doc, snip,
+                (fr[1], fr[2]) if fr else ('', '')))
+            if ev.kind == tanach.MATCH:
+                matches.append((w, uid, doc, snip, evidence_rows[-1][-1]))
+                continue
+        kept.append(oc)
+        tan_info.append((ev.tanach_code, ev.reading) if ev is not None
+                        and ev.kind == tanach.VARIANT else (0, ''))
+    print(f'[tanach] aligned occurrences by kind: {dict(kinds)}', flush=True)
+    edition_rows = _tanach_edition_errors(db_path, vidx)
+    return kept, tan_info, matches, edition_rows, evidence_rows
 
 
 # stage-3 helper: a rare word right after a title is a person/place name
@@ -772,39 +769,17 @@ def locate(spec, cfg, out_dir):
                   f'({time.time()-t0:.0f}s)', flush=True)
 
     # --- Tanach reference check (Otzaria only) ----------------------------
-    # Occurrences whose context matches a biblical verse are compared against
-    # the reading agreed on by 2+ editions. Matches are NOT dropped — they go
-    # to a separate review file, because the reference itself might be wrong.
-    tanach_matches, tanach_errors_rows = [], []
+    # Verified verse matches go to a separate review file (the reference
+    # itself might be wrong); a differing verse reading is stored next to the
+    # detector's suggestion as an alternative, never in place of it.
+    tanach_matches, tanach_errors_rows, tanach_evidence = [], [], []
     tan_info = None
     if spec.get('preset') == 'otzaria':
-        t1 = time.time()
-        vidx = _build_verse_index(spec['path'])
-        print(f'[tanach] verse index: {len(vidx):,} contexts '
-              f'({time.time()-t1:.0f}s)', flush=True)
-        kept, tan_info, n_fix = [], [], 0
-        for oc in all_occ:
-            w, uid, doc, prev, nxt, snip = oc
-            tan, tsugg = 0, ''
-            entry = vidx.get((prev, nxt))
-            if entry:
-                if len(entry.get(w, ())) >= 2:
-                    tanach_matches.append((w, uid, doc, snip))
-                    continue
-                canon = [m for m, bs in entry.items()
-                         if len(bs) >= 2 and m != w and _within2(w, m)]
-                if len(canon) == 1 and len(prev) >= 2 and len(nxt) >= 2:
-                    tan, tsugg = 2, canon[0]
-                    n_fix += 1
-            kept.append(oc)
-            tan_info.append((tan, tsugg))
-        all_occ = kept
+        (all_occ, tan_info, tanach_matches, tanach_errors_rows,
+         tanach_evidence) = _tanach_check(spec['path'], all_occ, flagged)
         print(f'[tanach] verse matches (separate review file): '
-              f'{len(tanach_matches):,}  MT-corrections: {n_fix:,}', flush=True)
-        tanach_errors_rows = _tanach_edition_errors(spec['path'], vidx)
-        print(f'[tanach] edition disagreements: {len(tanach_errors_rows):,}',
-              flush=True)
-        del vidx
+              f'{len(tanach_matches):,}  edition variants: '
+              f'{len(tanach_errors_rows):,}', flush=True)
 
     # words whose (very few) occurrences all sit in a single book are usually
     # the author's own idiosyncratic spelling, not typos
@@ -867,9 +842,9 @@ def locate(spec, cfg, out_dir):
         CREATE TABLE space_errors(unit TEXT, part1 TEXT, part2 TEXT,
                                   joined TEXT, join_freq INT, snippet TEXT);
         CREATE TABLE tanach_matches(word TEXT, unit TEXT, doc TEXT,
-                                    snippet TEXT);
+                                    snippet TEXT, evidence TEXT);
         CREATE TABLE tanach_errors(unit TEXT, word TEXT, canonical TEXT,
-                                   snippet TEXT);
+                                   snippet TEXT, evidence TEXT);
     ''')
     con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
                     [(w, *v) for w, v in flagged.items()])
@@ -896,10 +871,11 @@ def locate(spec, cfg, out_dir):
                         (w, uid, doc, 0, 0, 0, 0, '', snip))
     if all_ocr:
         print(f'[locate] ocr-profile findings: {len(all_ocr):,}', flush=True)
-    con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?)',
+    con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?,?)',
                     tanach_matches)
-    con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?)',
+    con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?,?)',
                     tanach_errors_rows)
+    tanach.write_evidence(con, tanach_evidence)
     con.executemany('INSERT INTO space_errors VALUES(?,?,?,?,?,?)', all_joins)
     con.commit()
     corpus.enrich(con)
@@ -919,6 +895,9 @@ def locate(spec, cfg, out_dir):
 # * sugg_local  — the correction is used inside the very same book
 # * book_repeat — all occurrences of the word sit in one book (idiosyncratic
 #                 spelling, not a typo) — strong demotion
+# plus the Tanach signal: tanach = 3 (an aligned verse whose reading, backed
+# by >= 2 independent sources, differs from the word). tanach = 2 marks rows
+# of the old trigram heuristic: they must be re-checked and earn nothing.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
                   CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
@@ -926,7 +905,7 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 2 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
 # proposed correction and the word is not an in-book spelling convention
