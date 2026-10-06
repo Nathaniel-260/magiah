@@ -173,10 +173,13 @@ KEY_COLS = "family, COALESCE(word,''), COALESCE(unit,''), errtype, " \
 
 # Tanach evidence of the old (prev, next)-trigram heuristic. `lg` per row:
 # 0 = not legacy, 1 = legacy and already marked for re-check, 2 = legacy from
-# before the mark (its review must not be inherited by anything).
+# before the mark. An APPROVAL given under other evidence than the row now has
+# may rest on the legacy suggestion and is dropped (logged in `history`);
+# not_error / ignored / unsure judge the word itself and are kept.
 LEGACY_EXTRA = json.dumps({'evidence_kind': 'tanach_legacy', 'recheck': True})
 _NEW_TANACH = ("COALESCE({p}extra,'') LIKE '%tanach_verse_match%' OR "
-               "COALESCE({p}extra,'') LIKE '%tanach_edition_variant%'")
+               "COALESCE({p}extra,'') LIKE '%tanach_edition_variant%' OR "
+               "COALESCE({p}extra,'') LIKE '%tanach_edition_unresolved%'")
 LEGACY_LG_SQL = (
     "CASE WHEN COALESCE({p}extra,'') LIKE '%tanach_legacy%' THEN 1 "
     "WHEN COALESCE({p}tanach,0) = 2 OR ({p}family IN "
@@ -359,7 +362,9 @@ def import_all(outdir, migrate_legacy=False):
                 ' FROM rep.tanach_errors_full ORDER BY rowid').fetchall():
             extra = _tanach_extra(evid, verified)
             extra['canonical'] = canonical
-            rank = 4.0 if verified else 0.0
+            # only an outvoted minority reading ranks; unresolved rows inform
+            rank = 4.0 if extra.get('evidence_kind') == \
+                'tanach_edition_variant' else 0.0
             rows.append((
                 'tanach_error', 'tanach_edition', word, canonical,
                 rank, rank, None, None, None, None, 0, org, src, ref, unit,
@@ -437,12 +442,12 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('''CREATE INDEX temp.ix_oldmap ON oldmap(
             family, w, u, errtype, r, seq)''')
         cur.execute('''CREATE TEMP TABLE assign AS
-            SELECT i.irow AS irow, o.id AS old_id
+            SELECT i.irow AS irow, o.id AS old_id,
+                   (o.lg = 2 OR o.lg != i.lg) AS lg_changed
             FROM imp2 i LEFT JOIN oldmap o
               ON o.family = i.family AND o.w = COALESCE(i.word, '')
              AND o.u = COALESCE(i.unit, '') AND o.errtype = i.errtype
-             AND o.r = COALESCE(i.ref, '') AND o.seq = i.seq
-             AND o.lg != 2 AND o.lg = i.lg''')
+             AND o.r = COALESCE(i.ref, '') AND o.seq = i.seq''')
         cur.execute('CREATE INDEX temp.ix_assign ON assign(irow)')
         cur.execute('CREATE INDEX temp.ix_imp2_irow ON imp2(irow)')
         old_total = cur.execute('SELECT COUNT(*) FROM findings').fetchone()[0]
@@ -498,6 +503,22 @@ def import_all(outdir, migrate_legacy=False):
             'SELECT COALESCE(MAX(id), 0) FROM findings').fetchone()[0]
         cur.execute("INSERT OR REPLACE INTO meta VALUES('max_finding_id', ?)",
                     (str(max(max_id, new_max)),))
+
+        # approvals that may rest on legacy Tanach evidence: re-check
+        stale = cur.execute('''
+            SELECT r.finding_id, f.word FROM review r
+            JOIN assign a ON a.old_id = r.finding_id AND a.lg_changed
+            JOIN findings f ON f.id = r.finding_id
+            WHERE r.status = 'approved' ''').fetchall()
+        ts = _now()
+        for fid, word in stale:
+            cur.execute('INSERT INTO history(ts, action, finding_id, word, '
+                        'old_status, new_status, note) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        (ts, 'legacy_recheck', fid, word, 'approved', None,
+                         'tanach_legacy'))
+            cur.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
+        counts['legacy_approvals_dropped'] = len(stale)
 
         # drop review rows of vanished findings; count what survived
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
@@ -595,7 +616,7 @@ def import_book_scan(outdir, result):
             SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
                    r.status, r.note, r.custom_suggestion, r.updated_at
             FROM oldbook o JOIN review r ON r.finding_id = o.id
-            WHERE o.lg = 0''')
+            WHERE o.lg = 0 OR r.status != 'approved' ''')
 
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
