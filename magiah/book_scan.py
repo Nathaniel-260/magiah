@@ -55,7 +55,6 @@ is shared with the full pipeline so the findings are directly comparable.
 import math
 import os
 import pickle
-import sqlite3
 import time
 from collections import Counter
 
@@ -88,7 +87,7 @@ def load_lexicon(out_dir):
 
 
 def _load_whitelist(cfg, out_dir):
-    """Whitelist files + words rejected in review — same sources as detect."""
+    """Whitelist files + words rejected everywhere in review (as detect)."""
     words = set()
     for path in (cfg.whitelist or ()):
         try:
@@ -96,16 +95,7 @@ def _load_whitelist(cfg, out_dir):
                 words.update(line.strip() for line in f if line.strip())
         except OSError:
             continue
-    dec = os.path.join(out_dir, 'decisions.db')
-    if os.path.exists(dec):
-        con = sqlite3.connect(dec, timeout=30.0)
-        try:
-            words.update(r[0] for r in con.execute(
-                "SELECT DISTINCT word FROM decisions WHERE verdict='reject'"))
-        except sqlite3.OperationalError:
-            pass
-        finally:
-            con.close()
+    words.update(core.load_review_rejections(out_dir))
     return words
 
 

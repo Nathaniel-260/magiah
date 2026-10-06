@@ -3,8 +3,9 @@
 
 ``magiah review`` starts a small local web server over report.db. Findings
 are shown one after another, ranked; every accept/reject is stored in
-decisions.db immediately. Rejected words feed the next ``detect`` run as a
-whitelist, and accepted fixes can be exported to approved_fixes.csv.
+decisions.db immediately. Words rejected everywhere (ד) feed the next
+``detect`` run as a whitelist; rejecting one occurrence does not. Accepted
+fixes can be exported to approved_fixes.csv.
 
 Keyboard: י/Y = accept, נ/N = reject occurrence, ד/D = reject the word
 everywhere, ע/I = ignore forever (undecided, never shown again),
@@ -21,6 +22,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .core import RANK_SQL, REPORT_DB_F
 
 DECISIONS_F = 'decisions.db'
+# columns named: the review UI may have added companion tables/columns
+DECISION_INSERT = ('INSERT OR REPLACE INTO {db}.decisions(word, unit, '
+                   'errtype, verdict, suggestion, source, ref) '
+                   'VALUES(?,?,?,?,?,?,?)')
 
 PAGE = '''<!DOCTYPE html>
 <html lang="he" dir="rtl"><head><meta charset="utf-8">
@@ -289,7 +294,7 @@ class _Handler(BaseHTTPRequestHandler):
                         wr.writerows(rows)
                 rej = [r[0] for r in con.execute(
                     "SELECT DISTINCT word FROM dec.decisions "
-                    "WHERE verdict='reject'")]
+                    "WHERE verdict='reject' AND unit='*'")]
                 p2 = os.path.join(send_dir, 'rejected_words.txt')
                 with open(p2, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(rej))
@@ -309,8 +314,7 @@ class _Handler(BaseHTTPRequestHandler):
         d = json.loads(self.rfile.read(n).decode('utf-8'))
         con = self._db()
         try:
-            con.execute('INSERT OR REPLACE INTO dec.decisions '
-                        'VALUES(?,?,?,?,?,?,?)',
+            con.execute(DECISION_INSERT.format(db='dec'),
                         (d['word'], d['unit'], d.get('errtype', ''),
                          d['verdict'], d.get('suggestion', ''),
                          d.get('source', ''), d.get('ref', '')))

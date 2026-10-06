@@ -113,11 +113,8 @@ const S = {
   sel: new Set(),
   sessionActions: 0,
   // cards
-  cardQueue: [],
-  cardSeen: new Set(),
-  cardPage: 1,
-  cardExhausted: false,
-  cardLoading: false,
+  cq: null,                 // CardQueue (cardqueue.js), created on first use
+  cardSeed: 0,              // fixed per queue so a 'random' cursor is stable
   cardStale: true,
   cardFixOpen: false,
   // fixer — keyed on the FILE (fixKey), never on the book title: one title can
@@ -232,7 +229,8 @@ function filterParams(overrides) {
   const origin = val("origin", f.origin), book = val("book", f.book);
   const errtypes = val("errtypes", f.errtypes), sts = val("statuses", f.statuses);
   if (origin) p.set("origin", origin);
-  if (book) p.set("book", book);
+  // `book` holds the book's stable key (doc), never its display title
+  if (book) p.set("book_key", book);
   if (errtypes && errtypes.length) p.set("errtype", errtypes.join(","));
   if (sts && sts.length) p.set("status", sts.join(","));
   if (val("verified", f.verified)) p.set("verified", "1");
@@ -448,7 +446,7 @@ function localRowsById(ids) {
   const set = new Set(ids);
   const found = [];
   for (const r of S.tableRows) if (set.has(r.id)) found.push(r);
-  for (const r of S.cardQueue) if (set.has(r.id)) found.push(r);
+  if (S.cq) for (const r of S.cq.queue.concat(S.cq.skipped)) if (set.has(r.id)) found.push(r);
   for (const r of S.fixRows) if (set.has(r.id)) found.push(r);
   return found;
 }
@@ -468,11 +466,15 @@ async function setStatus(ids, status, opts) {
   if (opts.note !== undefined) body.note = opts.note;
   if (opts.custom_suggestion !== undefined) body.custom_suggestion = opts.custom_suggestion;
   if (opts.scope) body.scope = opts.scope;
+  if (opts.expect_status) body.expect_status = opts.expect_status;
   try {
     const resp = await api("/api/status", { method: "POST", body });
     S.sessionActions += ids.length;
-    S.lastActions.push({ ids, rows: rows.slice(), snapshot, status });
-    if (S.lastActions.length > 60) S.lastActions.shift();
+    // a no-op write has no server history entry, so no undo step either
+    if (writeChanged(resp)) {
+      S.lastActions.push({ ids, rows: rows.slice(), snapshot, status });
+      if (S.lastActions.length > 60) S.lastActions.shift();
+    }
     updateSessionCounter();
     updateProgress();
     if (resp && resp.warnings) for (const w of resp.warnings) toast(w, "err", 8000);
@@ -519,11 +521,18 @@ async function doUndo() {
     if (last) {
       for (const [r, st, cs, nt] of last.snapshot) { r.effective_status = st; r.custom_suggestion = cs; r.note = nt; }
       // put the finding back at the head of the card queue
-      if (S.view === "cards" && last.rows.length === 1 && !S.cardQueue.includes(last.rows[0])) {
-        S.cardQueue.unshift(last.rows[0]);
+      if (S.view === "cards" && S.cq && last.rows.length === 1) {
+        S.cq.restore(last.rows[0]);
         renderCard();
       }
     }
+    // the server's word on what each finding is now (an approval brought
+    // back onto a changed suggestion returns as pending, not approved)
+    for (const e of (resp && resp.entries) || []) {
+      if (e.finding_id == null) continue;
+      for (const r of localRowsById([e.finding_id])) r.effective_status = e.restored;
+    }
+    if (S.view === "cards") renderCard();
     let msg = "הפעולה האחרונה בוטלה";
     if (resp && resp.reverted != null) msg += " (" + fmtNum(resp.reverted) + " ממצאים)";
     toast(msg, "ok");
@@ -571,7 +580,7 @@ function syncFilterControls() {
   $("#globalSearch").value = f.q;
   $$("#fErrtypes input[type=checkbox]").forEach(c => { c.checked = f.errtypes.includes(c.value); });
   $$("#fStatuses input[type=checkbox]").forEach(c => { c.checked = f.statuses.includes(c.value); });
-  $$("#fBookList .book-item").forEach(b => b.classList.toggle("selected", b.dataset.name === f.book));
+  $$("#fBookList .book-item").forEach(b => b.classList.toggle("selected", b.dataset.key === f.book));
   $("#fixInclude").checked = S.fixInclude;
   if ($("#fixBook")) $("#fixBook").value = S.fixKey;
   syncModeButtons();
@@ -641,15 +650,21 @@ const loadBooks = debounce(async function () {
     const box = $("#fBookList");
     box.replaceChildren();
     if (!books.length) { box.append(el("div", { class: "empty" }, "לא נמצאו ספרים")); return; }
+    // several books can share a title: filter by the stable key, and show
+    // the key next to a title that is not unique
+    const titleCount = new Map();
+    for (const b of books) titleCount.set(b.source, (titleCount.get(b.source) || 0) + 1);
     for (const b of books.slice(0, 300)) {
       const name = b.name || b.source || String(b);
+      const key = b.key || name;
+      const label = titleCount.get(b.source) > 1 ? name + " — " + key : name;
       const pending = b.pending_count != null ? b.pending_count : b.pending;
       const cnt = (pending != null ? fmtNum(pending) + " ממתינים / " : "") + (b.count != null ? fmtNum(b.count) : "");
-      const item = el("div", { class: "book-item" + (S.filters.book === name ? " selected" : ""), dataset: { name } },
-        el("span", { class: "bname", title: name }, el("bdi", null, name)),
+      const item = el("div", { class: "book-item" + (S.filters.book === key ? " selected" : ""), dataset: { key } },
+        el("span", { class: "bname", title: label }, el("bdi", null, label)),
         el("span", { class: "bcount" }, cnt));
       item.addEventListener("click", () => {
-        S.filters.book = S.filters.book === name ? "" : name;
+        S.filters.book = S.filters.book === key ? "" : key;
         syncFilterControls();
         filtersChanged();
       });
@@ -996,57 +1011,70 @@ function closeDrawer() {
 }
 
 /* ---------------------------------------------------------- card view */
+/* The queue logic lives in cardqueue.js (keyset paging, skip pile, in-flight
+ * guard, server-side completion); this is only its wiring to the API. */
+function cardQueue() {
+  if (!S.cq) {
+    S.cq = new CardQueue({
+      fetchPage: (cursor, recheck) => {
+        const p = filterParams({ page: 1, page_size: 50, statuses: recheck ? remainingStatuses() : S.filters.statuses });
+        p.set("cursor", cursor || "");
+        if (S.filters.sort === "random") p.set("seed", String(S.cardSeed));
+        return api("/api/findings?" + p);
+      },
+      countRemaining: async () =>
+        totalOf(await api("/api/findings?" + filterParams({ statuses: remainingStatuses(), page: 1, page_size: 1 }))),
+      save: (row, status, opts) => setStatus([row.id], status, Object.assign({ expect_status: effStatus(row) }, opts)),
+    });
+  }
+  return S.cq;
+}
+/* What still counts as open work in the card view: the statuses being
+ * reviewed, or the undecided ones when the filter does not narrow by status. */
+function remainingStatuses() {
+  return S.filters.statuses.length ? S.filters.statuses : ["pending"];
+}
+
 async function ensureCardQueue() {
-  if (S.cardLoading || S.cardExhausted) return;
-  if (S.cardQueue.length >= 10) return;
-  S.cardLoading = true;
+  const q = cardQueue();
   try {
-    const resp = await api("/api/findings?" + filterParams({ page: S.cardPage, page_size: 50 }));
-    const rows = rowsOf(resp);
-    let added = 0;
-    for (const r of rows) {
-      if (!S.cardSeen.has(r.id)) { S.cardSeen.add(r.id); S.cardQueue.push(r); added++; }
-    }
-    S.cardPage++;
-    if (!rows.length || (S.cardPage - 1) * 50 >= totalOf(resp)) S.cardExhausted = true;
-    if (!added && rows.length) {
-      // page contained only seen rows — advance further
-      S.cardLoading = false;
-      return ensureCardQueue();
-    }
+    await q.fill();
   } catch (e) {
     toast("טעינת הכרטיסים נכשלה: " + e.message, "err");
-    S.cardExhausted = true;
   }
-  S.cardLoading = false;
-  renderCard();
+  if (S.view === "cards") renderCard();
 }
 
 function resetCardQueue() {
-  S.cardQueue = [];
-  S.cardSeen = new Set();
-  S.cardPage = 1;
-  S.cardExhausted = false;
+  cardQueue().reset();
+  S.cardSeed = Math.floor(Math.random() * 2147483647);
   S.cardStale = false;
   S.cardFixOpen = false;
   renderCard();
   ensureCardQueue();
 }
 
-function currentCard() { return S.cardQueue[0] || null; }
+function currentCard() { return S.cq ? S.cq.head() : null; }
 
 function renderCard() {
   const box = $("#cardBox");
   const meta = $("#cardMeta");
   const r = currentCard();
+  const q = cardQueue();
   meta.replaceChildren(
-    el("span", null, "בתור: " + fmtNum(S.cardQueue.length) + (S.cardExhausted ? "" : "+")),
+    el("span", null, "בתור: " + fmtNum(q.queue.length) + (q.exhausted ? "" : "+")),
+    q.skipped.length ? el("span", { title: "יוצגו שוב בסוף התור" }, "נדחו לאחר כך: " + fmtNum(q.skipped.length)) : null,
     el("span", null, "קיצורים: י=אושר · נ=לא שגיאה · ד=לא בכל מקום · ת=תיקון · ע=התעלם · ב=בירור · ק=תוקן · רווח=דלג"));
   box.replaceChildren();
   if (!r) {
+    // "done" only on the server's word — never because the local list ran out
+    const st = q.state();
+    const msg = st === "done" ? "אין עוד ממצאים בסינון הנוכחי — כל הכבוד!"
+      : st === "remaining" ? "עברת על כל הכרטיסים, אך בסינון הנוכחי נותרו עוד " + fmtNum(q.remaining)
+        + " ממצאים פתוחים (ייתכן שעודכנו בחלון אחר). רענון הסינון יציג אותם."
+      : "טוען ממצאים…";
     box.append(el("div", { class: "card-done" },
-      el("div", { class: "big" }, S.cardLoading ? "⏳" : "🎉"),
-      S.cardLoading ? "טוען ממצאים…" : "אין עוד ממצאים בסינון הנוכחי — כל הכבוד!"));
+      el("div", { class: "big" }, st === "done" ? "🎉" : st === "remaining" ? "⚠" : "⏳"), msg));
     return;
   }
   const info = errtypeInfo(r.errtype);
@@ -1082,7 +1110,7 @@ function renderCard() {
    * one click away on a quieter secondary row. Nothing is hidden. */
   const mkBtn = (label, kbd, fn, cls) => {
     const b = el("button", { class: cls || null },
-      el("span", { class: "lbl" }, label), el("kbd", null, kbd));
+      el("span", { class: "lbl" }, label), kbd ? el("kbd", null, kbd) : null);
     b.addEventListener("click", fn);
     return b;
   };
@@ -1092,6 +1120,9 @@ function renderCard() {
     mkBtn("⏭ דלג", "רווח", () => cardSkip(), "act-skip")));
   box.append(el("div", { class: "card-actions second-row" },
     mkBtn("❌ לא שגיאה בכל מקום", "ד", () => cardAct("not_error", { scope: "word" })),
+    // narrower than "everywhere": the word may still be wrong elsewhere
+    mkBtn("❌ תקין בספר זה", "", () => cardAct("not_error", { scope: "book" })),
+    mkBtn("❌ ההצעה שגויה", "", () => cardAct("not_error", { scope: "replacement" })),
     mkBtn("✏ תיקון ידני", "ת", () => toggleCardFix(true)),
     mkBtn("🚫 התעלם", "ע", () => cardAct("ignored")),
     mkBtn("❓ דרוש בירור", "ב", () => cardAct("unsure")),
@@ -1125,19 +1156,26 @@ async function submitCardFix() {
   await cardAct("approved", { custom_suggestion: v });
 }
 async function cardAct(status, opts) {
-  const r = currentCard();
+  const q = cardQueue();
+  const r = q.head();
   if (!r) return;
   try {
-    await setStatus([r.id], status, opts || {});
-    S.cardQueue.shift();
+    const res = await q.act(status, opts || {});
+    if (res && res.ignored) return;        // a decision on this card is already in flight
     S.cardFixOpen = false;
     renderCard();
     ensureCardQueue();
-  } catch (e) { /* stays on card; toast shown */ }
+  } catch (e) {
+    // stays on card; setStatus already showed the toast. On 409 the server
+    // says what the finding is now, so the card shows the real state.
+    const cur = e && e.status === 409 && e.data && e.data.current;
+    if (cur && cur[String(r.id)]) { r.effective_status = cur[String(r.id)]; renderCard(); }
+  }
 }
+/* Skip for later: the card moves to a separate pile that returns after the
+ * rest of the queue; it is not a decision and not counted as done. */
 function cardSkip() {
-  if (!currentCard()) return;
-  S.cardQueue.push(S.cardQueue.shift());
+  if (!cardQueue().skip()) return;
   S.cardFixOpen = false;
   renderCard();
   ensureCardQueue();
@@ -2155,6 +2193,9 @@ async function loadStats() {
   const origins = normalizeMatrix(st.origins || st.by_origin || st.origin_status || []);
   const errts = normalizeMatrix(st.errtypes || st.by_errtype || st.errtype_status || []);
   const books = normalizeMatrix(st.books || st.by_book || st.per_book || []);
+  // decisions by who made them: an agent's approval is never shown as a human one
+  const actors = normalizeMatrix(st.by_actor || {});
+  const ACTOR_HE = { human: "אדם", agent: "סוכן", unknown: "לא ידוע (לפני תיעוד)" };
   if (origins.length) {
     body.append(el("h3", null, "לפי מאגר"));
     body.append(matrixTable(origins, colInfo("origin").hebrew, l => originInfo(l).hebrew || l));
@@ -2177,6 +2218,10 @@ async function loadStats() {
         el("span", { class: "bb-nums" }, fmtNum(done) + " / " + fmtNum(total) + " (" + pct + "%)")));
     }
     body.append(bars);
+  }
+  if (actors.length) {
+    body.append(el("h3", null, "לפי מקבל ההחלטה"));
+    body.append(matrixTable(actors, "הוחלט ע״י", l => ACTOR_HE[l] || l));
   }
   if (!origins.length && !errts.length && !books.length) {
     body.append(el("div", null, "אין נתוני סטטיסטיקה להצגה."));

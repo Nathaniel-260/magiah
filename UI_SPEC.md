@@ -87,20 +87,23 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);  -- import timestamps, sour
 - `report.db.tanach_errors_full` → family `tanach_error`, errtype `tanach_edition`; suggestion = `canonical`.
 - `report.db.tanach_matches_full` → family `tanach_match`, errtype `tanach_match` (informational).
 - `1784548105098-tokdiag_source_he.csv` (if present in outdir) → family `tokdiag`, errtype `tokdiag`; word=term, suggestion, snippet=context, source=book, ref=heRef, unit=line_id; extra={category,freq}. origin: resolve via unit→occurrences match if cheap, else 'לא ידוע'.
-- **Migration:** existing `decisions.db` (114 rows): verdict `accept`→status `approved` (with suggestion→custom_suggestion if differs), `reject` with unit='*'→word_rules `not_error`, `reject` per-unit→`not_error`, `ignore`→`ignored`. Match on (word, unit) → finding_id.
+- **Migration:** existing `decisions.db` (114 rows): verdict `accept`→status `approved` (with suggestion→custom_suggestion if differs), `reject` with unit='*'→word_rules `not_error`, `reject` per-unit→`not_error` on that occurrence only, `ignore`→`ignored`. Match on (word, unit) → finding_id.
+- **Decision scopes:** a decision reaches `occurrence` (this finding), `replacement` (`replacement_rules`: every finding proposing the same word→suggestion), `book` (`book_rules`: the word within one doc) or `word` (`word_rules`: everywhere). Per-decision details (scope, approved_suggestion, decided_by, flag, prev_decision) live in `review_ext`; `review`'s column list is unchanged. An approval whose finding later proposes a different suggestion (re-import / book re-scan) drops to `pending` with flag `stale_approval`; a user-typed correction stays bound. Existing databases are upgraded additively on connect (`meta.schema_rev`).
 
-**Effective status resolution (query layer):** review row wins; else word_rules for that word; else `pending`.
+**Effective status resolution (query layer):** review row wins; else the book rule (word, doc); else the replacement rule (word, suggestion); else word_rules for that word; else `pending`.
 
-**decisions.db sync-back (critical for pipeline compat):** every status write ALSO writes the old-format row to `decisions.db` `decisions(word,unit,errtype,verdict,suggestion,source,ref)`: `approved`/`fixed` → verdict `accept`; `not_error` → `reject` (word-rule → unit='*'); `ignored` → `ignore`; `pending`/`unsure` → DELETE the row (so old detect feedback loop keeps working unchanged).
+**Book identity:** the `doc` column (DB bookId / library relpath / `local:<abs>`), never the title. Rows without a doc are keyed `src:<title>`.
+
+**decisions.db sync-back (critical for pipeline compat):** every status write ALSO writes the old-format row to `decisions.db` `decisions(word,unit,errtype,verdict,suggestion,source,ref)`: `approved`/`fixed` → verdict `accept`; `not_error` → `reject` (word-rule → unit='*'; only unit='*' rows feed the detect whitelist, and `decision_scope` records each row's scope explicitly); `ignored` → `ignore`; `pending`/`unsure` → DELETE the row (so old detect feedback loop keeps working unchanged).
 
 ## 3. HTTP API (JSON, UTF-8; server binds 127.0.0.1)
 
 - `GET /` and `/static/*` — SPA files.
 - `GET /api/meta` — { origins:[{name, hebrew, count, done_count}], errtypes:[{key, hebrew, explanation, count, pending_count}], statuses:[...], columns:[{key, hebrew, explanation}] }.
 - `GET /api/books?origin=&q=` — books (source values) with counts + pending counts, sorted by count desc; q = substring filter.
-- `GET /api/findings?origin=&book=&errtype=&status=&verified=&min_rank=&q=&sort=rank|random|source|word&dir=&page=&page_size=` — paginated (default page_size 50, max 500). Returns rows with effective_status + total count. `q` searches word/suggestion/snippet/ref (LIKE).
+- `GET /api/findings?origin=&book_key=&errtype=&status=&verified=&min_rank=&q=&sort=rank|random|source|word&dir=&page=&page_size=` — paginated (default page_size 50, max 500). Returns rows with effective_status + total count. `q` searches word/suggestion/snippet/ref (LIKE). `book` (by title) is still accepted. With `cursor=` (empty for the first page) paging is keyset-based (index seeks, no OFFSET) and the response carries `next_cursor` (null on the last page); `total` is null there unless `total=1` is passed. `seed=` selects the `random` order (a seed-keyed permutation; same seed, same order). The card queue uses this.
 - `GET /api/finding/<id>` — full row incl. extra JSON, history entries for it.
-- `POST /api/status` — body {ids:[...], status, note?, custom_suggestion?, scope?:'occurrence'|'word'} ; scope 'word' writes word_rules for those words. Writes history + decisions.db sync. Returns updated counts.
+- `POST /api/status` — body {ids:[...], status, note?, custom_suggestion?, scope?:'occurrence'|'replacement'|'book'|'word', expect_status?, actor?:'agent'} ; scope 'word' writes word_rules for those words. Writes history (with the full previous state) + decisions.db sync; `decided_by` is 'human' unless actor='agent'. A write that changes nothing is skipped. If `expect_status` no longer matches → 409 {code:'status_conflict', current:{id: status}} (checked inside the write transaction). `approved`/`fixed` with scope `book` or `word` is refused (400): an approval is bound to one suggestion. Returns updated counts.
 - `POST /api/undo` — revert last history entry (incl. bulk as one step). Returns what was reverted.
 - `GET /api/history?limit=100` — recent actions.
 - `GET /api/stats` — progress matrix: per origin × status counts, per errtype × status, per book (top N + filtered).
@@ -189,7 +192,7 @@ Origin (מאגר) display names: Sefaria→ספריא, DictaToOtzaria→דיקט
 - Large sheets (Sefaria ~194k rows) must export in streaming fashion (write rows incrementally, no giant string concat) and stay under a few hundred MB memory.
 - If target file is locked (open in Excel): return Hebrew error naming the locked file — never skip silently (fix for defect §8.3).
 
-**B. Legacy fixes export (compat):** `POST /api/export/fixes` reproduces old `to_send/` exactly: `approved_fixes_all.csv` + `approved_fixes_<origin>.csv` (header `word,suggestion,errtype,book,ref,line_id,origin,snippet`, UTF-8-BOM) from statuses approved+fixed (custom_suggestion wins over suggestion), plus `rejected_words.txt` from not_error word_rules **and** per-occurrence not_error words. Fix defect §8.1: book/ref/origin/snippet come from the findings table directly (no lossy join → no more "Unknown" rows).
+**B. Legacy fixes export (compat):** `POST /api/export/fixes` reproduces old `to_send/` exactly: `approved_fixes_all.csv` + `approved_fixes_<origin>.csv` (header `word,suggestion,errtype,book,ref,line_id,origin,snippet`, UTF-8-BOM) from statuses approved+fixed (custom_suggestion wins over suggestion), plus `rejected_words.txt` from not_error word_rules (global exclusions only), `rejected_occurrences.csv`, `rejected_replacements.csv` and `book_conventions.csv`. The fixes files append `approved_suggestion,decided_by` after the 8 legacy columns. A per-origin file this exporter wrote earlier (listed in `to_send/.magiah_export_manifest.json`) is removed once that origin has no fixes. Fix defect §8.1: book/ref/origin/snippet come from the findings table directly (no lossy join → no more "Unknown" rows).
 
 ## 8. Defects in old tool that MUST be fixed in the new one
 
