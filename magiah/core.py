@@ -744,6 +744,22 @@ def _ctx_count_chunk(chunk):
     return counts, local, _chunk_stats_end()
 
 
+def write_scan_meta(con, spec):
+    """Record in report.db which corpus produced it, so the fixer can write
+    each finding into the library it was found in, not the current setting."""
+    import json
+    from datetime import datetime
+    root = (os.path.abspath(spec['path'])
+            if spec.get('type') in ('library', 'hybrid') and spec.get('path')
+            else '')
+    con.execute('CREATE TABLE IF NOT EXISTS scan_meta('
+                'key TEXT PRIMARY KEY, value TEXT)')
+    con.executemany('INSERT OR REPLACE INTO scan_meta VALUES(?,?)', [
+        ('corpus', json.dumps(spec, ensure_ascii=False)),
+        ('library_root', root),
+        ('scanned_at', datetime.now().isoformat(timespec='microseconds'))])
+
+
 def locate(spec, cfg, out_dir):
     t0 = time.time()
     with open(_require(out_dir, FLAGGED_F, 'מיקום'), 'rb') as f:
@@ -847,6 +863,7 @@ def locate(spec, cfg, out_dir):
         CREATE TABLE tanach_errors(unit TEXT, word TEXT, canonical TEXT,
                                    snippet TEXT, evidence TEXT);
     ''')
+    write_scan_meta(con, spec)
     con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
                     [(w, *v) for w, v in flagged.items()])
     rows = []

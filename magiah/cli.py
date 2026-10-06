@@ -100,7 +100,7 @@ def _run_book_cmd(args, spec, cfg, out_dir):
         print(str(e), file=sys.stderr, flush=True)
         return 1
     from .webui import db as uidb
-    counts = uidb.import_book_scan(out_dir, result)
+    counts = uidb.merge_book_scan(out_dir, result)
     print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
           f"הוחלפו {counts['replaced']:,}, "
           f"נשמרו {counts['preserved']:,} החלטות", flush=True)

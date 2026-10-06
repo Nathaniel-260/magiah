@@ -333,6 +333,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(res, code)
         elif path == '/api/fixer/undo_file':
             self._json(fixer_api.undo_file(con, self.outdir, body))
+        elif path == '/api/fixer/resolve_conflict':
+            self._json(fixer_api.resolve_conflict(con, self.outdir, body))
         elif path == '/api/fixer/mode':
             self._json(fixer_api.set_mode(con, body))
         else:

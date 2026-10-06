@@ -1354,16 +1354,143 @@ def set_fixer_mode(con, key, mode):
     return mode
 
 
+# Fixer additions, applied lazily so existing databases upgrade in place:
+# file_edits gains journal_id (ties a row to its write-journal intent, which
+# makes recovery idempotent), backup_sha and source_root; fixer_sources holds
+# the library root each scan was made against ('report' or 'doc:<doc>') and,
+# for book scans, the hash of the file as scanned (file_sha).
+_FILE_EDIT_COLS = ('journal_id', 'backup_sha', 'source_root')
+
+
+def _ensure_fixer_schema(con):
+    have = {r[1] for r in con.execute('PRAGMA table_info(file_edits)')}
+    missing = [c for c in _FILE_EDIT_COLS if c not in have]
+    src = {r[1] for r in con.execute('PRAGMA table_info(fixer_sources)')}
+    if not missing and 'file_sha' in src:
+        return
+    for col in missing:
+        try:
+            con.execute(f'ALTER TABLE file_edits ADD COLUMN {col} TEXT')
+        except sqlite3.OperationalError:
+            pass                       # another connection added it first
+    con.execute('''CREATE TABLE IF NOT EXISTS fixer_sources(
+        scope TEXT PRIMARY KEY, root TEXT NOT NULL, stamp TEXT,
+        recorded_at TEXT NOT NULL, file_sha TEXT)''')
+    if src and 'file_sha' not in src:
+        try:
+            con.execute('ALTER TABLE fixer_sources ADD COLUMN file_sha TEXT')
+        except sqlite3.OperationalError:
+            pass
+    con.commit()
+
+
 def record_file_edit(con, path, book_key, backup, mode, finding_ids, detail,
-                     fp_before, fp_after):
+                     fp_before, fp_after, journal_id=None, backup_sha=None,
+                     source_root=None):
+    _ensure_fixer_schema(con)
     cur = con.execute(
         'INSERT INTO file_edits(ts, path, book_key, backup, mode, '
-        'finding_ids, detail, fp_before, fp_after, undone_at) '
-        'VALUES(?,?,?,?,?,?,?,?,?,NULL)',
+        'finding_ids, detail, fp_before, fp_after, undone_at, journal_id, '
+        'backup_sha, source_root) '
+        'VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?)',
         (_now(), path, book_key, backup, mode,
-         json.dumps(finding_ids), detail, fp_before, fp_after))
+         json.dumps(finding_ids), detail, fp_before, fp_after, journal_id,
+         backup_sha, source_root))
     con.commit()
     return cur.lastrowid
+
+
+def find_file_edit_by_journal(con, journal_id):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT id FROM file_edits WHERE journal_id = ?',
+                      (journal_id,)).fetchone()
+    return row[0] if row else None
+
+
+def get_live_edit_entries(con, key):
+    """``{finding_id: detail entry}`` of the newest live edit per finding."""
+    out = {}
+    for row in con.execute('SELECT detail FROM file_edits WHERE book_key = ? '
+                           'AND undone_at IS NULL ORDER BY id', (key,)):
+        try:
+            entries = json.loads(row[0])
+        except (ValueError, TypeError):
+            continue
+        for e in entries:
+            if isinstance(e, dict) and e.get('id') is not None:
+                out[e['id']] = e
+    return out
+
+
+def record_source_root(con, scope, root, stamp=None, file_sha=None):
+    _ensure_fixer_schema(con)
+    con.execute('INSERT OR REPLACE INTO fixer_sources(scope, root, stamp, '
+                'recorded_at, file_sha) VALUES(?,?,?,?,?)',
+                (scope, os.path.abspath(root) if root else '', stamp, _now(),
+                 file_sha))
+    con.commit()
+
+
+def get_source_root(con, scope):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT root, stamp, file_sha FROM fixer_sources '
+                      'WHERE scope = ?', (scope,)).fetchone()
+    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2]}
+            if row else None)
+
+
+def advance_scan_file_sha(con, scope, old, new):
+    """The fixer's own write moved the file from `old` to `new` without
+    moving any line, so line numbers recorded at scan time stay valid."""
+    _ensure_fixer_schema(con)
+    con.execute('UPDATE fixer_sources SET file_sha = ? WHERE scope = ? '
+                'AND file_sha = ?', (new, scope, old))
+    con.commit()
+
+
+def import_stamp(con):
+    """``(stamp, last_import)``. The stamp changes with every full import
+    (import_all writes import_counts; a book-scan merge does not), so a pinned
+    report root can tell it is stale."""
+    vals = dict(con.execute("SELECT key, value FROM meta WHERE key IN "
+                            "('import_counts', 'last_import')").fetchall())
+    return vals.get('import_counts') or '', vals.get('last_import') or ''
+
+
+def record_book_scan_source(outdir, result):
+    """Pin the library root a single-book scan read, under 'doc:<doc>',
+    with the hash of the file as scanned.
+
+    The scan's library comes from the request, not from run_config.json, so
+    without this the fixer could only guess which folder the rows describe.
+    """
+    from . import patcher
+    if result.get('kind') not in ('library', 'file') \
+            or not result.get('doc') or not result.get('path'):
+        return None
+    root = None
+    if result['kind'] == 'library':
+        root = os.path.abspath(result['path'])
+        for _part in str(result['doc']).split('/'):
+            root = os.path.dirname(root)
+    try:
+        sha = patcher.fingerprint(result['path'])
+    except OSError:
+        sha = None
+    con = connect(outdir)
+    try:
+        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha)
+    finally:
+        con.close()
+    return root
+
+
+def merge_book_scan(outdir, result):
+    """Merge a single-book scan and record where it came from — the one
+    path both the web UI and the CLI use, so neither can forget the root."""
+    counts = import_book_scan(outdir, result)
+    record_book_scan_source(outdir, result)
+    return counts
 
 
 def get_file_edits(con, key=None, limit=50, include_undone=True):
@@ -1403,6 +1530,10 @@ def get_file_edit(con, edit_id):
         d['finding_ids'] = json.loads(d['finding_ids'])
     except (ValueError, TypeError):
         d['finding_ids'] = []
+    try:
+        d['detail'] = json.loads(d['detail'])
+    except (ValueError, TypeError):
+        d['detail'] = []
     return d
 
 

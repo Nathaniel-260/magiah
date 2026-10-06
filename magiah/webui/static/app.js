@@ -1249,7 +1249,9 @@ async function loadFixDoc() {
       const e = manual.get(r.id);
       // only re-apply where the server still cannot place it itself; if it
       // now anchors on its own, its answer is the better one
-      if (e && r.anchor && !r.anchor.ok) {
+      // ...and only on a line the server still offers for a manual pick
+      if (e && r.anchor && !r.anchor.ok && e.lineno === r.lineno &&
+          (r.anchor.manual_lines || []).indexOf(e.lineno) >= 0) {
         const line = (resp.lines || []).find(l => l.n === r.lineno);
         const txt = line ? line.text : "";
         r.explicit = e;
@@ -1528,7 +1530,7 @@ function tokenPickLine(text, tokens, row) {
 function resolveOccurrence(row, start, end) {
   const lineText = (S.fixLines.get(row.lineno) || {}).text || "";
   const picked = lineText.slice(start, end);
-  row.explicit = { start, end };
+  row.explicit = { start, end, lineno: row.lineno };
   row.anchor = { ok: true, start, end, confidence: "manual",
                  spans_markup: picked.indexOf("<") >= 0 };
   // Pointing at a word says WHERE, not WHETHER. Arming an undecided finding
@@ -2006,6 +2008,7 @@ async function applyFixes() {
     if (r.explicit) {
       it.explicit_start = r.explicit.start;
       it.explicit_end = r.explicit.end;
+      it.explicit_lineno = r.explicit.lineno;
     }
     return it;
   });
