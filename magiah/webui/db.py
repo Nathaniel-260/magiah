@@ -25,9 +25,16 @@ their rank is documented per family:
 
 * extra_space  — rank = round(log10(join_freq + 1), 2)  (log-scaled join
   frequency: the more often the joined form appears, the more confident).
-* tanach_edition — rank = 4.0 flat (mirrors the ``tanach = 2`` bonus in
-  RANK_SQL: a deviation from the agreed Tanach text is strong evidence).
+* tanach_edition — rank = 4.0 flat (mirrors the ``tanach = 3`` bonus in
+  RANK_SQL) for verified rows (report.db carries an ``evidence`` column);
+  0.0 for rows of the old trigram heuristic.
 * tanach_match — rank = 0.0 (informational only).
+
+Tanach findings of the old heuristic (``tanach = 2``, or tanach_* rows of a
+report.db without an ``evidence`` column) are marked
+``{"evidence_kind": "tanach_legacy", "recheck": true}`` in ``extra`` and get
+no rank bonus. A review decision made before that mark existed is NOT carried
+onto them: it was given on the strength of evidence now known to be unsound.
 * tokdiag      — rank = round(log10(freq + 1), 2) (log-scaled frequency).
 
 decisions.db sync-back
@@ -72,7 +79,7 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 2 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
 
 VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 # ---------------------------------------------------------------------------
@@ -164,6 +171,23 @@ JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
 KEY_COLS = "family, COALESCE(word,''), COALESCE(unit,''), errtype, " \
            "COALESCE(ref,'')"
 
+# Tanach evidence of the old (prev, next)-trigram heuristic. `lg` per row:
+# 0 = not legacy, 1 = legacy and already marked for re-check, 2 = legacy from
+# before the mark (its review must not be inherited by anything).
+LEGACY_EXTRA = json.dumps({'evidence_kind': 'tanach_legacy', 'recheck': True})
+_NEW_TANACH = ("COALESCE({p}extra,'') LIKE '%tanach_verse_match%' OR "
+               "COALESCE({p}extra,'') LIKE '%tanach_edition_variant%'")
+LEGACY_LG_SQL = (
+    "CASE WHEN COALESCE({p}extra,'') LIKE '%tanach_legacy%' THEN 1 "
+    "WHEN COALESCE({p}tanach,0) = 2 OR ({p}family IN "
+    "('tanach_error','tanach_match') AND NOT (" + _NEW_TANACH + ")) "
+    "THEN 2 ELSE 0 END")
+
+
+def _legacy_lg(prefix=''):
+    return LEGACY_LG_SQL.format(p=prefix)
+
+
 # Reading-order sort key for a unit id. DB units are plain integers, but
 # file-based units are 'file:<relpath>:<lineno>' (§9c) — a plain
 # CAST(unit AS INTEGER) yields 0 for every one of those, which silently
@@ -239,6 +263,15 @@ def _find_tokdiag_csv(outdir):
     return hits[-1] if hits else None
 
 
+def _tanach_extra(evidence_json, verified):
+    if not verified:
+        return json.loads(LEGACY_EXTRA)
+    try:
+        return json.loads(evidence_json) if evidence_json else {}
+    except ValueError:
+        return {}
+
+
 def import_all(outdir, migrate_legacy=False):
     """(Re)build the findings table from report.db + the tokdiag CSV.
 
@@ -279,14 +312,23 @@ def import_all(outdir, migrate_legacy=False):
 
         counts = {}
         # -- family 'error' ------------------------------------------------
+        occ_cols = {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(occurrences_full)')}
+        evid = ''
+        if {'evidence_kind', 'alternatives'} <= occ_cols:
+            evid = ("""WHEN evidence_kind IS NOT NULL THEN
+                       '{"evidence_kind": "' || evidence_kind ||
+                       '", "alternatives": ' || COALESCE(alternatives, 'null')
+                       || '}'""")
         cur.execute(f'''
             INSERT INTO imp
             SELECT 'error', errtype, word, suggestion, score,
                    ROUND({RANK_SQL}, 2), ctx_hits, sugg_local, book_repeat,
                    tanach,
                    CASE WHEN {VERIFIED_SQL} THEN 1 ELSE 0 END,
-                   origin, source, ref, unit, doc, snippet, NULL
-            FROM rep.occurrences_full ORDER BY rowid''')
+                   origin, source, ref, unit, doc, snippet,
+                   CASE WHEN tanach = 2 THEN ? {evid} ELSE NULL END
+            FROM rep.occurrences_full ORDER BY rowid''', (LEGACY_EXTRA,))
         counts['error'] = cur.rowcount
 
         # -- family 'extra_space' -------------------------------------------
@@ -309,27 +351,36 @@ def import_all(outdir, migrate_legacy=False):
 
         # -- family 'tanach_error' -------------------------------------------
         rows = []
-        for word, canonical, src, ref, unit, snip, org in cur.execute(
-                'SELECT word, canonical, source, ref, unit, snippet, origin '
-                'FROM rep.tanach_errors_full ORDER BY rowid').fetchall():
+        verified = 'evidence' in {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(tanach_errors_full)')}
+        for word, canonical, src, ref, unit, snip, org, evid in cur.execute(
+                'SELECT word, canonical, source, ref, unit, snippet, origin, '
+                + ('evidence' if verified else 'NULL') +
+                ' FROM rep.tanach_errors_full ORDER BY rowid').fetchall():
+            extra = _tanach_extra(evid, verified)
+            extra['canonical'] = canonical
+            rank = 4.0 if verified else 0.0
             rows.append((
                 'tanach_error', 'tanach_edition', word, canonical,
-                4.0, 4.0, None, None, None, None, 0, org, src, ref, unit,
-                None, snip,
-                json.dumps({'canonical': canonical}, ensure_ascii=False)))
+                rank, rank, None, None, None, None, 0, org, src, ref, unit,
+                None, snip, json.dumps(extra, ensure_ascii=False)))
         cur.executemany('INSERT INTO imp VALUES(' +
                         ','.join('?' * 18) + ')', rows)
         counts['tanach_error'] = len(rows)
 
         # -- family 'tanach_match' -------------------------------------------
         rows = []
-        for word, src, ref, unit, snip, org in cur.execute(
-                'SELECT word, source, ref, unit, snippet, origin '
-                'FROM rep.tanach_matches_full ORDER BY rowid').fetchall():
+        verified = 'evidence' in {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(tanach_matches_full)')}
+        for word, src, ref, unit, snip, org, evid in cur.execute(
+                'SELECT word, source, ref, unit, snippet, origin, '
+                + ('evidence' if verified else 'NULL') +
+                ' FROM rep.tanach_matches_full ORDER BY rowid').fetchall():
             rows.append((
                 'tanach_match', 'tanach_match', word, None,
                 0.0, 0.0, None, None, None, None, 0, org, src, ref, unit,
-                None, snip, None))
+                None, snip, json.dumps(_tanach_extra(evid, verified),
+                                       ensure_ascii=False)))
         cur.executemany('INSERT INTO imp VALUES(' +
                         ','.join('?' * 18) + ')', rows)
         counts['tanach_match'] = len(rows)
@@ -371,7 +422,7 @@ def import_all(outdir, migrate_legacy=False):
 
         # -- stable-id assignment (see module docstring) ---------------------
         cur.execute(f'''CREATE TEMP TABLE imp2 AS
-            SELECT imp.*, rowid AS irow,
+            SELECT imp.*, rowid AS irow, {_legacy_lg()} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY rowid) AS seq
             FROM imp''')
@@ -379,7 +430,7 @@ def import_all(outdir, migrate_legacy=False):
             family, word, unit, errtype, ref, seq)''')
         cur.execute(f'''CREATE TEMP TABLE oldmap AS
             SELECT id, family, COALESCE(word,'') AS w, COALESCE(unit,'') AS u,
-                   errtype, COALESCE(ref,'') AS r,
+                   errtype, COALESCE(ref,'') AS r, {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY id) AS seq
             FROM findings f''')
@@ -390,7 +441,8 @@ def import_all(outdir, migrate_legacy=False):
             FROM imp2 i LEFT JOIN oldmap o
               ON o.family = i.family AND o.w = COALESCE(i.word, '')
              AND o.u = COALESCE(i.unit, '') AND o.errtype = i.errtype
-             AND o.r = COALESCE(i.ref, '') AND o.seq = i.seq''')
+             AND o.r = COALESCE(i.ref, '') AND o.seq = i.seq
+             AND o.lg != 2 AND o.lg = i.lg''')
         cur.execute('CREATE INDEX temp.ix_assign ON assign(irow)')
         cur.execute('CREATE INDEX temp.ix_imp2_irow ON imp2(irow)')
         old_total = cur.execute('SELECT COUNT(*) FROM findings').fetchone()[0]
@@ -534,6 +586,7 @@ def import_book_scan(outdir, result):
             SELECT f.id AS id, f.family AS family,
                    COALESCE(f.word,'') AS w, COALESCE(f.unit,'') AS u,
                    f.errtype AS errtype, COALESCE(f.ref,'') AS r,
+                   {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY f.id) AS seq
             FROM findings f WHERE {where}''', wparams)
@@ -541,7 +594,8 @@ def import_book_scan(outdir, result):
         cur.execute('''CREATE TEMP TABLE oldrev AS
             SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
                    r.status, r.note, r.custom_suggestion, r.updated_at
-            FROM oldbook o JOIN review r ON r.finding_id = o.id''')
+            FROM oldbook o JOIN review r ON r.finding_id = o.id
+            WHERE o.lg = 0''')
 
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
