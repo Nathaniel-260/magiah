@@ -1,0 +1,325 @@
+# -*- coding: utf-8 -*-
+"""One reader for Otzaria's seforim.db, shared by every consumer.
+
+Why a dedicated layer
+---------------------
+seforim.db has changed shape under Magiah's feet. Older databases kept the
+text in ``line.content`` as plain TEXT. Schema 6 moved it to
+``line_content.content`` and — once a ``zstd_dict`` table exists — stores each
+row as a zstd frame compressed with that one dictionary. Code that queries
+``line.content`` directly fails on such a database ("no such column"), and
+code that reads the BLOB without decoding it tokenizes binary garbage into an
+empty lexicon. Both used to be silent; the full scan, the single-book scan,
+the Tanach index and the report enrichment each had their own query.
+
+This module is the only place that knows the layout. It inspects the schema
+at open time, decodes per row (BLOB -> zstd frame, TEXT -> as-is, exactly as
+the Otzaria app does) and counts every row it could not read, so a caller can
+refuse to present a partial pass as a complete one.
+
+The zstd frames here are single-segment frames with a dictionary id; they do
+NOT need ``--long``. (That flag concerns the outer ``seforim-schema6.db.zst``
+release download, which is a different compression layer entirely.)
+
+Versions
+--------
+``book_version`` / ``version_line`` hold alternative editions. A NULL
+``version_line.content`` means "identical to the primary text", so only rows
+with content carry a different reading. Those rows are NOT independent
+witnesses by default — they are usually another digitisation of the same
+edition — and scanning them would double-count words in the lexicon. They are
+therefore excluded unless explicitly requested, and the exclusion is counted.
+"""
+import os
+import sqlite3
+import urllib.request
+
+
+class TextSourceError(Exception):
+    """The database cannot be read as an Otzaria text source (Hebrew)."""
+
+
+# ---------------------------------------------------------------------------
+# zstd backend: stdlib on Python >= 3.14, the `zstandard` package before that
+# ---------------------------------------------------------------------------
+
+def _make_decoder(dict_bytes):
+    """Return ``decode(bytes) -> bytes`` for frames made with `dict_bytes`."""
+    try:
+        from compression import zstd as _z          # Python 3.14+
+        zd = _z.ZstdDict(dict_bytes)
+
+        def decode(data):
+            return _z.decompress(data, zstd_dict=zd)
+        return decode, 'compression.zstd'
+    except ImportError:
+        pass
+    try:
+        import zstandard as _zs
+    except ImportError:
+        raise TextSourceError(
+            'מסד הנתונים דחוס ב-zstd, ואין בסביבה מפענח zstd.\n'
+            'יש להתקין את החבילה zstandard (pip install zstandard) '
+            'או להשתמש ב-Python 3.14 ומעלה.')
+    dctx = _zs.ZstdDecompressor(dict_data=_zs.ZstdCompressionDict(dict_bytes))
+
+    def decode(data):
+        # frames carry their content size; max_output_size guards the rare
+        # frame written without it
+        return dctx.decompress(data, max_output_size=64 * 1024 * 1024)
+    return decode, 'zstandard'
+
+
+def connect_ro(path, timeout=30.0):
+    """Read-only connection. Never creates a missing file (a plain
+    ``sqlite3.connect`` would leave a 0-byte database behind)."""
+    if not os.path.isfile(path):
+        raise TextSourceError(f'קובץ מסד הנתונים לא נמצא: {path}')
+    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
+        + '?mode=ro'
+    con = sqlite3.connect(uri, uri=True, timeout=timeout)
+    con.execute('PRAGMA busy_timeout=30000')
+    return con
+
+
+class ReadStats:
+    """Counts of what a reader actually read — the coverage evidence."""
+
+    FIELDS = ('lines', 'chars', 'empty', 'decode_errors', 'null_content',
+              'version_lines', 'version_lines_skipped')
+
+    def __init__(self):
+        for f in self.FIELDS:
+            setattr(self, f, 0)
+        self.error_samples = []          # first few (unit, message)
+
+    def add(self, other):
+        for f in self.FIELDS:
+            setattr(self, f, getattr(self, f) + getattr(other, f))
+        room = 20 - len(self.error_samples)
+        if room > 0:
+            self.error_samples.extend(other.error_samples[:room])
+        return self
+
+    def to_dict(self):
+        d = {f: getattr(self, f) for f in self.FIELDS}
+        d['error_samples'] = list(self.error_samples)
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        s = cls()
+        for f in cls.FIELDS:
+            setattr(s, f, int((d or {}).get(f, 0)))
+        s.error_samples = list((d or {}).get('error_samples') or [])
+        return s
+
+
+class OtzariaDB:
+    """Schema-aware, read-only access to the text of seforim.db."""
+
+    def __init__(self, path):
+        self.path = path
+        self.con = connect_ro(path)
+        tables = {r[0] for r in self.con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'line' not in tables or 'book' not in tables:
+            self.con.close()
+            raise TextSourceError(
+                f'הקובץ אינו מסד ספרים של אוצריא (חסרות הטבלאות line/book): '
+                f'{path}')
+        line_cols = {r[1] for r in self.con.execute('PRAGMA table_info(line)')}
+        if 'line_content' in tables:
+            self.layout = 'line_content'
+            self._text_sql = ('SELECT l.id, l.bookId, c.content FROM line l '
+                              'JOIN line_content c ON c.id = l.id')
+        elif 'content' in line_cols:
+            self.layout = 'inline'
+            self._text_sql = 'SELECT l.id, l.bookId, l.content FROM line l'
+        else:
+            self.con.close()
+            raise TextSourceError(f'לא נמצאה עמודת תוכן במסד: {path}')
+        self.has_versions = {'book_version', 'version_line'} <= tables
+        self.decode_raw = None
+        self.backend = None
+        if 'zstd_dict' in tables:
+            row = self.con.execute(
+                'SELECT dict FROM zstd_dict ORDER BY id LIMIT 1').fetchone()
+            if row is None:
+                raise TextSourceError('טבלת zstd_dict ריקה — לא ניתן לפענח')
+            self.decode_raw, self.backend = _make_decoder(row[0])
+        self.schema_meta = {}
+        if 'schema_meta' in tables:
+            self.schema_meta = dict(self.con.execute(
+                'SELECT key, value FROM schema_meta').fetchall())
+
+    def close(self):
+        self.con.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- decoding ------------------------------------------------------------
+    def decode(self, value):
+        """Row value -> str. BLOB is a zstd frame, TEXT is already text."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if self.decode_raw is None:
+            # a BLOB in a database without a dictionary: not a format we know
+            raise TextSourceError('תוכן בינארי במסד ללא מילון zstd')
+        return self.decode_raw(bytes(value)).decode('utf-8')
+
+    def _decode_counted(self, unit, value, stats):
+        if value is None:
+            stats.null_content += 1
+            return None
+        try:
+            text = self.decode(value)
+        except Exception as e:                      # noqa: BLE001
+            stats.decode_errors += 1
+            if len(stats.error_samples) < 20:
+                stats.error_samples.append((str(unit), repr(e)[:200]))
+            return None
+        stats.lines += 1
+        stats.chars += len(text)
+        if not text.strip():
+            stats.empty += 1
+        return text
+
+    # -- enumeration ---------------------------------------------------------
+    def id_range(self):
+        return self.con.execute('SELECT MIN(id), MAX(id) FROM line').fetchone()
+
+    def iter_range(self, lo, hi, stats, book_ids_sql=None, params=()):
+        """Yield ``(line_id, book_id, text)`` for ``lo <= id < hi``.
+
+        `book_ids_sql` optionally restricts to a sub-select of book ids.
+        Unreadable rows are counted in `stats` and skipped — never yielded as
+        empty text, which would make a broken read look like an empty book.
+        """
+        sql = self._text_sql + ' WHERE l.id >= ? AND l.id < ?'
+        args = [lo, hi]
+        if book_ids_sql:
+            sql += f' AND l.bookId IN ({book_ids_sql})'
+            args.extend(params)
+        for lid, bid, raw in self.con.execute(sql, args):
+            text = self._decode_counted(lid, raw, stats)
+            if text is not None:
+                yield lid, bid, text
+
+    def book_lines(self, book_id, stats=None):
+        """``[(line_id, heRef, text)]`` of one book in reading order."""
+        stats = stats if stats is not None else ReadStats()
+        if self.layout == 'line_content':
+            sql = ('SELECT l.id, l.heRef, c.content FROM line l '
+                   'JOIN line_content c ON c.id = l.id WHERE l.bookId = ? '
+                   'ORDER BY l.lineIndex, l.id')
+        else:
+            sql = ('SELECT l.id, l.heRef, l.content FROM line l '
+                   'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
+        out = []
+        for lid, ref, raw in self.con.execute(sql, (book_id,)):
+            text = self._decode_counted(lid, raw, stats)
+            if text is not None:
+                out.append((lid, ref or '', text))
+        return out
+
+    def line_texts(self, line_ids, stats=None):
+        """``{line_id: text}`` for the given ids (missing/unreadable omitted)."""
+        stats = stats if stats is not None else ReadStats()
+        out = {}
+        ids = list(line_ids)
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ','.join('?' * len(batch))
+            for lid, _bid, raw in self.con.execute(
+                    self._text_sql + f' WHERE l.id IN ({ph})', batch):
+                text = self._decode_counted(lid, raw, stats)
+                if text is not None:
+                    out[lid] = text
+        return out
+
+    def count_version_lines(self, lo=None, hi=None):
+        """Version rows that carry their own reading (content NOT NULL)."""
+        if not self.has_versions:
+            return 0
+        sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
+        args = []
+        if lo is not None:
+            sql += ' AND lineId >= ? AND lineId < ?'
+            args = [lo, hi]
+        return self.con.execute(sql, args).fetchone()[0]
+
+    def iter_version_range(self, lo, hi, stats):
+        """Yield ``(version_id, line_id, book_id, text)`` for version rows
+        with their own reading, ``lo <= line_id < hi``."""
+        if not self.has_versions:
+            return
+        for vid, lid, bid, raw in self.con.execute(
+                'SELECT v.versionId, v.lineId, l.bookId, v.content '
+                'FROM version_line v JOIN line l ON l.id = v.lineId '
+                'WHERE v.lineId >= ? AND v.lineId < ? '
+                'AND v.content IS NOT NULL', (lo, hi)):
+            text = self._decode_counted(f'ver:{vid}:{lid}', raw, stats)
+            if text is not None:
+                stats.version_lines += 1
+                yield vid, lid, bid, text
+
+    def identity(self):
+        """What a run must record to be reproducible against this input."""
+        st = os.stat(self.path)
+        counts = {
+            'books': self.con.execute('SELECT COUNT(*) FROM book').fetchone()[0],
+            'lines': self.con.execute('SELECT COUNT(*) FROM line').fetchone()[0],
+        }
+        lo, hi = self.id_range()
+        return {'path': os.path.abspath(self.path), 'bytes': st.st_size,
+                'mtime': int(st.st_mtime), 'layout': self.layout,
+                'compressed': self.decode_raw is not None,
+                'zstd_backend': self.backend,
+                'schema_meta': self.schema_meta,
+                'line_id_range': [lo, hi], **counts}
+
+
+# ---------------------------------------------------------------------------
+# text files: one line-splitting rule for every reader
+# ---------------------------------------------------------------------------
+
+def split_lines(text):
+    """Split on CR LF / CR / LF only — the same rule the file writer uses.
+
+    ``str.splitlines`` also breaks on U+2028, U+2029, U+0085, VT, FF and
+    U+001C-U+001E. Library files do contain U+2028 inside a line, and a reader
+    that splits there numbers every later line differently from the full scan
+    (which iterates the file object) and from the patcher, so a finding would
+    point one line off. Kept here so all three agree by construction.
+    """
+    if not text:
+        return []
+    out = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    if out and out[-1] == '':
+        out.pop()                       # a trailing terminator ends the file
+    return out
+
+
+def iter_file_lines(path, encoding='utf-8'):
+    """Yield the lines of a text file without terminators, numbered like
+    :func:`split_lines` (and the patcher), streaming."""
+    with open(path, encoding=encoding, errors='replace', newline='') as f:
+        pending_cr = False
+        buf = ''
+        for chunk in iter(lambda: f.read(1 << 20), ''):
+            if pending_cr and chunk.startswith('\n'):
+                chunk = chunk[1:]
+            pending_cr = chunk.endswith('\r')
+            buf += chunk.replace('\r\n', '\n').replace('\r', '\n')
+            parts = buf.split('\n')
+            buf = parts.pop()
+            yield from parts
+        if buf:
+            yield buf

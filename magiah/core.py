@@ -25,6 +25,7 @@ from multiprocessing import Pool
 
 from .config import Config
 from .corpus import make_corpus
+from .textsource import ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
@@ -101,15 +102,56 @@ def _pool(spec, cfg, loads=None):
                 initargs=(spec, cfg.to_dict(), loads or {}))
 
 
+def _chunk_stats_begin():
+    """Fresh per-chunk read counters on the worker's corpus adapter."""
+    _W['corpus'].stats = ReadStats()
+
+
+def _chunk_stats_end():
+    return _W['corpus'].stats.to_dict()
+
+
+COVERAGE_F = 'coverage_{stage}.json'
+
+
+class PartialRead(StageError):
+    """Rows of the input could not be read; the stage output is partial."""
+
+
+def _write_coverage(out_dir, stage, stats, extra=None):
+    """Persist what a stage actually read (the run's coverage evidence)."""
+    import json
+    info = {'stage': stage, 'complete': stats.decode_errors == 0,
+            **stats.to_dict(), **(extra or {})}
+    with open(os.path.join(out_dir, COVERAGE_F.format(stage=stage)), 'w',
+              encoding='utf-8') as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+    print(f'[{stage}] coverage: lines={stats.lines:,} chars={stats.chars:,} '
+          f'decode_errors={stats.decode_errors:,} '
+          f'version_lines_skipped={stats.version_lines_skipped:,}',
+          flush=True)
+    return info
+
+
+def _fail_if_partial(stage, stats, out_dir):
+    """A pass with unreadable rows must never be reported as complete."""
+    if stats.decode_errors:
+        raise PartialRead(
+            f'שלב "{stage}" לא הצליח לקרוא {stats.decode_errors:,} שורות '
+            f'מהקלט, ולכן התוצאה חלקית ואינה מוצגת כהצלחה.' + chr(10) +
+            f'פרטים: {os.path.join(out_dir, COVERAGE_F.format(stage=stage))}')
+
+
 # ---------------------------------------------------------------------------
 # stage 1: lexicon
 # ---------------------------------------------------------------------------
 
 def _count_chunk(chunk):
+    _chunk_stats_begin()
     c = Counter()
     for _, text in _W['corpus'].iter_texts(chunk):
         c.update(tokenize(text))
-    return c
+    return c, _chunk_stats_end()
 
 
 def build_lexicon(spec, cfg, out_dir):
@@ -117,15 +159,22 @@ def build_lexicon(spec, cfg, out_dir):
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
     lex = Counter()
+    stats = ReadStats()
     with _pool(spec, cfg) as pool:
-        for i, c in enumerate(pool.imap_unordered(_count_chunk, chunks), 1):
+        for i, (c, st) in enumerate(
+                pool.imap_unordered(_count_chunk, chunks), 1):
             lex.update(c)
+            stats.add(ReadStats.from_dict(st))
             print(f'  [lexicon] chunk {i}/{len(chunks)}  types={len(lex):,}  '
                   f'({time.time()-t0:.0f}s)', flush=True)
     with open(os.path.join(out_dir, LEXICON_F), 'wb') as f:
         pickle.dump(dict(lex), f, protocol=4)
     print(f'[lexicon] tokens={sum(lex.values()):,}  types={len(lex):,}  '
           f'time={time.time()-t0:.0f}s', flush=True)
+    _write_coverage(out_dir, 'lexicon', stats,
+                    {'tokens': sum(lex.values()), 'types': len(lex),
+                     'chunks': len(chunks)})
+    _fail_if_partial('lexicon', stats, out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +247,7 @@ def _segment(w, freq, cfg):
 
 def _split_verify_chunk(chunk):
     """Count how often each split candidate occurs *with* spaces."""
+    _chunk_stats_begin()
     first, pairs, cands = _W['sc_first'], _W['sc_pairs'], _W['split_cands']
     counts = Counter()
     for _, text in _W['corpus'].iter_texts(chunk):
@@ -209,7 +259,7 @@ def _split_verify_chunk(chunk):
                     if len(parts) == 2 or (i + 2 < len(toks)
                                            and toks[i + 2] == parts[2]):
                         counts[idx] += 1
-    return counts
+    return counts, _chunk_stats_end()
 
 
 def calibrate(cfg, out_dir):
@@ -459,10 +509,13 @@ def detect(spec, cfg, out_dir):
         pickle.dump(cand_list, f, protocol=4)
     corpus = make_corpus(spec)
     counts = Counter()
+    vstats = ReadStats()
     chunks = corpus.chunks(cfg.n_chunks)
     with _pool(spec, cfg, {'split_cands': splits_path}) as pool:
-        for i, c in enumerate(pool.imap_unordered(_split_verify_chunk, chunks), 1):
+        for i, (c, st) in enumerate(
+                pool.imap_unordered(_split_verify_chunk, chunks), 1):
             counts.update(c)
+            vstats.add(ReadStats.from_dict(st))
             if i % 6 == 0:
                 print(f'  [verify] chunk {i}/{len(chunks)} '
                       f'({time.time()-t0:.0f}s)', flush=True)
@@ -486,6 +539,8 @@ def detect(spec, cfg, out_dir):
                    + (1 if minlen >= 3 else 0))
             n_ok += 1
     print(f'[verify] confirmed {n_ok:,}/{len(cand_list):,} splits', flush=True)
+    _write_coverage(out_dir, 'detect', vstats)
+    _fail_if_partial('detect', vstats, out_dir)
 
     with open(os.path.join(out_dir, FLAGGED_F), 'wb') as f:
         pickle.dump(errors, f, protocol=4)
@@ -569,6 +624,7 @@ NAME_TRIGGERS = frozenset((
 # ---------------------------------------------------------------------------
 
 def _locate_chunk(chunk):
+    _chunk_stats_begin()
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
     profiles = _W.get('ocr_profiles') or {}
     occ, joins, ocr = [], [], []
@@ -661,7 +717,7 @@ def _locate_chunk(chunk):
                     continue
                 occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
-    return occ, joins, ocr
+    return occ, joins, ocr, _chunk_stats_end()
 
 
 def _ctx_count_chunk(chunk):
@@ -669,6 +725,7 @@ def _ctx_count_chunk(chunk):
     * ctx: how often does (neighbor, correction) occur as an adjacent pair?
     * local: how often does each proposed correction occur in the same book
       as the flagged word?"""
+    _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
     counts, local = Counter(), Counter()
@@ -682,7 +739,7 @@ def _ctx_count_chunk(chunk):
                 p = (t, toks[i + 1])
                 if p in pairs:
                     counts[p] += 1
-    return counts, local
+    return counts, local, _chunk_stats_end()
 
 
 def locate(spec, cfg, out_dir):
@@ -693,14 +750,16 @@ def locate(spec, cfg, out_dir):
     chunks = corpus.chunks(cfg.n_chunks)
 
     all_occ, all_joins, all_ocr = [], [], []
+    lstats = ReadStats()
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
     prof_path = os.path.join(out_dir, 'ocr_profiles.pkl')
     if os.path.exists(prof_path):
         loads['ocr_profiles'] = prof_path
     with _pool(spec, cfg, loads) as pool:
-        for i, (occ, joins, ocr) in enumerate(
+        for i, (occ, joins, ocr, st) in enumerate(
                 pool.imap_unordered(_locate_chunk, chunks), 1):
+            lstats.add(ReadStats.from_dict(st))
             all_occ.extend(occ)
             all_joins.extend(joins)
             all_ocr.extend(ocr)
@@ -782,7 +841,7 @@ def locate(spec, cfg, out_dir):
             pickle.dump(book_need, f, protocol=4)
         with _pool(spec, cfg, {'ctx_pairs': ctx_path,
                                'book_need': need_path}) as pool:
-            for i, (c, lc) in enumerate(
+            for i, (c, lc, _st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
@@ -843,6 +902,8 @@ def locate(spec, cfg, out_dir):
     con.close()
     print(f'[locate] occurrences={len(rows):,}  space_errors={len(all_joins):,}'
           f'  time={time.time()-t0:.0f}s -> {db_path}', flush=True)
+    _write_coverage(out_dir, 'locate', lstats)
+    _fail_if_partial('locate', lstats, out_dir)
 
 
 # ---------------------------------------------------------------------------

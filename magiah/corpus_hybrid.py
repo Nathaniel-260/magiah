@@ -22,6 +22,7 @@ import re
 import sqlite3
 
 from .corpus import OTZARIA_DB
+from .textsource import OtzariaDB, ReadStats, connect_ro, iter_file_lines
 
 DEFAULT_LIBRARY = r'C:\OTZ\otzaria-library'
 SEFARIA_SOURCE = 'Sefaria'
@@ -84,6 +85,7 @@ class LibraryCorpus:
         self.spec = spec
         self.path = spec.get('path') or DEFAULT_LIBRARY
         self.encoding = spec.get('encoding', 'utf-8')
+        self.stats = ReadStats()
 
     # -- enumeration -------------------------------------------------------
     @staticmethod
@@ -160,12 +162,16 @@ class LibraryCorpus:
         for rel in chunk:
             fp = os.path.join(self.path, *rel.split('/'))
             try:
-                f = open(fp, encoding=self.encoding, errors='replace')
-            except OSError:
-                continue
-            with f:
-                for lineno, text in enumerate(f):
+                for lineno, text in enumerate(
+                        iter_file_lines(fp, self.encoding)):
+                    self.stats.lines += 1
+                    self.stats.chars += len(text)
                     yield f'{FILE_UNIT_PREFIX}{rel}:{lineno}', rel, text
+            except OSError as e:
+                # an unreadable book is a coverage gap, not an empty book
+                self.stats.decode_errors += 1
+                if len(self.stats.error_samples) < 20:
+                    self.stats.error_samples.append((rel, repr(e)[:200]))
 
     # -- enrichment --------------------------------------------------------
     def file_unit_meta(self, units):
@@ -184,25 +190,22 @@ class LibraryCorpus:
             origin = self.origin_of(rel)
             fp = os.path.join(self.path, *rel.split('/'))
             refs = {}
+            need = {ln for ln, _ in wanted}
+            hdrs = {}                  # level -> text
             try:
-                f = open(fp, encoding=self.encoding, errors='replace')
+                for lineno, line in enumerate(
+                        iter_file_lines(fp, self.encoding)):
+                    for m in _HDR_RE.finditer(line):
+                        lvl = int(m.group(1))
+                        hdrs[lvl] = _header_text(m)
+                        for deeper in range(lvl + 1, 5):
+                            hdrs.pop(deeper, None)
+                    if lineno in need:
+                        parts = [hdrs[k] for k in (2, 3, 4) if hdrs.get(k)]
+                        refs[lineno] = (title + (', ' + ' '.join(parts)
+                                                 if parts else ''))
             except OSError:
-                f = None
-            if f is not None:
-                with f:
-                    need = {ln for ln, _ in wanted}
-                    hdrs = {}          # level -> text
-                    for lineno, line in enumerate(f):
-                        for m in _HDR_RE.finditer(line):
-                            lvl = int(m.group(1))
-                            hdrs[lvl] = _header_text(m)
-                            for deeper in range(lvl + 1, 5):
-                                hdrs.pop(deeper, None)
-                        if lineno in need:
-                            parts = [hdrs[k] for k in (2, 3, 4)
-                                     if hdrs.get(k)]
-                            refs[lineno] = (title + (', ' + ' '.join(parts)
-                                                     if parts else ''))
+                pass                   # ref falls back to the title below
             for ln, unit in wanted:
                 meta[unit] = (title, refs.get(ln, title), origin)
         return meta
@@ -220,30 +223,41 @@ class HybridCorpus:
                                       'path': spec.get('path')})
         self.db = spec.get('db') or OTZARIA_DB
         self._db_book_ids = None
+        self._odb = None
+
+    @property
+    def stats(self):
+        return self.library.stats
+
+    @stats.setter
+    def stats(self, value):
+        self.library.stats = value
+
+    def _otzaria(self):
+        if self._odb is None:
+            self._odb = OtzariaDB(self.db)
+        return self._odb
+
+    def close(self):
+        if self._odb is not None:
+            self._odb.close()
+            self._odb = None
 
     def db_book_ids(self):
         """ids of the seforim.db books scanned from the DB (Sefaria only) —
         computed once per process and cached."""
         if self._db_book_ids is None:
-            con = sqlite3.connect(self.db)
-            try:
-                self._db_book_ids = frozenset(r[0] for r in con.execute(
-                    'SELECT b.id FROM book b JOIN source s '
-                    'ON s.id = b.sourceId WHERE s.name = ?',
-                    (SEFARIA_SOURCE,)))
-            finally:
-                con.close()
+            con = self._otzaria().con
+            self._db_book_ids = frozenset(r[0] for r in con.execute(
+                'SELECT b.id FROM book b JOIN source s '
+                'ON s.id = b.sourceId WHERE s.name = ?', (SEFARIA_SOURCE,)))
         return self._db_book_ids
 
     # -- corpus interface --------------------------------------------------
     def chunks(self, n):
         chunks = [('f', c) for c in self.library.chunks(n)]
-        con = sqlite3.connect(self.db)
-        try:
-            lo, hi = con.execute('SELECT MIN(id), MAX(id) FROM line'
-                                 ).fetchone()
-        finally:
-            con.close()
+        with OtzariaDB(self.db) as odb:
+            lo, hi = odb.id_range()
         if lo is not None:
             step = (hi - lo) // n + 1
             chunks.extend(('db', lo + i * step,
@@ -260,19 +274,14 @@ class HybridCorpus:
             yield from self.library.iter_texts_docs(chunk[1])
             return
         _, lo, hi = chunk
-        con = sqlite3.connect(self.db)
-        try:
-            # the uncorrelated IN-subquery is materialized once by SQLite,
-            # so non-Sefaria rows are filtered before their content is read
-            for uid, book_id, text in con.execute(
-                    'SELECT id, bookId, content FROM line '
-                    'WHERE id >= ? AND id < ? AND content IS NOT NULL '
-                    'AND bookId IN (SELECT b.id FROM book b '
-                    '  JOIN source s ON s.id = b.sourceId WHERE s.name = ?)',
-                    (lo, hi, SEFARIA_SOURCE)):
-                yield str(uid), str(book_id), text
-        finally:
-            con.close()
+        # the uncorrelated IN-subquery is materialized once by SQLite, so
+        # non-Sefaria rows are filtered before their content is decoded
+        for uid, book_id, text in self._otzaria().iter_range(
+                lo, hi, self.stats,
+                book_ids_sql='SELECT b.id FROM book b JOIN source s '
+                             'ON s.id = b.sourceId WHERE s.name = ?',
+                params=(SEFARIA_SOURCE,)):
+            yield str(uid), str(book_id), text
 
     # -- enrichment --------------------------------------------------------
     def enrich(self, con):
@@ -280,7 +289,7 @@ class HybridCorpus:
         meta = self.library.file_unit_meta(units)
         db_units = [u for u in units
                     if u not in meta and u.lstrip('-').isdigit()]
-        src = sqlite3.connect(self.db)
+        src = connect_ro(self.db)
         try:
             for i in range(0, len(db_units), 500):
                 batch = db_units[i:i + 500]

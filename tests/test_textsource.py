@@ -1,0 +1,272 @@
+# -*- coding: utf-8 -*-
+"""The seforim.db reader: layouts, zstd rows, versions, coverage, lines."""
+import os
+import sqlite3
+import tempfile
+import unittest
+
+from magiah import book_source, core
+from magiah.config import Config
+from magiah.corpus import make_corpus
+from magiah.corpus_hybrid import HybridCorpus, LibraryCorpus
+from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError,
+                               iter_file_lines, split_lines)
+
+try:
+    from compression import zstd as _zstd
+except ImportError:                                  # Python < 3.14
+    _zstd = None
+
+LINES = [
+    (1, 1, 'בראשית ברא אלהים את השמים ואת הארץ'),
+    (2, 1, '<b>והארץ</b> היתה תהו ובהו'),
+    (3, 2, 'אמר הרב ברכת שלום עליכם לתלמידיו'),
+    (4, 2, 'אמר הסוחר המחיר שלם ואין חוב'),
+]
+
+
+def _base_schema(con):
+    con.executescript('''
+        CREATE TABLE source(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE book(id INTEGER PRIMARY KEY, title TEXT, sourceId INT,
+                          hasTeamim INT DEFAULT 0);
+        INSERT INTO source VALUES(1, 'Sefaria'), (2, 'DictaToOtzaria');
+        INSERT INTO book VALUES(1, 'ספר א', 1, 0), (2, 'ספר ב', 2, 0);
+        CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO schema_meta VALUES('db_schema_version', '6');
+    ''')
+
+
+def make_inline_db(path):
+    """The pre-schema-6 layout: text in line.content."""
+    con = sqlite3.connect(path)
+    _base_schema(con)
+    con.execute('CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INT, '
+                'lineIndex INT, heRef TEXT, content TEXT)')
+    con.executemany('INSERT INTO line VALUES(?,?,?,?,?)',
+                    [(i, b, i, f'ref {i}', t) for i, b, t in LINES])
+    con.commit()
+    con.close()
+
+
+def _train_dict():
+    samples = [(t + ' ' + str(i)).encode('utf-8')
+               for i in range(400) for _, _, t in LINES]
+    return _zstd.train_dict(samples, 4096)
+
+
+def make_schema6_db(path, corrupt_id=None, plain_id=None):
+    """Schema 6: text in line_content, zstd frames with a stored dict, and
+    one alternative version with its own reading."""
+    zd = _train_dict()
+    con = sqlite3.connect(path)
+    _base_schema(con)
+    con.executescript('''
+        CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INT, lineIndex INT,
+                          heRef TEXT, tocEntryId INT, charCount INT);
+        CREATE TABLE line_content(id INTEGER PRIMARY KEY, content TEXT);
+        CREATE TABLE zstd_dict(id INTEGER PRIMARY KEY, dict BLOB NOT NULL);
+        CREATE TABLE book_version(id INTEGER PRIMARY KEY, bookId INT,
+                                  versionTitle TEXT, hasContent INT);
+        CREATE TABLE version_line(versionId INT, lineId INT, content TEXT,
+                                  charCount INT,
+                                  PRIMARY KEY(versionId, lineId));
+    ''')
+    con.execute('INSERT INTO zstd_dict VALUES(1, ?)', (zd.dict_content,))
+    for i, b, t in LINES:
+        con.execute('INSERT INTO line VALUES(?,?,?,?,NULL,?)',
+                    (i, b, i, f'ref {i}', len(t)))
+        if i == plain_id:
+            val = t                                  # stored uncompressed
+        elif i == corrupt_id:
+            val = b'\x28\xb5\x2f\xfd' + b'\x00' * 9  # broken frame
+        else:
+            val = _zstd.compress(t.encode('utf-8'), zstd_dict=zd)
+        con.execute('INSERT INTO line_content VALUES(?,?)', (i, val))
+    con.execute("INSERT INTO book_version VALUES(1, 1, 'v1', 1)")
+    con.execute('INSERT INTO version_line VALUES(1, 1, NULL, 0)')
+    con.execute('INSERT INTO version_line VALUES(1, 2, ?, 0)',
+                (_zstd.compress('נוסח אחר'.encode('utf-8'), zstd_dict=zd),))
+    con.commit()
+    con.close()
+
+
+class InlineLayoutTest(unittest.TestCase):
+    def test_old_layout_still_reads(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 's.db')
+            make_inline_db(p)
+            with OtzariaDB(p) as odb:
+                self.assertEqual(odb.layout, 'inline')
+                st = ReadStats()
+                got = list(odb.iter_range(1, 5, st))
+            self.assertEqual([t for _, _, t in got], [t for _, _, t in LINES])
+            self.assertEqual(st.lines, 4)
+            self.assertEqual(st.decode_errors, 0)
+
+    def test_missing_db_is_not_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'nope.db')
+            with self.assertRaises(TextSourceError):
+                OtzariaDB(p)
+            self.assertFalse(os.path.exists(p))
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class Schema6Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _db(self, **kw):
+        p = os.path.join(self.dir, 'seforim.db')
+        make_schema6_db(p, **kw)
+        return p
+
+    def test_compressed_rows_decode(self):
+        p = self._db()
+        with OtzariaDB(p) as odb:
+            self.assertEqual(odb.layout, 'line_content')
+            self.assertIsNotNone(odb.backend)
+            st = ReadStats()
+            got = {lid: t for lid, _, t in odb.iter_range(1, 5, st)}
+        self.assertEqual(got, {i: t for i, _, t in LINES})
+        self.assertEqual(st.decode_errors, 0)
+
+    def test_text_row_in_compressed_db_passes_through(self):
+        p = self._db(plain_id=3)
+        with OtzariaDB(p) as odb:
+            got = {lid: t for lid, _, t in odb.iter_range(1, 5, ReadStats())}
+        self.assertEqual(got[3], LINES[2][2])
+
+    def test_corrupt_row_is_counted_never_yielded(self):
+        p = self._db(corrupt_id=2)
+        with OtzariaDB(p) as odb:
+            st = ReadStats()
+            got = [lid for lid, _, _ in odb.iter_range(1, 5, st)]
+        self.assertNotIn(2, got)
+        self.assertEqual(st.decode_errors, 1)
+        self.assertEqual(st.error_samples[0][0], '2')
+
+    def test_otzaria_preset_corpus_reads_schema6(self):
+        p = self._db()
+        corpus = make_corpus({'type': 'sqlite', 'path': p, 'table': 'line',
+                              'id_col': 'id', 'text_col': 'content',
+                              'preset': 'otzaria'})
+        rows = []
+        for ch in corpus.chunks(2):
+            rows.extend(corpus.iter_texts_docs(ch))
+        corpus.close()
+        self.assertEqual(sorted((u, d) for u, d, _ in rows),
+                         [('1', '1'), ('2', '1'), ('3', '2'), ('4', '2')])
+        # the one version row with its own reading is excluded, and counted
+        self.assertEqual(corpus.stats.version_lines_skipped, 1)
+
+    def test_hybrid_db_part_reads_only_sefaria_books(self):
+        p = self._db()
+        lib = os.path.join(self.dir, 'lib')
+        os.makedirs(lib)
+        corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': p})
+        units = []
+        for ch in corpus.chunks(1):
+            units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
+        corpus.close()
+        self.assertEqual(sorted(units), ['1', '2'])     # book 1 = Sefaria
+
+    def test_book_scan_loader_reads_schema6(self):
+        p = self._db()
+        b = book_source.load_book('db', '2', db_path=p)
+        self.assertEqual([t for _, _, t in b.lines],
+                         [LINES[2][2], LINES[3][2]])
+        self.assertEqual(b.lines[0][1], 'ref 3')
+
+    def test_book_with_unreadable_row_is_refused(self):
+        p = self._db(corrupt_id=4)
+        with self.assertRaises(book_source.BookNotFound):
+            book_source.load_book('db', '2', db_path=p)
+
+    def test_lexicon_stage_refuses_partial_input(self):
+        p = self._db(corrupt_id=2)
+        out = os.path.join(self.dir, 'out')
+        os.makedirs(out)
+        spec = {'type': 'sqlite', 'path': p, 'table': 'line', 'id_col': 'id',
+                'text_col': 'content', 'preset': 'otzaria'}
+        cfg = Config(workers=1, n_chunks=2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(spec, cfg, out)
+        import json
+        with open(os.path.join(out, 'coverage_lexicon.json'),
+                  encoding='utf-8') as f:
+            cov = json.load(f)
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['decode_errors'], 1)
+        self.assertEqual(cov['lines'], 3)
+
+    def test_lexicon_stage_counts_full_coverage(self):
+        p = self._db()
+        out = os.path.join(self.dir, 'out')
+        os.makedirs(out)
+        spec = {'type': 'sqlite', 'path': p, 'table': 'line', 'id_col': 'id',
+                'text_col': 'content', 'preset': 'otzaria'}
+        core.build_lexicon(spec, Config(workers=1, n_chunks=2), out)
+        import pickle
+        with open(os.path.join(out, core.LEXICON_F), 'rb') as f:
+            lex = pickle.load(f)
+        self.assertEqual(lex.get('שלום'), 1)
+        self.assertEqual(lex.get('והארץ'), 1)        # inline tag dropped
+
+
+class LineSplittingTest(unittest.TestCase):
+    """Full scan, single-book scan and the patcher must number lines alike."""
+
+    TEXT = 'שורה א המשך\r\nשורה ב\rשורה ג\nשורה ד\n'
+
+    def test_split_lines_ignores_unicode_separators(self):
+        self.assertEqual(split_lines(self.TEXT),
+                         ['שורה א המשך', 'שורה ב', 'שורה ג', 'שורה ד'])
+
+    def test_streaming_reader_agrees_across_chunk_boundaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'b.txt')
+            # a CRLF straddling the 1 MiB read boundary
+            body = 'א' * ((1 << 20) - 1) + '\r\nב\n'
+            with open(p, 'w', encoding='utf-8', newline='') as f:
+                f.write(self.TEXT + body)
+            with open(p, encoding='utf-8', newline='') as f:
+                whole = split_lines(f.read())
+            self.assertEqual(list(iter_file_lines(p)), whole)
+
+    def test_book_scan_units_match_full_scan_units(self):
+        with tempfile.TemporaryDirectory() as lib:
+            os.makedirs(os.path.join(lib, 'DictaToOtzaria'))
+            p = os.path.join(lib, 'DictaToOtzaria', 'ספר.txt')
+            with open(p, 'w', encoding='utf-8', newline='') as f:
+                f.write(self.TEXT)
+            corpus = LibraryCorpus({'type': 'library', 'path': lib})
+            full = [(u, t) for ch in corpus.chunks(1)
+                    for u, _, t in corpus.iter_texts_docs(ch)]
+            book = book_source.load_book('library', 'DictaToOtzaria/ספר.txt',
+                                         library_dir=lib)
+            self.assertEqual(full, [(u, t) for u, _, t in book.lines])
+
+    def test_new_library_file_is_found_without_restart(self):
+        with tempfile.TemporaryDirectory() as lib:
+            os.makedirs(os.path.join(lib, 'MoreBooks'))
+            with open(os.path.join(lib, 'MoreBooks', 'א.txt'), 'w',
+                      encoding='utf-8') as f:
+                f.write('שורה\n')
+            self.assertEqual(len(book_source.list_library_books(lib)), 1)
+            with open(os.path.join(lib, 'MoreBooks', 'ב.txt'), 'w',
+                      encoding='utf-8') as f:
+                f.write('שורה\n')
+            self.assertEqual(len(book_source.list_library_books(lib)), 2)
+            b = book_source.load_book('library', 'MoreBooks/ב.txt',
+                                      library_dir=lib)
+            self.assertEqual(len(b), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

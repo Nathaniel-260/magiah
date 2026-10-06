@@ -458,7 +458,7 @@ def verify_context(spec, cfg, ctx_pairs, book_need, progress=None):
             pickle.dump(book_need, f, protocol=4)
         with core._pool(spec, cfg, {'ctx_pairs': ctx_path,
                                     'book_need': need_path}) as pool:
-            for i, (c, lc) in enumerate(
+            for i, (c, lc, _st) in enumerate(
                     pool.imap_unordered(core._ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
