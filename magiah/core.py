@@ -25,7 +25,7 @@ from multiprocessing import Pool
 
 from .config import Config
 from .corpus import make_corpus
-from .textsource import ReadStats
+from .textsource import OtzariaDB, ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
@@ -578,27 +578,31 @@ def _within2(a, b):
 
 def _build_verse_index(db_path):
     """(prev, next) -> {middle: set(bookId)} over all cantillated editions."""
-    con = sqlite3.connect(db_path)
     idx = {}
-    for book_id, content in con.execute(
-            'SELECT l.bookId, l.content FROM line l '
-            'JOIN book b ON b.id = l.bookId '
-            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
-        toks = tokenize(content)
-        for i in range(1, len(toks) - 1):
-            key = (toks[i - 1], toks[i + 1])
-            idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
-    con.close()
+    stats = ReadStats()
+    with OtzariaDB(db_path) as odb:
+        lo, hi = odb.id_range()
+        for _, book_id, content in odb.iter_range(
+                lo, hi + 1, stats,
+                book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
+            toks = tokenize(content)
+            for i in range(1, len(toks) - 1):
+                key = (toks[i - 1], toks[i + 1])
+                idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
+    if stats.decode_errors:
+        raise PartialRead(f'Tanach index: {stats.decode_errors:,} rows '
+                          f'could not be decoded')
     return idx
 
 
 def _tanach_edition_errors(db_path, vidx):
     """Places where one Tanach edition deviates from 3+ agreeing editions."""
     rows = []
-    con = sqlite3.connect(db_path)
-    for uid, content in con.execute(
-            'SELECT l.id, l.content FROM line l JOIN book b ON b.id = l.bookId '
-            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
+    odb = OtzariaDB(db_path)
+    lo, hi = odb.id_range()
+    for uid, _, content in odb.iter_range(
+            lo, hi + 1, ReadStats(),
+            book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
         toks = tokenize(content)
         for i in range(1, len(toks) - 1):
             m = toks[i]
@@ -609,7 +613,7 @@ def _tanach_edition_errors(db_path, vidx):
                 if len(canon) == 1:
                     snip = ' '.join(toks[max(0, i - 6):i + 7])
                     rows.append((str(uid), m, canon[0], snip))
-    con.close()
+    odb.close()
     return rows
 
 
