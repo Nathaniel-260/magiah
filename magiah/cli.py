@@ -161,6 +161,10 @@ def main(argv=None):
                           'a hybrid corpus: repo files + Sefaria books from '
                           f'seforim.db (default dir: {DEFAULT_LIBRARY})')
     ap.add_argument('--out', default='magiah_out', help='output directory')
+    ap.add_argument('--calibrate-from-machine', action='store_true',
+                    help='calibrate: learn from the machine report.db when no '
+                         'human-reviewed findings exist (output labelled '
+                         'machine_unreviewed)')
     ap.add_argument('--top', type=int, default=0,
                     help='report: export only the N highest-ranked rows')
     ap.add_argument('--whitelist', action='append', metavar='FILE',
@@ -200,7 +204,8 @@ def main(argv=None):
         if args.command in ('lexicon', 'all'):
             core.build_lexicon(spec, cfg, out_dir)
         if args.command == 'calibrate':
-            core.calibrate(cfg, out_dir)
+            core.calibrate(cfg, out_dir,
+                           from_machine=args.calibrate_from_machine)
         if args.command == 'review':
             from . import review
             review.serve(out_dir, port=args.port or 8765)
