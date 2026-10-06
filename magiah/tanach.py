@@ -48,7 +48,14 @@ from .normalize import TOKEN_RE, clean
 from .textsource import OtzariaDB, ReadStats
 
 # --- thresholds --------------------------------------------------------------
-MIN_CONTEXT = 4            # aligned context tokens around the word
+MIN_CONTEXT = 5            # aligned context tokens around the word
+# A context token is *distinctive* when its skeleton has 3+ letters and occurs
+# fewer than COMMON_FREQ times in the Tanach stream (~top 1% of types, which
+# covers particles, divine names and narrative formulae). Rabbinic prose
+# strings such words together constantly, so a run of them can sit on one
+# verse by chance; MIN_DISTINCT distinctive words pin the verse down.
+COMMON_FREQ = 200
+MIN_DISTINCT = 2
 AMBIGUITY_MARGIN = 2       # the best verse must beat the runner-up by this
 MIN_INDEPENDENT = 2        # independent sources that must agree on a reading
 REF_SHARE = 0.9            # share of a book's referenced lines that must parse
@@ -56,9 +63,11 @@ VERSION_LINE_RATIO = 0.6   # token similarity of a version line to the primary
 VERSION_ACCEPT_SHARE = 0.9  # share of a version's lines that must track it
 
 # --- evidence kinds ----------------------------------------------------------
-VARIANT = 'tanach_verse_variant'     # verse reads differently: alternative
+VARIANT = 'tanach_verse_variant'     # verse reading == detector suggestion
+DISAGREES = 'tanach_disagrees'       # verse reading != detector suggestion
 MATCH = 'tanach_verse_match'         # word is the verse's reading
 EDITION_VARIANT = 'tanach_edition_variant'
+EDITION_UNRESOLVED = 'tanach_edition_unresolved'   # informational only
 PLENE = 'tanach_plene'               # differs only in ו/י (male/haser)
 QERE_KETIV = 'tanach_qere_ketiv'
 SINGLE_SOURCE = 'tanach_single_source'
@@ -70,7 +79,9 @@ LEGACY = 'tanach_legacy'             # produced by the pre-verse heuristic
 # values of the report's `tanach` column
 TANACH_NONE = 0
 TANACH_LEGACY = 2      # old (prev, next)-trigram mechanism: re-check required
-TANACH_VERIFIED = 3    # aligned verse + >= MIN_INDEPENDENT sources disagree
+TANACH_VERIFIED = 3    # verse reading (>= 2 sources) == detector suggestion
+TANACH_DISAGREES = 4   # verse reading != detector suggestion: no bonus,
+                       # both kept as alternatives for a human to decide
 
 ROOT_TITLES = {'תנ"ך', 'תנך'}
 SECTION_TITLES = {'תורה', 'נביאים', 'כתובים'}
@@ -87,7 +98,8 @@ _WORK_ALIASES = {'תהלים': 'תהילים', 'ישעיה': 'ישעיהו', 'י
 EVIDENCE_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS tanach_evidence(
   word TEXT, unit TEXT, doc TEXT, snippet TEXT,
-  evidence_kind TEXT, ref TEXT, alternatives TEXT, evidence TEXT,
+  evidence_kind TEXT, ref TEXT, reading TEXT, alternatives TEXT,
+  evidence TEXT,
   PRIMARY KEY(word, unit, snippet))'''
 
 
@@ -120,9 +132,17 @@ def skeleton(tok):
 
 
 def plene_equal(a, b):
-    """True when `a` and `b` differ only by ו/י (male/haser spelling)."""
-    return a != b and a.replace('ו', '').replace('י', '') == \
-        b.replace('ו', '').replace('י', '')
+    """True when `a` and `b` differ by ONE inserted ו or י that is not the
+    first letter (male/haser). A substitution, a transposition or a leading
+    ו/י (conjunction, verb prefix) is a different word, not a spelling."""
+    if len(a) == len(b) + 1:
+        longer, shorter = a, b
+    elif len(b) == len(a) + 1:
+        longer, shorter = b, a
+    else:
+        return False
+    return any(longer[i] in 'וי' and longer[:i] + longer[i + 1:] == shorter
+               for i in range(1, len(longer)))
 
 
 def within2(a, b):
@@ -339,16 +359,25 @@ class Verse:
 
 
 class Evidence:
-    __slots__ = ('kind', 'verse', 'pos', 'reading', 'groups', 'editions')
+    __slots__ = ('kind', 'verse', 'pos', 'reading', 'groups', 'editions',
+                 'aligned')
 
     def __init__(self, kind, verse=None, pos=None, reading='', groups=(),
-                 editions=()):
+                 editions=(), aligned=0):
         self.kind, self.verse, self.pos = kind, verse, pos
         self.reading, self.groups, self.editions = reading, groups, editions
+        self.aligned = aligned
 
-    @property
-    def tanach_code(self):
-        return TANACH_VERIFIED if self.kind == VARIANT else TANACH_NONE
+    def decide(self, detector_suggestion):
+        """``(tanach code, evidence kind)`` given the detector's suggestion.
+
+        The rank bonus needs both signals to name the same correction; when
+        the verse reads otherwise, the row is marked for a human decision."""
+        if self.kind != VARIANT:
+            return TANACH_NONE, self.kind
+        if detector_suggestion == self.reading:
+            return TANACH_VERIFIED, VARIANT
+        return TANACH_DISAGREES, DISAGREES
 
     def to_dict(self, index):
         d = {'evidence_kind': self.kind}
@@ -357,6 +386,8 @@ class Evidence:
             d['verse_line'] = self.verse.line_id
         if self.reading:
             d['reading'] = self.reading
+        if self.aligned:
+            d['aligned_tokens'] = self.aligned
         # three different counts — never conflate them
         d['occurrences'] = len(self.editions)          # agreeing editions
         d['works'] = 1 if self.verse is not None else 0
@@ -522,6 +553,7 @@ class TanachIndex:
     def _finalize(self, ed_tokens, kq_alts):
         """Per verse: align every edition to the primary tokens, fold the
         editions of one provenance group into a single reading."""
+        self.intra = []              # (verse idx, pos, group, {reading: eids})
         for vi, verse in enumerate(self.verses):
             prim_sk = [skeleton(t) for t in verse.toks]
             kq = set(verse.kq)
@@ -543,7 +575,14 @@ class TanachIndex:
                 folded = []
                 for i in range(len(verse.toks)):
                     vals = {a[i] for _, a in members if a[i] is not None}
-                    # a source that disagrees with itself casts no vote
+                    # a source that disagrees with itself casts no vote, but
+                    # the disagreement is kept for the edition report
+                    if len(vals) > 1:
+                        by = defaultdict(list)
+                        for e, a in members:
+                            if a[i] is not None:
+                                by[a[i]].append(e)
+                        self.intra.append((vi, i, g, dict(by)))
                     folded.append(vals.pop() if len(vals) == 1 else None)
                 verse.readings[g] = tuple(folded)
                 verse.members[g] = tuple(e for e, _ in members)
@@ -561,6 +600,7 @@ class TanachIndex:
                     self.kq_alt[s] = alt[i]
         self._push_break()
         sk = self.sk
+        self.freq = Counter(x for x in sk if x is not None)
         for s in range(len(sk) - 1):
             if sk[s] is not None and sk[s + 1] is not None:
                 self.anchors[(sk[s], sk[s + 1])].append(s)
@@ -614,9 +654,20 @@ class TanachIndex:
             while c + 1 + right <= hi and s + 1 + right < n and \
                     self._match(qsk[c + 1 + right], s + 1 + right):
                 right += 1
-            if left >= 1 and right >= 1 and left + right >= MIN_CONTEXT:
+            if left >= 1 and right >= 1 and left + right >= MIN_CONTEXT \
+                    and self._distinct(s - left, s + right) >= MIN_DISTINCT:
                 out.append((s, left + right))
         return out
+
+    def _distinct(self, a, b):
+        """Distinctive context words in stream[a..b], the word excluded."""
+        n = 0
+        for s in range(a, b + 1):
+            x = self.sk[s]
+            if x is not None and len(x) >= 3 and \
+                    self.freq.get(x, 0) < COMMON_FREQ:
+                n += 1
+        return n
 
     def evidence(self, word, prev, nxt, snippet):
         """Evidence for one occurrence, or None when no verse aligns."""
@@ -642,6 +693,11 @@ class TanachIndex:
         if len(ranked) > 1 and ranked[0] - ranked[1] < AMBIGUITY_MARGIN:
             return Evidence(AMBIGUOUS)
         s = max(found, key=found.get)
+        ev = self._judge(word, s)
+        ev.aligned = found[s]
+        return ev
+
+    def _judge(self, word, s):
         verse, pos = self.verses[self.loc_v[s]], self.loc_p[s]
         if pos in verse.kq:
             return Evidence(QERE_KETIV, verse, pos)
@@ -685,15 +741,38 @@ class TanachIndex:
 
     # -- edition disagreements -------------------------------------------------
     def edition_errors(self):
-        """``(rows, stats)``: a minority reading of one independent source
-        against >= MIN_INDEPENDENT agreeing independent sources.
+        """``(rows, stats)`` for the edition report.
+
+        * ``tanach_edition_variant`` — one independent source against >=
+          MIN_INDEPENDENT agreeing independent sources (needs >= 3 sources in
+          all, so with two sources there are none);
+        * ``tanach_edition_unresolved`` — every other disagreement, labelled
+          with a `reason` (one_against_one, no_majority, intra_source, plene,
+          qere_ketiv, unrelated). Informational: nobody is outvoted.
 
         Rows: (unit, word, canonical, snippet, evidence_json)."""
         rows = []
         st = Counter()
+
+        def snippet_of(verse, g):
+            return ' '.join(t if t is not None else '_'
+                            for t in verse.readings[g])
+
+        def unresolved(verse, pos, word, reason, readings, extra=None):
+            st[reason] += 1
+            d = {'evidence_kind': EDITION_UNRESOLVED, 'reason': reason,
+                 'ref': verse.ref, 'verse_line': verse.line_id,
+                 'readings': readings}
+            d.update(extra or {})
+            rows.append((str(verse.line_id), word, '',
+                         ' '.join(verse.toks),
+                         json.dumps(d, ensure_ascii=False)))
+
+        def labels(verse, by):
+            return {t: {g: [self.edition_label(e) for e in verse.members[g]]
+                        for g in gs} for t, gs in by.items()}
+
         for verse in self.verses:
-            if len(verse.readings) < 2:
-                continue
             for pos in range(len(verse.toks)):
                 by = defaultdict(list)
                 for g, toks in verse.readings.items():
@@ -702,23 +781,30 @@ class TanachIndex:
                 if len(by) < 2:
                     continue
                 st['disagreements'] += 1
-                if pos in verse.kq:
-                    st['qere_ketiv'] += 1
-                    continue
                 ranked = sorted(by.items(), key=lambda kv: -len(kv[1]))
                 maj, maj_g = ranked[0]
+                prim = verse.toks[pos]
+                other = next((t for t, _ in ranked if t != prim), ranked[1][0])
+                if pos in verse.kq:
+                    unresolved(verse, pos, other, 'qere_ketiv',
+                               labels(verse, by))
+                    continue
                 if len(maj_g) < MIN_INDEPENDENT or \
                         len(ranked[1][1]) == len(maj_g):
-                    st['unresolved'] += 1
+                    reason = 'one_against_one' if len(by) == 2 and \
+                        all(len(v) == 1 for v in by.values()) \
+                        else 'no_majority'
                     if any(plene_equal(maj, m) for m, _ in ranked[1:]):
                         st['unresolved_plene'] += 1
+                    unresolved(verse, pos, other, reason, labels(verse, by))
                     continue
                 for m, mg in ranked[1:]:
                     if plene_equal(m, maj):
-                        st['plene'] += 1
+                        unresolved(verse, pos, m, 'plene', labels(verse, by))
                         continue
                     if not within2(m, maj):
-                        st['unrelated'] += 1
+                        unresolved(verse, pos, m, 'unrelated',
+                                   labels(verse, by))
                         continue
                     for g in mg:
                         st['reported'] += 1
@@ -730,10 +816,16 @@ class TanachIndex:
                         d['minority_source'] = g
                         d['minority_editions'] = [
                             self.edition_label(e) for e in verse.members[g]]
-                        snip = ' '.join(t if t is not None else '_'
-                                        for t in verse.readings[g])
-                        rows.append((str(verse.line_id), m, maj, snip,
+                        rows.append((str(verse.line_id), m, maj,
+                                     snippet_of(verse, g),
                                      json.dumps(d, ensure_ascii=False)))
+        for vi, pos, g, by in self.intra:
+            verse = self.verses[vi]
+            prim = verse.toks[pos]
+            word = next((t for t in by if t != prim), next(iter(by)))
+            unresolved(verse, pos, word, 'intra_source',
+                       {t: [self.edition_label(e) for e in eids]
+                        for t, eids in by.items()}, {'source': g})
         return rows, dict(st)
 
 
@@ -750,16 +842,19 @@ def evidence_row(index, ev, word, unit, doc, snippet, detector):
 
     The detector's suggestion is never replaced: a Tanach reading is stored
     next to it as an alternative, each with its own evidence."""
+    errtype, sugg = detector
+    _, kind = ev.decide(sugg)
     d = ev.to_dict(index)
+    d['evidence_kind'] = kind
     alts = None
-    if ev.kind == VARIANT:
-        errtype, sugg = detector
+    if kind in (VARIANT, DISAGREES):
         alts = [{'suggestion': sugg or '', 'by': 'detector',
                  'errtype': errtype},
                 {'suggestion': ev.reading, 'by': 'tanach', **d}]
         if sugg == ev.reading:
             alts[0]['agrees_with_tanach'] = True
-    return (word, unit, doc, snippet, ev.kind, d.get('ref', ''),
+    return (word, unit, doc, snippet, kind, d.get('ref', ''),
+            ev.reading if alts else None,
             json.dumps(alts, ensure_ascii=False) if alts else None,
             json.dumps(d, ensure_ascii=False))
 
@@ -767,11 +862,13 @@ def evidence_row(index, ev, word, unit, doc, snippet, detector):
 def write_evidence(con, rows):
     con.execute(EVIDENCE_SCHEMA)
     con.executemany('INSERT OR IGNORE INTO tanach_evidence '
-                    'VALUES(?,?,?,?,?,?,?,?)', rows)
+                    'VALUES(?,?,?,?,?,?,?,?,?)', rows)
 
 
 # enrich(): what occurrences_full takes from tanach_evidence. The suggestion
 # column is always the detector's; the Tanach reading lives in `alternatives`.
-ENRICH_COLS = 'te.evidence_kind AS evidence_kind, te.alternatives AS alternatives'
+ENRICH_COLS = ('te.evidence_kind AS evidence_kind, '
+               'te.alternatives AS alternatives, '
+               'te.reading AS tanach_reading')
 ENRICH_JOIN = ('LEFT JOIN tanach_evidence te ON te.word = o.word '
                'AND te.unit = o.unit AND te.snippet = o.snippet')

@@ -33,6 +33,7 @@ VERSES = {
     'ה': 'אמר המורה לתלמידים שבו בשקט וכתבו לאט את התשובה הנכונה',
     'ו': 'הנער שתה מים קרים מן הבאר העמוקה בערב חם',
     'ז': 'הדוד בנה בית חדש ליד הנהר הרחב בשנה שעברה',
+    'ח': 'הסבתא אפתה עוגה מתוקה לכל הנכדים בליל שבת שמח',
 }
 # a second, independent source (two renderings of it = one source)
 SECOND = {
@@ -40,8 +41,11 @@ SECOND = {
     'ב': VERSES['ב'],
     'ג': 'האיש קנה מחברתה [מחברתו] בשוק העיר הקטנה ביום שני בבוקר',
     'ד': VERSES['ד'],
-    'ה': VERSES['ה'],
+    'ה': VERSES['ה'].replace('לאט', 'לאת'),     # one source against one
+    'ח': VERSES['ח'],
 }
+# the same source rendered again, disagreeing with itself in verse ד
+SECOND_PLAIN = dict(SECOND, ד=VERSES['ד'].replace('הנכונה', 'הנכונח'))
 # a third independent source: one real deviation, one plene spelling, and the
 # ketiv written plainly in the qere/ketiv slot
 THIRD = {
@@ -64,6 +68,7 @@ QUOTES = {
          'וזה נכון',
     'a': 'וכך כתוב הנער שתה מים קדים מן הבאר העמוקה בערב חם וזה נכון',
     'b': 'וכך כתוב הדוד בנה בית חדס ליד הנהר הרחב בשנה שעברה וזה נכון',
+    'h': 'וכך כתוב הסבתא אפתה עוגח מתוקה לכל הנכדים בליל שבת שמח וזה נכון',
 }
 # word -> (errtype, detector suggestion)
 FLAGGED = {
@@ -73,6 +78,7 @@ FLAGGED = {
     'מהד': ('edit1_sub', 'מהר'),
     'קדים': ('edit1_sub', 'כדים'),
     'חדס': ('edit1_sub', 'חדש'),
+    'עוגח': ('edit1_sub', 'עוגה'),
 }
 
 
@@ -128,7 +134,8 @@ def make_bible_db(path, third_source=False):
 
     versions = [(1, 'Primary', 'https://one.example/masorah', {}),
                 (2, 'Second', 'https://two.example/a.xml', SECOND),
-                (3, 'Second plain', 'https://two.example/a.xml', SECOND)]
+                (3, 'Second plain', 'https://two.example/a.xml',
+                 SECOND_PLAIN)]
     if third_source:
         versions.append((4, 'Third', 'https://three.example/t', THIRD))
     for vid, title, src, texts in versions:
@@ -194,7 +201,16 @@ class LocateTest(_DBCase):
             'SELECT * FROM tanach_matches_full')]
         cls.rank = {r[0]: r[1] for r in con.execute(
             f'SELECT word, {core.RANK_SQL} FROM occurrences_full')}
+        cls.boost = {r[0]: r[1] for r in con.execute(
+            f'SELECT word, ({core.RANK_SQL}) - ('
+            + core.RANK_SQL.replace('tanach', '0') +
+            ') FROM occurrences_full')}
         con.close()
+        core.report(Config(), out)
+        import csv
+        with open(os.path.join(out, 'errors_edit1_sub.csv'),
+                  encoding='utf-8-sig', newline='') as f:
+            cls.csv_rows = {r['word']: r for r in csv.DictReader(f)}
 
     @classmethod
     def tearDownClass(cls):
@@ -228,8 +244,12 @@ class LocateTest(_DBCase):
     def test_c_detector_suggestion_kept_and_tanach_reading_is_alternative(self):
         r = self._row('פרץ')
         self.assertEqual(r['suggestion'], 'פרס')       # the detector's
-        self.assertEqual(r['tanach'], 3)
-        self.assertEqual(r['evidence_kind'], 'tanach_verse_variant')
+        # the verse reads differently from the detector: a human decides,
+        # and the disagreement earns no rank bonus
+        self.assertEqual(r['tanach'], 4)
+        self.assertEqual(r['evidence_kind'], 'tanach_disagrees')
+        self.assertEqual(r['tanach_reading'], 'פרח')
+        self.assertEqual(self.boost['פרץ'], 0)
         alts = json.loads(r['alternatives'])
         self.assertEqual([a['suggestion'] for a in alts], ['פרס', 'פרח'])
         self.assertEqual(alts[0]['by'], 'detector')
@@ -239,6 +259,21 @@ class LocateTest(_DBCase):
         self.assertEqual(tan['independent_sources'], 2)
         self.assertEqual(tan['works'], 1)
         self.assertEqual(tan['occurrences'], 3)        # primary + 2 versions
+        self.assertGreaterEqual(tan['aligned_tokens'], 5)
+
+    def test_h_bonus_only_when_verse_and_detector_agree(self):
+        r = self._row('עוגח')
+        self.assertEqual(r['suggestion'], 'עוגה')
+        self.assertEqual(r['tanach'], 3)
+        self.assertEqual(r['evidence_kind'], 'tanach_verse_variant')
+        self.assertEqual(self.boost['עוגח'], 4.0)
+        alts = json.loads(r['alternatives'])
+        self.assertTrue(alts[0]['agrees_with_tanach'])
+
+    def test_csv_reports_carry_the_tanach_reading(self):
+        self.assertEqual(self.csv_rows['פרץ']['suggestion'], 'פרס')
+        self.assertEqual(self.csv_rows['פרץ']['tanach_reading'], 'פרח')
+        self.assertEqual(self.csv_rows['חדס']['tanach_reading'], '')
 
     def test_d_plene_difference_is_not_an_error(self):
         r = self._row('הירק')
@@ -259,9 +294,10 @@ class LocateTest(_DBCase):
         self.assertEqual(r['evidence_kind'], 'tanach_ambiguous')
 
     def test_g_no_rank_bonus_without_verified_evidence(self):
-        for w in ('קדים', 'חדס', 'הירק', 'מחברתה', 'מהד'):
+        for w in ('קדים', 'חדס', 'הירק', 'מחברתה', 'מהד', 'פרץ'):
             r = self._row(w)
             self.assertNotEqual(r['tanach'], 2, w)
+            self.assertEqual(self.boost[w], 0, w)
         self.assertEqual(self.matches, [])
 
 
@@ -288,7 +324,7 @@ class IndexTest(_DBCase):
     def test_independent_sources_not_editions(self):
         c = self.idx.counts()
         self.assertEqual(c['works'], 1)
-        self.assertEqual(c['verses'], 7)
+        self.assertEqual(c['verses'], 8)
         self.assertEqual(c['editions'], 5)             # b1, b4, v2, v3, v4
         self.assertEqual(c['independent_sources'], 3)  # one, two, three
         groups = {e['group'] for e in self.idx.editions.values()
@@ -304,14 +340,56 @@ class IndexTest(_DBCase):
 
     def test_edition_error_needs_two_independent_agreeing_sources(self):
         rows, st = self.idx.edition_errors()
-        self.assertEqual([(r[1], r[2]) for r in rows], [('אדוס', 'אדום')])
-        ev = json.loads(rows[0][4])
-        self.assertEqual(ev['evidence_kind'], 'tanach_edition_variant')
+        errs = [r for r in rows
+                if json.loads(r[4])['evidence_kind'] == 'tanach_edition_variant']
+        self.assertEqual([(r[1], r[2]) for r in errs], [('אדוס', 'אדום')])
+        ev = json.loads(errs[0][4])
         self.assertEqual(ev['independent_sources'], 2)
         self.assertEqual(ev['minority_source'], 'host:three.example')
-        # the plene spelling and the qere/ketiv slot are counted, not reported
+        # the plene spelling and the qere/ketiv slot are labelled, not errors
         self.assertEqual(st['plene'], 1)
         self.assertEqual(st['qere_ketiv'], 1)
+        reasons = sorted(json.loads(r[4])['reason'] for r in rows
+                         if r not in errs)
+        self.assertEqual(reasons, ['intra_source', 'one_against_one',
+                                   'plene', 'qere_ketiv'])
+
+    def test_unresolved_disagreements_are_reported_not_dropped(self):
+        rows, _ = self.idx.edition_errors()
+        by = {json.loads(r[4])['reason']: r for r in rows
+              if json.loads(r[4])['evidence_kind']
+              == 'tanach_edition_unresolved'}
+        one = json.loads(by['one_against_one'][4])
+        self.assertEqual(sorted(one['readings']), ['לאט', 'לאת'])
+        self.assertEqual(by['one_against_one'][2], '')    # no canonical
+        intra = json.loads(by['intra_source'][4])
+        self.assertEqual(intra['source'], 'host:two.example')
+        self.assertEqual(sorted(intra['readings']), ['הנכונה', 'הנכונח'])
+
+    def test_four_aligned_tokens_are_not_enough(self):
+        self.assertIsNone(self.idx.evidence(
+            'פרץ', 'שם', 'אדום', 'משהו אחר שם פרץ אדום יפה מאד ועוד דבר'))
+
+    def test_common_words_only_context_does_not_align(self):
+        ok = self.idx.evidence('פרץ', 'שם', 'אדום', QUOTES['c'])
+        self.assertIsNotNone(ok)
+        old = self.t.COMMON_FREQ
+        self.t.COMMON_FREQ = 1          # every context word is now "common"
+        try:
+            self.assertIsNone(self.idx.evidence('פרץ', 'שם', 'אדום',
+                                                QUOTES['c']))
+        finally:
+            self.t.COMMON_FREQ = old
+
+    def test_plene_is_one_inner_vav_or_yod(self):
+        pe = self.t.plene_equal
+        self.assertTrue(pe('הירוק', 'הירק'))
+        self.assertTrue(pe('שמים', 'שמם'))
+        self.assertFalse(pe('שומר', 'שימר'))       # substitution
+        self.assertFalse(pe('ויאמר', 'יאמר'))      # leading conjunction
+        self.assertFalse(pe('יאמר', 'אמר'))        # leading prefix
+        self.assertFalse(pe('אמרו', 'אמור'))       # transposition
+        self.assertFalse(pe('הירוק', 'הירוק'))
 
     def test_partial_quote_is_not_evidence(self):
         # only two context tokens match the verse
@@ -350,6 +428,10 @@ def make_legacy_report(path):
         ('פרץ', 'edit1_sub', 'פרח', 2.0, 0, 0, 0, 2, 'ספר', 'ר', '7', 's',
          'Dicta', '3'),
         ('בייתה', 'edit1_sub', 'ביתה', 2.0, 0, 0, 0, 0, 'ספר', 'ר', '8', 's',
+         'Dicta', '3'),
+        ('קפץ', 'edit1_sub', 'קפה', 2.0, 0, 0, 0, 2, 'ספר', 'ר', '10', 's',
+         'Dicta', '3'),
+        ('גשמ', 'edit1_sub', 'גשם', 2.0, 0, 0, 0, 2, 'ספר', 'ר', '11', 's',
          'Dicta', '3')])
     con.execute('INSERT INTO tanach_errors_full VALUES(?,?,?,?,?,?,?)',
                 ('אדוס', 'אדום', 'ספר', 'ר', '9', 's', 'Sefaria'))
@@ -383,12 +465,15 @@ class LegacyTest(unittest.TestCase):
         for fid, fam, et, w, unit, tan in (
                 (1, 'error', 'edit1_sub', 'פרץ', '7', 2),
                 (2, 'error', 'edit1_sub', 'בייתה', '8', 0),
-                (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None)):
+                (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None),
+                (4, 'error', 'edit1_sub', 'קפץ', '10', 2),
+                (5, 'error', 'edit1_sub', 'גשמ', '11', 2)):
             con.execute('INSERT INTO findings(id, family, errtype, word, '
                         'unit, ref, tanach) VALUES(?,?,?,?,?,?,?)',
                         (fid, fam, et, w, unit, 'ר', tan))
+            status = {4: 'not_error', 5: 'ignored'}.get(fid, 'approved')
             con.execute('INSERT INTO review VALUES(?,?,?,?,?)',
-                        (fid, 'approved', None, None, now))
+                        (fid, status, None, None, now))
         con.commit()
         con.close()
 
@@ -409,6 +494,13 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(json.loads(ed['extra'])['evidence_kind'],
                          'tanach_legacy')
         self.assertIsNone(ed['status'])
+        # decisions about the word itself do not depend on the verse reading
+        self.assertEqual(rows['קפץ']['status'], 'not_error')
+        self.assertEqual(rows['גשמ']['status'], 'ignored')
+        dropped = con.execute(
+            "SELECT COUNT(*) FROM history WHERE action = 'legacy_recheck'"
+            ).fetchone()[0]
+        self.assertEqual(dropped, 2)
 
         # a decision taken AFTER the re-check mark survives a refresh
         con.execute("INSERT INTO review VALUES(?, 'not_error', NULL, NULL, ?)",
@@ -422,6 +514,38 @@ class LegacyTest(unittest.TestCase):
             "ON r.finding_id = f.id WHERE f.word = 'פרץ'").fetchone()
         con.close()
         self.assertEqual(st[0], 'not_error')
+
+
+class EditionRankTest(unittest.TestCase):
+    def test_only_resolved_edition_variants_rank(self):
+        from magiah.webui import db as uidb
+        d = tempfile.mkdtemp(prefix='magiah_tanach_ed_')
+        try:
+            path = os.path.join(d, 'report.db')
+            make_legacy_report(path)
+            con = sqlite3.connect(path)
+            con.executescript('''
+                DROP TABLE tanach_errors_full;
+                CREATE TABLE tanach_errors_full(word, canonical, source, ref,
+                                                unit, snippet, origin,
+                                                evidence);''')
+            con.executemany(
+                'INSERT INTO tanach_errors_full VALUES(?,?,?,?,?,?,?,?)', [
+                    ('אדוס', 'אדום', 'ס', 'ר', '9', 's', 'Sefaria', json.dumps(
+                        {'evidence_kind': 'tanach_edition_variant'})),
+                    ('לאת', '', 'ס', 'ר', '12', 's', 'Sefaria', json.dumps(
+                        {'evidence_kind': 'tanach_edition_unresolved',
+                         'reason': 'one_against_one'}))])
+            con.commit()
+            con.close()
+            uidb.import_all(d)
+            con = uidb.connect(d)
+            rank = dict(con.execute(
+                "SELECT word, rank FROM findings WHERE family='tanach_error'"))
+            con.close()
+            self.assertEqual(rank, {'אדוס': 4.0, 'לאת': 0.0})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == '__main__':

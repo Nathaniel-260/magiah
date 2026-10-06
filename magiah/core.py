@@ -597,9 +597,11 @@ def _tanach_check(db_path, all_occ, flagged):
         if key not in cache:
             cache[key] = vidx.evidence(w, prev, nxt, snip)
         ev = cache[key]
+        code = tanach.TANACH_NONE
         if ev is not None:
-            kinds[ev.kind] += 1
             fr = flagged.get(w)
+            code, kind = ev.decide(fr[2] if fr else '')
+            kinds[kind] += 1
             evidence_rows.append(tanach.evidence_row(
                 vidx, ev, w, uid, doc, snip,
                 (fr[1], fr[2]) if fr else ('', '')))
@@ -607,8 +609,7 @@ def _tanach_check(db_path, all_occ, flagged):
                 matches.append((w, uid, doc, snip, evidence_rows[-1][-1]))
                 continue
         kept.append(oc)
-        tan_info.append((ev.tanach_code, ev.reading) if ev is not None
-                        and ev.kind == tanach.VARIANT else (0, ''))
+        tan_info.append((code, ev.reading if code else ''))
     print(f'[tanach] aligned occurrences by kind: {dict(kinds)}', flush=True)
     edition_rows = _tanach_edition_errors(db_path, vidx)
     return kept, tan_info, matches, edition_rows, evidence_rows
@@ -896,8 +897,9 @@ def locate(spec, cfg, out_dir):
 # * book_repeat — all occurrences of the word sit in one book (idiosyncratic
 #                 spelling, not a typo) — strong demotion
 # plus the Tanach signal: tanach = 3 (an aligned verse whose reading, backed
-# by >= 2 independent sources, differs from the word). tanach = 2 marks rows
-# of the old trigram heuristic: they must be re-checked and earn nothing.
+# by >= 2 independent sources, differs from the word AND equals the detector's
+# suggestion). tanach = 4 (the verse reads otherwise than the detector) and
+# tanach = 2 (rows of the old trigram heuristic) earn nothing.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
                   CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
@@ -927,10 +929,15 @@ def _write_reports(con, dest_dir, extra_where, params, top):
     limit = f'LIMIT {top}' if top else ''
     types = [r[0] for r in con.execute(
         'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
-    cols = ('word, suggestion, ROUND({rank}, 2), ctx_hits, sugg_local, '
-            'source, ref, unit, snippet').format(rank=RANK_SQL)
-    header = ['word', 'suggestion', 'rank', 'ctx_hits', 'sugg_local',
-              'source', 'ref', 'unit', 'snippet']
+    # the Tanach reading sits next to the detector's suggestion, never in it
+    have = {r[1] for r in con.execute('PRAGMA table_info(occurrences_full)')}
+    tan_col = ("COALESCE(tanach_reading, '')" if 'tanach_reading' in have
+               else "''")
+    cols = ('word, suggestion, {tan}, ROUND({rank}, 2), ctx_hits, '
+            'sugg_local, source, ref, unit, snippet').format(
+                rank=RANK_SQL, tan=tan_col)
+    header = ['word', 'suggestion', 'tanach_reading', 'rank', 'ctx_hits',
+              'sugg_local', 'source', 'ref', 'unit', 'snippet']
     for t in types:
         variants = [(f'errors_{t}.csv', f'errtype = ?{extra_where}')]
         if t.startswith('edit1'):
@@ -965,6 +972,9 @@ def _write_reports(con, dest_dir, extra_where, params, top):
             con.execute(f'SELECT 1 FROM {tbl} LIMIT 1')
         except sqlite3.OperationalError:
             continue
+        if 'evidence' in {r[1] for r in con.execute(
+                f'PRAGMA table_info({tbl})')}:
+            sel, hdr = sel + ', evidence', hdr + ['evidence']
         path = os.path.join(dest_dir, fname)
         out = _open_report(path)
         if out is None:
