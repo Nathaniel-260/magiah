@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 
+from . import tanach
 from .corpus import OTZARIA_DB
 from .textsource import OtzariaDB, ReadStats, connect_ro, iter_file_lines
 
@@ -331,18 +332,18 @@ def _meta_enrich(con, meta):
                 'unit TEXT PRIMARY KEY, source TEXT, ref TEXT, origin TEXT)')
     con.executemany('INSERT OR REPLACE INTO unit_meta VALUES(?,?,?,?)',
                     [(u, s, r, o) for u, (s, r, o) in meta.items()])
+    con.execute(tanach.EVIDENCE_SCHEMA)
     con.executescript(f'''
         CREATE TABLE occurrences_full AS
-          SELECT o.word, e.errtype,
-                 CASE WHEN o.tanach_sugg != '' THEN o.tanach_sugg
-                      ELSE e.suggestion END AS suggestion,
+          SELECT o.word, e.errtype, e.suggestion,
                  e.score, o.ctx_hits, o.sugg_local, o.book_repeat, o.tanach,
                  COALESCE(m.source, o.doc) AS source,
                  COALESCE(m.ref, '') AS ref, o.unit, o.snippet,
                  COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin,
-                 o.doc AS doc
+                 o.doc AS doc, {tanach.ENRICH_COLS}
           FROM occurrences o
           JOIN errors e ON e.word = o.word
+          {tanach.ENRICH_JOIN}
           LEFT JOIN unit_meta m ON m.unit = o.unit;
         CREATE TABLE space_errors_full AS
           SELECT s.part1, s.part2, s.joined, s.join_freq,
@@ -353,12 +354,12 @@ def _meta_enrich(con, meta):
         CREATE TABLE tanach_matches_full AS
           SELECT t.word, COALESCE(m.source, t.doc) AS source,
                  COALESCE(m.ref, '') AS ref, t.unit, t.snippet,
-                 COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin
+                 COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin, t.evidence
           FROM tanach_matches t LEFT JOIN unit_meta m ON m.unit = t.unit;
         CREATE TABLE tanach_errors_full AS
           SELECT t.word, t.canonical, COALESCE(m.source, '') AS source,
                  COALESCE(m.ref, '') AS ref, t.unit, t.snippet,
-                 COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin
+                 COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin, t.evidence
           FROM tanach_errors t LEFT JOIN unit_meta m ON m.unit = t.unit;
         DROP TABLE occurrences;
         DROP TABLE space_errors;
