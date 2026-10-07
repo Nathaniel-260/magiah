@@ -304,6 +304,131 @@ def _coverage(out, stage):
 
 
 @unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class PartialOutputTest(unittest.TestCase):
+    """A stage that could not read its whole input must not replace its last
+    good output, and nothing downstream may consume output whose latest
+    build was partial."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+        self.out = os.path.join(self.tmp.name, 'out')
+        os.makedirs(self.out)
+        self.spec = _otzaria_spec(self.db)
+        self.cfg = Config(workers=1, n_chunks=2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_partial_lexicon_keeps_old_one_and_is_refused(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        lex_path = os.path.join(self.out, core.LEXICON_F)
+        good = _read(lex_path)
+        self.assertTrue(_coverage(self.out, 'lexicon')['complete'])
+        self.assertIsNotNone(book_scan.load_lexicon(self.out))
+
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        self.assertEqual(_read(lex_path), good)          # not replaced
+        self.assertFalse(os.path.exists(lex_path + '.tmp'))
+        self.assertFalse(_coverage(self.out, 'lexicon')['complete'])
+        # the stale lexicon is refused by every consumer
+        with self.assertRaises(book_scan.BookScanError) as cm:
+            book_scan.load_lexicon(self.out)
+        self.assertIn('מילון', str(cm.exception))
+        with self.assertRaises(core.PartialRead):
+            core.detect(self.spec, self.cfg, self.out)
+        with self.assertRaises(book_scan.BookScanError):
+            book_scan.scan_book(self.out, 'db', '2', db_path=self.db)
+
+    def test_first_partial_lexicon_writes_no_lexicon(self):
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, core.LEXICON_F)))
+
+    def test_partial_locate_keeps_old_report_and_is_refused(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        rep = os.path.join(self.out, core.REPORT_DB_F)
+        good = _read(rep)
+        core.report(self.cfg, self.out)                  # complete: accepted
+
+        _corrupt_row(self.db, 3)
+        with self.assertRaises(core.PartialRead):
+            core.locate(self.spec, self.cfg, self.out)
+        self.assertEqual(_read(rep), good)               # not replaced
+        self.assertFalse(os.path.exists(rep + '.tmp'))
+        cov = _coverage(self.out, 'locate')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['unread'], 1)
+        with self.assertRaises(core.PartialRead) as cm:
+            core.report(self.cfg, self.out)
+        self.assertIn('מיקום', str(cm.exception))
+        # calibrate only learns from the last complete report, and must not
+        # block the rescan that repairs it
+        core.calibrate(self.cfg, self.out)
+
+    def test_failed_lexicon_also_blocks_the_older_report(self):
+        # report.db is derived from the lexicon: once the latest lexicon
+        # build is partial, the report from an earlier run is refused too
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        with self.assertRaises(core.PartialRead) as cm:
+            core.report(self.cfg, self.out)
+        self.assertIn('מילון', str(cm.exception))
+        # a complete rebuild clears it
+        make_schema6_db(os.path.join(self.tmp.name, 'fixed.db'))
+        os.replace(os.path.join(self.tmp.name, 'fixed.db'), self.db)
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.report(self.cfg, self.out)
+
+    def test_tanach_pass_failure_is_recorded_in_hebrew(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+
+        def broken_index(db_path, stats):
+            stats.decode_errors += 2
+            return {}
+        with mock.patch.object(core, '_build_verse_index', broken_index):
+            with self.assertRaises(core.PartialRead) as cm:
+                core.locate(self.spec, self.cfg, self.out)
+        self.assertIn('לא הצליח לקרוא 2 שורות', str(cm.exception))
+        cov = _coverage(self.out, 'locate')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['passes']['tanach_index']['decode_errors'], 2)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, core.REPORT_DB_F)))
+
+    def test_output_without_coverage_file_is_accepted(self):
+        # outputs written before coverage was recorded keep working
+        self.assertIsNone(core.coverage_problem(self.out, 'lexicon'))
+
+    def test_cli_report_exits_nonzero_on_refused_report(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        _corrupt_row(self.db, 3)
+        with self.assertRaises(core.PartialRead):
+            core.locate(self.spec, self.cfg, self.out)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['report', '--otzaria', '--db', self.db,
+                           '--out', self.out])
+        self.assertEqual(rc, 1)
+        self.assertIn('מיקום', err.getvalue())
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
 class MissingContentRowTest(unittest.TestCase):
     """A `line` row without its `line_content` row is unread, not absent."""
 
@@ -403,6 +528,38 @@ class OpenFailureTest(unittest.TestCase):
         self.assertIn('לא נמצא', err.getvalue())
         self.assertNotIn('Traceback', err.getvalue())
         self.assertFalse(os.path.exists(missing))
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class ReadStatsCountedTest(unittest.TestCase):
+    """Every pass that reads the corpus counts what it could not read."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db, corrupt_id=2)
+        con = sqlite3.connect(self.db)
+        con.execute('UPDATE book SET hasTeamim = 1 WHERE id = 1')
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_tanach_passes_count_and_release_the_db(self):
+        st = ReadStats()
+        vidx = core._build_verse_index(self.db, st)
+        self.assertEqual(st.decode_errors, 1)
+        st2 = ReadStats()
+        core._tanach_edition_errors(self.db, vidx, st2)
+        self.assertEqual(st2.decode_errors, 1)
+        os.remove(self.db)                      # closed: not locked
+
+    def test_book_context_verification_refuses_partial_pass(self):
+        with self.assertRaises(book_scan.BookScanError):
+            book_scan.verify_context(
+                _otzaria_spec(self.db), Config(workers=1, n_chunks=2),
+                {('בראשית', 'ברא')}, {})
 
 
 class ReadOnlyUriTest(unittest.TestCase):
