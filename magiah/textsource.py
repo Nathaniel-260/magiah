@@ -32,7 +32,7 @@ therefore excluded unless explicitly requested, and the exclusion is counted.
 """
 import os
 import sqlite3
-import urllib.request
+import urllib.parse
 
 
 class TextSourceError(Exception):
@@ -70,14 +70,33 @@ def _make_decoder(dict_bytes):
     return decode, 'zstandard'
 
 
+def ro_uri(path):
+    """SQLite ``file:`` URI that opens `path` read-only.
+
+    Built by hand rather than with ``pathname2url``: on Python 3.14 that turns
+    ``\\\\server\\share\\...`` into ``///server/share/...`` — a local path —
+    so a database on a network share could not be opened at all. SQLite wants
+    an empty authority followed by the UNC path (``file:////server/share/``).
+    Spaces, ``#``, ``%``, ``?`` and Hebrew are percent-encoded (UTF-8).
+    """
+    p = os.path.abspath(path)
+    if os.name == 'nt':
+        p = p.replace('\\', '/')
+    p = urllib.parse.quote(p, safe='/:')
+    if not p.startswith('/'):
+        p = '/' + p                     # drive path: file:///C:/...
+    return 'file://' + p + '?mode=ro'   # UNC: file:////server/share/...
+
+
 def connect_ro(path, timeout=30.0):
     """Read-only connection. Never creates a missing file (a plain
     ``sqlite3.connect`` would leave a 0-byte database behind)."""
     if not os.path.isfile(path):
         raise TextSourceError(f'קובץ מסד הנתונים לא נמצא: {path}')
-    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
-        + '?mode=ro'
-    con = sqlite3.connect(uri, uri=True, timeout=timeout)
+    try:
+        con = sqlite3.connect(ro_uri(path), uri=True, timeout=timeout)
+    except sqlite3.Error as e:
+        raise TextSourceError(f'לא ניתן לפתוח את מסד הנתונים: {path} ({e})')
     con.execute('PRAGMA busy_timeout=30000')
     return con
 

@@ -14,7 +14,7 @@ from magiah import book_scan, book_source, cli, core, corpus as corpus_mod
 from magiah.config import Config
 from magiah.corpus import make_corpus
 from magiah.corpus_hybrid import HybridCorpus, LibraryCorpus
-from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError,
+from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
 
 try:
@@ -301,6 +301,48 @@ def _coverage(out, stage):
     with open(os.path.join(out, f'coverage_{stage}.json'),
               encoding='utf-8') as f:
         return json.load(f)
+
+
+class ReadOnlyUriTest(unittest.TestCase):
+    """UNC paths, and paths with Hebrew, spaces, '#' and '%'."""
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_unc_uri_keeps_server_and_share(self):
+        self.assertEqual(ro_uri(r'\\server\share\a b\seforim.db'),
+                         'file:////server/share/a%20b/seforim.db?mode=ro')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_drive_uri(self):
+        self.assertEqual(ro_uri(r'C:\ספרים\a#b%c\seforim.db'),
+                         'file:///C:/%D7%A1%D7%A4%D7%A8%D7%99%D7%9D/'
+                         'a%23b%25c/seforim.db?mode=ro')
+
+    def test_awkward_local_path_opens_read_only(self):
+        with tempfile.TemporaryDirectory(prefix='ספר # 100% ') as d:
+            p = os.path.join(d, 'seforim.db')
+            make_inline_db(p)
+            with OtzariaDB(p) as odb:
+                self.assertEqual(len(list(odb.iter_range(1, 5,
+                                                         ReadStats()))), 4)
+                with self.assertRaises(sqlite3.OperationalError):
+                    odb.con.execute('DELETE FROM line')
+            missing = os.path.join(d, 'nope.db')
+            with self.assertRaises(TextSourceError):
+                OtzariaDB(missing)
+            self.assertFalse(os.path.exists(missing))
+
+    @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
+                         'needs the \\\\localhost\\C$ admin share')
+    def test_unc_path_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'seforim.db')
+            make_inline_db(p)
+            drive, rest = os.path.splitdrive(os.path.abspath(p))
+            if len(drive) != 2:
+                self.skipTest('temp dir is not on a drive letter')
+            unc = '\\\\localhost\\' + drive[0] + '$' + rest
+            with OtzariaDB(unc) as odb:
+                self.assertEqual(odb.layout, 'inline')
 
 
 class LibraryPathFileTest(unittest.TestCase):

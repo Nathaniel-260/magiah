@@ -26,7 +26,8 @@ import os
 import sqlite3
 
 from .corpus import OTZARIA_DB
-from .textsource import OtzariaDB, ReadStats, TextSourceError, split_lines
+from .textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
+                         split_lines)
 from .corpus_hybrid import (DEFAULT_LIBRARY, FALLBACK_ORIGIN,
                             FILE_UNIT_PREFIX, LibraryCorpus, _HDR_RE,
                             _header_text)
@@ -129,10 +130,7 @@ def _scanned_files(library_dir, lib, refresh=False):
 
 
 def _connect_ro(path):
-    import urllib.request
-    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
-          + '?mode=ro'
-    con = sqlite3.connect(uri, uri=True, timeout=30.0)
+    con = sqlite3.connect(ro_uri(path), uri=True, timeout=30.0)
     con.execute('PRAGMA busy_timeout=30000')
     return con
 
