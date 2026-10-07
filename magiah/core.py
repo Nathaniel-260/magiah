@@ -606,6 +606,17 @@ def settle_split(errors, w, fw, best, lex, scope, strong=None):
     return 'primary' if errors[w][1] == 'missing_space' else 'alternative'
 
 
+def keep_structural_suspicion(errors, w, fw, cands, lex):
+    """A final-form letter mid-word is wrong whether or not the split it
+    suggests is ever seen spaced; record the suspicion without inventing a
+    replacement when no split could be confirmed."""
+    if w in errors or not any(strong for _, strong in cands):
+        return
+    cfg = lex.cfg
+    record_best(errors, w, fw,
+                ('final_midword', '', 0, 3.0 - _frequency_penalty(fw, cfg)))
+
+
 
 def uses_context(errtype):
     """Error types whose correction is verified by neighbouring words."""
@@ -973,6 +984,8 @@ def detect(spec, cfg, out_dir):
         obs = [counts.get(idx + k, 0) for k in range(len(cs))]
         idx += len(cs)
         best, alts = resolve_splits(cs, obs, lex, 'corpus')
+        if not best:
+            keep_structural_suspicion(errors, w, freq[w], cs, lex)
         if best:
             settle_split(errors, w, freq[w], best, lex, 'corpus')
             alts_out[w] = [(' '.join(p), o, e, ok and p == best[0])

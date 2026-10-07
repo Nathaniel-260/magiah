@@ -136,6 +136,8 @@ def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
         obs = [seq_counts.get(idx + k, 0) for k in range(len(cs))]
         idx += len(cs)
         best, alts = core.resolve_splits(cs, obs, lex, scope)
+        if not best:
+            core.keep_structural_suspicion(errors, w, freq.get(w, 0), cs, lex)
         if best:
             core.settle_split(errors, w, freq.get(w, 0), best, lex, scope)
             alts_out[w] = [(' '.join(p), o, e, ok and p == best[0])

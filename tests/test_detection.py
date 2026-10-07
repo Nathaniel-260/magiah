@@ -677,3 +677,38 @@ class WorkerMemory(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UnverifiedFinalLetterSplit(unittest.TestCase):
+    """A final letter mid-word stays a suspicion when its split is never
+    seen spaced (the parts are frequent, but never adjacent)."""
+
+    LINES = (['אמר שלום לכולם וגם עליכם אמרו'] * 12
+             + ['ואמר שלוםעליכם לכולם'])
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='magiah_fin_')
+        self.lib = os.path.join(self.tmp, 'lib')
+        self.out = os.path.join(self.tmp, 'out')
+        os.makedirs(self.out)
+        write_lib(self.lib, {BOOK_A: self.LINES})
+        self.spec = {'type': 'library', 'path': self.lib}
+        self.cfg = small_cfg()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_full_scan_keeps_the_suspicion(self):
+        run_full(self.spec, self.cfg, self.out)
+        rows = [r for r in report_rows(self.out) if r['word'] == 'שלוםעליכם']
+        self.assertEqual([(r['errtype'], r['suggestion']) for r in rows],
+                         [('final_midword', '')])
+
+    def test_book_scan_in_corpus_scope_keeps_the_suspicion(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        res = book_scan.scan_book(self.out, 'library', BOOK_A, cfg=self.cfg,
+                                  library_dir=self.lib, spec=self.spec,
+                                  verify_ctx=True)
+        rows = [r for r in res['findings'] if r['word'] == 'שלוםעליכם']
+        self.assertEqual([(r['errtype'], r['suggestion']) for r in rows],
+                         [('final_midword', '')])
