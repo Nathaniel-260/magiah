@@ -290,8 +290,10 @@ class OtzariaDB:
                     out[lid] = text
         return out
 
-    def count_version_lines(self, lo=None, hi=None):
-        """Version rows that carry their own reading (content NOT NULL)."""
+    def count_version_lines(self, lo=None, hi=None, book_ids_sql=None,
+                            params=()):
+        """Version rows that carry their own reading (content NOT NULL),
+        optionally only of the books `book_ids_sql` selects."""
         if not self.has_versions:
             return 0
         sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
@@ -299,6 +301,10 @@ class OtzariaDB:
         if lo is not None:
             sql += ' AND lineId >= ? AND lineId < ?'
             args = [lo, hi]
+        if book_ids_sql:
+            sql += (' AND lineId IN (SELECT id FROM line '
+                    f'WHERE bookId IN ({book_ids_sql}))')
+            args.extend(params)
         return self.con.execute(sql, args).fetchone()[0]
 
     def iter_version_range(self, lo, hi, stats):

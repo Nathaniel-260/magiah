@@ -561,6 +561,18 @@ class ReadStatsCountedTest(unittest.TestCase):
                 _otzaria_spec(self.db), Config(workers=1, n_chunks=2),
                 {('בראשית', 'ברא')}, {})
 
+    def test_hybrid_counts_skipped_version_lines(self):
+        db = os.path.join(self.tmp.name, 'clean.db')
+        make_schema6_db(db)
+        lib = os.path.join(self.tmp.name, 'lib')
+        os.makedirs(lib)
+        corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': db})
+        for ch in corpus.chunks(2):
+            list(corpus.iter_texts_docs(ch))
+        corpus.close()
+        # the version row belongs to book 1 (Sefaria), so hybrid skips it too
+        self.assertEqual(corpus.stats.version_lines_skipped, 1)
+
 
 class ReadOnlyUriTest(unittest.TestCase):
     """UNC paths, and paths with Hebrew, spaces, '#' and '%'."""
