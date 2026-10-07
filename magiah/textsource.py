@@ -140,10 +140,23 @@ class OtzariaDB:
     def __init__(self, path):
         self.path = path
         self.con = connect_ro(path)
+        # any failure past this point must release the connection: on Windows
+        # an open handle keeps seforim.db locked (WinError 32) for the process
+        try:
+            self._inspect(path)
+        except TextSourceError:
+            self.con.close()
+            raise
+        except Exception as e:          # not a database, a corrupt dictionary
+            self.con.close()
+            raise TextSourceError(
+                f'לא ניתן לקרוא את מסד הנתונים כמסד ספרים של אוצריא: {path}'
+                f' ({e})') from e
+
+    def _inspect(self, path):
         tables = {r[0] for r in self.con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if 'line' not in tables or 'book' not in tables:
-            self.con.close()
             raise TextSourceError(
                 f'הקובץ אינו מסד ספרים של אוצריא (חסרות הטבלאות line/book): '
                 f'{path}')
@@ -156,7 +169,6 @@ class OtzariaDB:
             self.layout = 'inline'
             self._text_sql = 'SELECT l.id, l.bookId, l.content FROM line l'
         else:
-            self.con.close()
             raise TextSourceError(f'לא נמצאה עמודת תוכן במסד: {path}')
         self.has_versions = {'book_version', 'version_line'} <= tables
         self.decode_raw = None

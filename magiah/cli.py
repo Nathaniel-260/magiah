@@ -9,6 +9,7 @@ from . import core
 from .config import Config
 from .corpus import OTZARIA_DB
 from .corpus_hybrid import DEFAULT_LIBRARY
+from .textsource import TextSourceError
 
 RUN_CONFIG = 'run_config.json'
 
@@ -211,9 +212,10 @@ def main(argv=None):
             core.locate(spec, cfg, out_dir)
         if args.command in ('report', 'all'):
             core.report(cfg, out_dir, top=args.top)
-    except core.StageError as e:
-        # a stage was run before its prerequisite: print the Hebrew guidance
-        # (no traceback — this is a user error, not a crash)
+    except (core.StageError, TextSourceError) as e:
+        # a stage was run before its prerequisite, or the database cannot be
+        # read (missing, not Otzaria's, no zstd decoder): print the Hebrew
+        # guidance (no traceback — this is a user error, not a crash)
         print(str(e), file=sys.stderr, flush=True)
         return 1
 

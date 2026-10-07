@@ -303,6 +303,73 @@ def _coverage(out, stage):
         return json.load(f)
 
 
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class OpenFailureTest(unittest.TestCase):
+    """A database that fails to open is released and reported in Hebrew."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _set_dict(self, value):
+        con = sqlite3.connect(self.db)
+        if value is None:
+            con.execute('DELETE FROM zstd_dict')
+        else:
+            con.execute('UPDATE zstd_dict SET dict = ?', (value,))
+        con.commit()
+        con.close()
+
+    def _assert_released(self):
+        # on Windows a leaked connection keeps the file locked (WinError 32)
+        os.remove(self.db)
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_empty_dictionary_table(self):
+        self._set_dict(None)
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_bad_dictionary_is_text_source_error(self):
+        self._set_dict(b'not a zstd dictionary at all')
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_missing_decoder(self):
+        def no_decoder(_):
+            raise TextSourceError('אין מפענח zstd')
+        with mock.patch('magiah.textsource._make_decoder', no_decoder):
+            with self.assertRaises(TextSourceError):
+                OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_not_a_database(self):
+        with open(self.db, 'wb') as f:
+            f.write(b'this is not sqlite' * 100)
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_cli_prints_hebrew_not_traceback(self):
+        out = os.path.join(self.tmp.name, 'out')
+        missing = os.path.join(self.tmp.name, 'nope.db')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['lexicon', '--otzaria', '--db', missing,
+                           '--out', out])
+        self.assertEqual(rc, 1)
+        self.assertIn('לא נמצא', err.getvalue())
+        self.assertNotIn('Traceback', err.getvalue())
+        self.assertFalse(os.path.exists(missing))
+
+
 class ReadOnlyUriTest(unittest.TestCase):
     """UNC paths, and paths with Hebrew, spaces, '#' and '%'."""
 
