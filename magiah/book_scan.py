@@ -62,6 +62,7 @@ from collections import Counter
 from . import core
 from .book_source import load_book
 from .config import Config
+from .textsource import ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, TOKEN_RE, clean, is_abbrev,
                         tokenize)
@@ -83,6 +84,11 @@ def load_lexicon(out_dir):
             'סריקת ספר בודד מתבססת על המילון הקיים, והוא לא נמצא '
             f'({core.LEXICON_F}).\nיש להריץ פעם אחת סריקה מלאה (או את שלב '
             '"בניית מילון") לפני שאפשר לסרוק ספר בודד.')
+    # the lexicon's latest build must have read its whole input — an older
+    # lexicon left behind by a failed build is refused too
+    problem = core.coverage_problem(out_dir, 'lexicon')
+    if problem:
+        raise BookScanError(problem)
     with open(path, 'rb') as f:
         return pickle.load(f)
 
@@ -444,6 +450,7 @@ def verify_context(spec, cfg, ctx_pairs, book_need, progress=None):
     """
     import tempfile
     ctx_counts, local_counts = Counter(), Counter()
+    stats = ReadStats()
     if not ctx_pairs and not book_need:
         return ctx_counts, local_counts
     corpus = core.make_corpus(spec)
@@ -458,10 +465,11 @@ def verify_context(spec, cfg, ctx_pairs, book_need, progress=None):
             pickle.dump(book_need, f, protocol=4)
         with core._pool(spec, cfg, {'ctx_pairs': ctx_path,
                                     'book_need': need_path}) as pool:
-            for i, (c, lc) in enumerate(
+            for i, (c, lc, st) in enumerate(
                     pool.imap_unordered(core._ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
+                stats.add(ReadStats.from_dict(st))
                 if progress:
                     progress(f'  [context] chunk {i}/{len(chunks)}')
     finally:
@@ -474,6 +482,12 @@ def verify_context(spec, cfg, ctx_pairs, book_need, progress=None):
             os.rmdir(tmp)
         except OSError:
             pass
+    if stats.unread():
+        # counts from a partial pass would understate ctx_hits silently
+        raise BookScanError(
+            f'אימות ההקשר מול המאגר לא הצליח לקרוא {stats.unread():,} שורות; '
+            f'הסריקה בוטלה כדי לא להציג תוצאה חלקית. '
+            f'דוגמה: {stats.error_samples[:1]}')
     return ctx_counts, local_counts
 
 

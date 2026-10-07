@@ -75,7 +75,9 @@
 
 ## התקנה
 
-דורש Python 3.9 ומעלה. אין תלויות חיצוניות.
+דורש Python 3.9 ומעלה. ממסדי אוצריא בסכמה 6 ואילך כל שורה שמורה דחוסה ב-zstd;
+ב-Python 3.14 ומעלה הפענוח נעשה בספרייה הסטנדרטית, ובגרסאות קודמות החבילה
+`zstandard` מותקנת אוטומטית (`pip install .`).
 
 ```bash
 pip install .
@@ -88,7 +90,13 @@ python -m magiah --help
 
 ## שימוש
 
-**ספריית אוצריא** (מזהה אוטומטית את `C:\ProgramData\otzaria\books\seforim.db`):
+**ספריית אוצריא** (מזהה אוטומטית את `seforim.db` שבתיקייה הרשומה ב-
+`%APPDATA%\otzaria\library_path.txt`, ואם אין — את
+`C:\ProgramData\otzaria\books\seforim.db`). נקראים גם המבנה הישן
+(`line.content`) וגם סכמה 6 (`line_content`, דחוס ב-zstd עם מילון שמור).
+גרסאות חלופיות שב-`version_line` אינן נסרקות ונספרות כמדולגות. כל שלב
+כותב `coverage_<stage>.json`, ושלב שלא הצליח לפענח חלק מהשורות נעצר
+בשגיאה במקום להציג ריצה חלקית כהצלחה:
 
 ```bash
 magiah all --otzaria --out results

@@ -9,6 +9,9 @@ description = "Corpus-based typo detection for Hebrew/Aramaic texts - no diction
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+# seforim.db schema 6 stores line text as zstd frames; Python 3.14+ decodes
+# them with the standard library, older interpreters need `zstandard`
+dependencies = ["zstandard>=0.22; python_version < '3.14'"]
 keywords = ["hebrew", "aramaic", "ocr", "typo", "proofreading", "corpus", "torah", "otzaria"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -26,3 +29,8 @@ Homepage = "https://github.com/Nathaniel-260/magiah"
 
 [tool.setuptools.packages.find]
 include = ["magiah*"]
+
+# the review UI is served from these files at runtime; without this the wheel
+# installs a UI that only shows its "files not installed" placeholder
+[tool.setuptools.package-data]
+"magiah.webui" = ["static/*"]

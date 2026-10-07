@@ -14,6 +14,7 @@ Everything is derived from the corpus itself — no external dictionaries, so
 Aramaic, rabbinic Hebrew and abbreviations are handled naturally.
 """
 import csv
+import json
 import math
 import os
 import pickle
@@ -25,6 +26,7 @@ from multiprocessing import Pool
 
 from .config import Config
 from .corpus import make_corpus
+from .textsource import OtzariaDB, ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
@@ -51,7 +53,7 @@ _STAGE_OF = {
 }
 
 
-def _require(out_dir, filename, stage):
+def _require(out_dir, filename, stage, check_coverage=True):
     """Fail cleanly when a prerequisite of `stage` is missing.
 
     First-run guard: every stage except `lexicon` consumes a file produced by
@@ -59,11 +61,17 @@ def _require(out_dir, filename, stage):
     "no such table" traceback in English — and, for the report.db cases, a
     0-byte report.db left behind by sqlite3.connect() that then blocks the UI
     from starting at all.
+
+    The file is also refused when the latest run of the stage that produces
+    it did not read its whole input (:func:`coverage_problem`).
     """
     path = os.path.join(out_dir, filename)
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        return path
     need_cmd, need_he = _STAGE_OF.get(filename, ('all', 'סריקה'))
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        problem = check_coverage and coverage_problem(out_dir, need_cmd)
+        if problem:
+            raise PartialRead(problem)
+        return path
     raise StageError(
         f'לא ניתן להריץ את שלב "{stage}": חסר הקובץ {filename}, '
         f'שנוצר בשלב "{need_he}".\n'
@@ -101,15 +109,146 @@ def _pool(spec, cfg, loads=None):
                 initargs=(spec, cfg.to_dict(), loads or {}))
 
 
+def _chunk_stats_begin():
+    """Fresh per-chunk read counters on the worker's corpus adapter."""
+    _W['corpus'].stats = ReadStats()
+
+
+def _chunk_stats_end():
+    return _W['corpus'].stats.to_dict()
+
+
+COVERAGE_F = 'coverage_{stage}.json'
+
+
+class PartialRead(StageError):
+    """Rows of the input could not be read; the stage output is partial."""
+
+
+def _replace_atomically(path, write):
+    """``write(tmp_path)``, then move it over `path` in one step — so a stage
+    that fails midway never leaves a half-written file in place of the last
+    good one."""
+    tmp = path + '.tmp'
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _dump_pickle(obj):
+    def write(path):
+        with open(path, 'wb') as f:
+            pickle.dump(obj, f, protocol=4)
+    return write
+
+
+def _write_coverage(out_dir, stage, stats, extra=None, passes=None):
+    """Persist what a stage actually read (the run's coverage evidence).
+
+    `passes` holds the stage's further reads of the input (Tanach index,
+    context verification); the stage is complete only if every pass was.
+    """
+    passes = passes or {}
+    unread = sum(s.unread() for s in (stats, *passes.values()))
+    info = {'stage': stage, 'complete': unread == 0, 'unread': unread,
+            **stats.to_dict(), **(extra or {})}
+    if passes:
+        info['passes'] = {k: v.to_dict() for k, v in passes.items()}
+
+    def write(path):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(info, f, ensure_ascii=False, indent=1)
+    _replace_atomically(os.path.join(out_dir, COVERAGE_F.format(stage=stage)),
+                        write)
+    print(f'[{stage}] coverage: lines={stats.lines:,} chars={stats.chars:,} '
+          f'decode_errors={stats.decode_errors:,} missing={stats.missing:,} '
+          f'version_lines_skipped={stats.version_lines_skipped:,}'
+          + ''.join(f' {k}.unread={v.unread():,}' for k, v in passes.items()),
+          flush=True)
+    return info
+
+
+def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None):
+    """A pass with unreadable rows must never be reported as complete.
+
+    Called BEFORE the stage writes its output: a partial read records its
+    coverage file and stops, so the previous output stays untouched (and is
+    then refused by its consumers — see :func:`coverage_problem`).
+    """
+    passes = passes or {}
+    if not any(s.unread() for s in (stats, *passes.values())):
+        return
+    info = _write_coverage(out_dir, stage, stats, extra, passes)
+    raise PartialRead(
+        f'שלב "{_STAGE_HE.get(stage, stage)}" לא הצליח לקרוא '
+        f'{info["unread"]:,} שורות '
+        f'מהקלט, ולכן התוצאה חלקית ואינה מוצגת כהצלחה.' + chr(10) +
+        f'פרטים: {os.path.join(out_dir, COVERAGE_F.format(stage=stage))}')
+
+
+_STAGE_HE = {cmd: he for cmd, he in _STAGE_OF.values()}
+# the stages that read the corpus, in order; each one's output is derived from
+# the outputs of the ones before it
+_READ_STAGES = ('lexicon', 'detect', 'locate')
+
+
+def coverage_problem(out_dir, stage):
+    """Why the output of `stage` must not be used — or None if it may.
+
+    The rule: ``coverage_<stage>.json`` describes the stage's LATEST attempt,
+    and an output is used only if the latest attempt of its stage, and of
+    every stage before it, read the whole input. A partial attempt never
+    replaces the output, so an older complete output may still be on disk
+    after a failed run; it is refused all the same — it does not reflect the
+    input the user last scanned, and using it silently would hide the
+    failure. No coverage file at all (output written before coverage was
+    recorded) is accepted.
+    """
+    upto = _READ_STAGES.index(stage) + 1 if stage in _READ_STAGES else 0
+    for st in _READ_STAGES[:upto] or (stage,):
+        problem = _stage_coverage_problem(out_dir, st)
+        if problem:
+            return problem
+    return None
+
+
+def _stage_coverage_problem(out_dir, stage):
+    path = os.path.join(out_dir, COVERAGE_F.format(stage=stage))
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            info = json.load(f)
+        if info.get('complete') is True:
+            return None
+        unread = int(info.get('unread', info.get('decode_errors', 0)))
+    except (OSError, ValueError, TypeError, AttributeError):
+        unread = 0                      # unreadable evidence is no evidence
+    he = _STAGE_HE.get(stage, stage)
+    return (f'הריצה האחרונה של שלב "{he}" לא קראה את כל הקלט '
+            f'({unread:,} שורות לא נקראו), ולכן אין להשתמש בתוצרים שלו '
+            f'ושל השלבים שאחריו.\n'
+            f'יש לתקן את הבעיה ולהריץ שוב:  python -X utf8 -m magiah '
+            f'all --out "{out_dir}"\n'
+            f'פרטים: {path}')
+
+
 # ---------------------------------------------------------------------------
 # stage 1: lexicon
 # ---------------------------------------------------------------------------
 
 def _count_chunk(chunk):
+    _chunk_stats_begin()
     c = Counter()
     for _, text in _W['corpus'].iter_texts(chunk):
         c.update(tokenize(text))
-    return c
+    return c, _chunk_stats_end()
 
 
 def build_lexicon(spec, cfg, out_dir):
@@ -117,15 +256,23 @@ def build_lexicon(spec, cfg, out_dir):
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
     lex = Counter()
+    stats = ReadStats()
     with _pool(spec, cfg) as pool:
-        for i, c in enumerate(pool.imap_unordered(_count_chunk, chunks), 1):
+        for i, (c, st) in enumerate(
+                pool.imap_unordered(_count_chunk, chunks), 1):
             lex.update(c)
+            stats.add(ReadStats.from_dict(st))
             print(f'  [lexicon] chunk {i}/{len(chunks)}  types={len(lex):,}  '
                   f'({time.time()-t0:.0f}s)', flush=True)
-    with open(os.path.join(out_dir, LEXICON_F), 'wb') as f:
-        pickle.dump(dict(lex), f, protocol=4)
     print(f'[lexicon] tokens={sum(lex.values()):,}  types={len(lex):,}  '
           f'time={time.time()-t0:.0f}s', flush=True)
+    extra = {'tokens': sum(lex.values()), 'types': len(lex),
+             'chunks': len(chunks)}
+    # coverage first: a partial lexicon must not replace the last good one
+    _fail_if_partial('lexicon', stats, out_dir, extra)
+    _replace_atomically(os.path.join(out_dir, LEXICON_F),
+                        _dump_pickle(dict(lex)))
+    _write_coverage(out_dir, 'lexicon', stats, extra)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +345,7 @@ def _segment(w, freq, cfg):
 
 def _split_verify_chunk(chunk):
     """Count how often each split candidate occurs *with* spaces."""
+    _chunk_stats_begin()
     first, pairs, cands = _W['sc_first'], _W['sc_pairs'], _W['split_cands']
     counts = Counter()
     for _, text in _W['corpus'].iter_texts(chunk):
@@ -209,7 +357,7 @@ def _split_verify_chunk(chunk):
                     if len(parts) == 2 or (i + 2 < len(toks)
                                            and toks[i + 2] == parts[2]):
                         counts[idx] += 1
-    return counts
+    return counts, _chunk_stats_end()
 
 
 def calibrate(cfg, out_dir):
@@ -218,7 +366,11 @@ def calibrate(cfg, out_dir):
     substitutions actually happen (ד/ר, ט/מ...) and how often; the next
     `detect` run uses these counts instead of the hand-written pair list."""
     import json
-    con = sqlite3.connect(_require(out_dir, REPORT_DB_F, 'כיול'))
+    # coverage NOT checked: calibrate only learns letter weights from the last
+    # complete report.db, and the UI runs it as the first step of a rescan —
+    # refusing it would block the very rescan that repairs a failed `locate`
+    con = sqlite3.connect(_require(out_dir, REPORT_DB_F, 'כיול',
+                                   check_coverage=False))
     pairs = Counter()
     for w, s in con.execute(
             "SELECT DISTINCT word, suggestion FROM occurrences_full "
@@ -459,10 +611,13 @@ def detect(spec, cfg, out_dir):
         pickle.dump(cand_list, f, protocol=4)
     corpus = make_corpus(spec)
     counts = Counter()
+    vstats = ReadStats()
     chunks = corpus.chunks(cfg.n_chunks)
     with _pool(spec, cfg, {'split_cands': splits_path}) as pool:
-        for i, c in enumerate(pool.imap_unordered(_split_verify_chunk, chunks), 1):
+        for i, (c, st) in enumerate(
+                pool.imap_unordered(_split_verify_chunk, chunks), 1):
             counts.update(c)
+            vstats.add(ReadStats.from_dict(st))
             if i % 6 == 0:
                 print(f'  [verify] chunk {i}/{len(chunks)} '
                       f'({time.time()-t0:.0f}s)', flush=True)
@@ -486,9 +641,10 @@ def detect(spec, cfg, out_dir):
                    + (1 if minlen >= 3 else 0))
             n_ok += 1
     print(f'[verify] confirmed {n_ok:,}/{len(cand_list):,} splits', flush=True)
+    _fail_if_partial('detect', vstats, out_dir)
 
-    with open(os.path.join(out_dir, FLAGGED_F), 'wb') as f:
-        pickle.dump(errors, f, protocol=4)
+    _replace_atomically(os.path.join(out_dir, FLAGGED_F), _dump_pickle(errors))
+    _write_coverage(out_dir, 'detect', vstats)
     print(f'[detect] flagged={len(errors):,}  time={time.time()-t0:.0f}s',
           flush=True)
     for k, v in Counter(v[1] for v in errors.values()).most_common():
@@ -521,40 +677,41 @@ def _within2(a, b):
     return prev[lb] <= 2
 
 
-def _build_verse_index(db_path):
-    """(prev, next) -> {middle: set(bookId)} over all cantillated editions."""
-    con = sqlite3.connect(db_path)
+def _build_verse_index(db_path, stats):
+    """(prev, next) -> {middle: set(bookId)} over all cantillated editions.
+    Unreadable rows are counted in `stats`; the caller decides."""
     idx = {}
-    for book_id, content in con.execute(
-            'SELECT l.bookId, l.content FROM line l '
-            'JOIN book b ON b.id = l.bookId '
-            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
-        toks = tokenize(content)
-        for i in range(1, len(toks) - 1):
-            key = (toks[i - 1], toks[i + 1])
-            idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
-    con.close()
+    with OtzariaDB(db_path) as odb:
+        lo, hi = odb.id_range()
+        for _, book_id, content in odb.iter_range(
+                lo, hi + 1, stats,
+                book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
+            toks = tokenize(content)
+            for i in range(1, len(toks) - 1):
+                key = (toks[i - 1], toks[i + 1])
+                idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
     return idx
 
 
-def _tanach_edition_errors(db_path, vidx):
-    """Places where one Tanach edition deviates from 3+ agreeing editions."""
+def _tanach_edition_errors(db_path, vidx, stats):
+    """Places where one Tanach edition deviates from 3+ agreeing editions.
+    Unreadable rows are counted in `stats`."""
     rows = []
-    con = sqlite3.connect(db_path)
-    for uid, content in con.execute(
-            'SELECT l.id, l.content FROM line l JOIN book b ON b.id = l.bookId '
-            'WHERE b.hasTeamim = 1 AND l.content IS NOT NULL'):
-        toks = tokenize(content)
-        for i in range(1, len(toks) - 1):
-            m = toks[i]
-            entry = vidx.get((toks[i - 1], toks[i + 1]), {})
-            if len(entry.get(m, ())) == 1:      # this edition alone
-                canon = [x for x, bs in entry.items()
-                         if len(bs) >= 3 and _within2(m, x)]
-                if len(canon) == 1:
-                    snip = ' '.join(toks[max(0, i - 6):i + 7])
-                    rows.append((str(uid), m, canon[0], snip))
-    con.close()
+    with OtzariaDB(db_path) as odb:
+        lo, hi = odb.id_range()
+        for uid, _, content in odb.iter_range(
+                lo, hi + 1, stats,
+                book_ids_sql='SELECT id FROM book WHERE hasTeamim = 1'):
+            toks = tokenize(content)
+            for i in range(1, len(toks) - 1):
+                m = toks[i]
+                entry = vidx.get((toks[i - 1], toks[i + 1]), {})
+                if len(entry.get(m, ())) == 1:      # this edition alone
+                    canon = [x for x, bs in entry.items()
+                             if len(bs) >= 3 and _within2(m, x)]
+                    if len(canon) == 1:
+                        snip = ' '.join(toks[max(0, i - 6):i + 7])
+                        rows.append((str(uid), m, canon[0], snip))
     return rows
 
 
@@ -569,6 +726,7 @@ NAME_TRIGGERS = frozenset((
 # ---------------------------------------------------------------------------
 
 def _locate_chunk(chunk):
+    _chunk_stats_begin()
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
     profiles = _W.get('ocr_profiles') or {}
     occ, joins, ocr = [], [], []
@@ -661,7 +819,7 @@ def _locate_chunk(chunk):
                     continue
                 occ.append((w, uid, doc, prev, nxt,
                             text[max(0, s - 45):e + 45].strip()))
-    return occ, joins, ocr
+    return occ, joins, ocr, _chunk_stats_end()
 
 
 def _ctx_count_chunk(chunk):
@@ -669,6 +827,7 @@ def _ctx_count_chunk(chunk):
     * ctx: how often does (neighbor, correction) occur as an adjacent pair?
     * local: how often does each proposed correction occur in the same book
       as the flagged word?"""
+    _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
     counts, local = Counter(), Counter()
@@ -682,7 +841,7 @@ def _ctx_count_chunk(chunk):
                 p = (t, toks[i + 1])
                 if p in pairs:
                     counts[p] += 1
-    return counts, local
+    return counts, local, _chunk_stats_end()
 
 
 def locate(spec, cfg, out_dir):
@@ -693,20 +852,26 @@ def locate(spec, cfg, out_dir):
     chunks = corpus.chunks(cfg.n_chunks)
 
     all_occ, all_joins, all_ocr = [], [], []
+    lstats = ReadStats()
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
     prof_path = os.path.join(out_dir, 'ocr_profiles.pkl')
     if os.path.exists(prof_path):
         loads['ocr_profiles'] = prof_path
     with _pool(spec, cfg, loads) as pool:
-        for i, (occ, joins, ocr) in enumerate(
+        for i, (occ, joins, ocr, st) in enumerate(
                 pool.imap_unordered(_locate_chunk, chunks), 1):
+            lstats.add(ReadStats.from_dict(st))
             all_occ.extend(occ)
             all_joins.extend(joins)
             all_ocr.extend(ocr)
             print(f'  [locate] chunk {i}/{len(chunks)}  occ={len(all_occ):,}  '
                   f'space={len(all_joins):,}  ocr={len(all_ocr):,}  '
                   f'({time.time()-t0:.0f}s)', flush=True)
+    # a partial main pass is refused before the Tanach and context passes
+    # spend more time on it
+    passes = {}                         # name -> ReadStats of each later pass
+    _fail_if_partial('locate', lstats, out_dir)
 
     # --- Tanach reference check (Otzaria only) ----------------------------
     # Occurrences whose context matches a biblical verse are compared against
@@ -716,7 +881,9 @@ def locate(spec, cfg, out_dir):
     tan_info = None
     if spec.get('preset') == 'otzaria':
         t1 = time.time()
-        vidx = _build_verse_index(spec['path'])
+        tstats = passes['tanach_index'] = ReadStats()
+        vidx = _build_verse_index(spec['path'], tstats)
+        _fail_if_partial('locate', lstats, out_dir, passes=passes)
         print(f'[tanach] verse index: {len(vidx):,} contexts '
               f'({time.time()-t1:.0f}s)', flush=True)
         kept, tan_info, n_fix = [], [], 0
@@ -738,7 +905,10 @@ def locate(spec, cfg, out_dir):
         all_occ = kept
         print(f'[tanach] verse matches (separate review file): '
               f'{len(tanach_matches):,}  MT-corrections: {n_fix:,}', flush=True)
-        tanach_errors_rows = _tanach_edition_errors(spec['path'], vidx)
+        estats = passes['tanach_editions'] = ReadStats()
+        tanach_errors_rows = _tanach_edition_errors(spec['path'], vidx,
+                                                    estats)
+        _fail_if_partial('locate', lstats, out_dir, passes=passes)
         print(f'[tanach] edition disagreements: {len(tanach_errors_rows):,}',
               flush=True)
         del vidx
@@ -780,21 +950,27 @@ def locate(spec, cfg, out_dir):
         need_path = os.path.join(out_dir, 'book_need.pkl')
         with open(need_path, 'wb') as f:
             pickle.dump(book_need, f, protocol=4)
+        cstats = passes['context'] = ReadStats()
         with _pool(spec, cfg, {'ctx_pairs': ctx_path,
                                'book_need': need_path}) as pool:
-            for i, (c, lc) in enumerate(
+            for i, (c, lc, st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
+                cstats.add(ReadStats.from_dict(st))
                 if i % 6 == 0:
                     print(f'  [context] chunk {i}/{len(chunks)} '
                           f'({time.time()-t0:.0f}s)', flush=True)
+        _fail_if_partial('locate', lstats, out_dir, passes=passes)
 
     # --- write the report database ---------------------------------------
+    # built under a temp name and moved into place only once complete, so a
+    # failed run never replaces the last good report.db
     db_path = os.path.join(out_dir, REPORT_DB_F)
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    con = sqlite3.connect(db_path)
+    tmp_path = db_path + '.tmp'
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    con = sqlite3.connect(tmp_path)
     con.executescript('''
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
@@ -841,6 +1017,8 @@ def locate(spec, cfg, out_dir):
     con.commit()
     corpus.enrich(con)
     con.close()
+    os.replace(tmp_path, db_path)
+    _write_coverage(out_dir, 'locate', lstats, passes=passes)
     print(f'[locate] occurrences={len(rows):,}  space_errors={len(all_joins):,}'
           f'  time={time.time()-t0:.0f}s -> {db_path}', flush=True)
 

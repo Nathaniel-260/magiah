@@ -83,7 +83,9 @@ books) runs in roughly **45 minutes** using only the Python standard library.
 
 ## Installation
 
-Requires Python ≥3.9. No third-party dependencies.
+Requires Python ≥3.9. Otzaria databases from schema 6 on store each line
+as a zstd frame; Python 3.14+ decodes them with the standard library, and
+older interpreters install `zstandard` automatically (`pip install .`).
 
 ```bash
 pip install .
@@ -96,7 +98,14 @@ encoding problems.
 
 ## Usage
 
-**Otzaria library** (auto-detects `C:\ProgramData\otzaria\books\seforim.db`):
+**Otzaria library** (auto-detects the `seforim.db` of the folder recorded in
+`%APPDATA%\otzaria\library_path.txt`, falling back to
+`C:\ProgramData\otzaria\books\seforim.db`). Both the old layout
+(`line.content`) and schema 6 (`line_content`, zstd with a stored
+dictionary) are read. Alternative editions in `version_line` are not
+scanned and are counted as skipped. Every stage writes
+`coverage_<stage>.json`, and a stage that could not decode some rows
+stops with an error instead of reporting a partial pass as complete:
 
 ```bash
 magiah all --otzaria --out results

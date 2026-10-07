@@ -13,7 +13,56 @@ import glob
 import os
 import sqlite3
 
-OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
+from .textsource import OtzariaDB, ReadStats, iter_file_lines
+
+LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
+
+
+def _read_library_path(path):
+    """The library folder named in Otzaria's ``library_path.txt``, or ''.
+
+    Runs at import time (through OTZARIA_DB), so it must never raise: a file
+    saved as UTF-16 or cp1255 used to stop every command, ``ui`` included,
+    with a UnicodeDecodeError. UTF-8 (with or without BOM) and UTF-16 with a
+    BOM are read; anything else falls back to the default path. Only the
+    first non-empty line counts, without surrounding quotes.
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(64 * 1024)
+        if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+            text = raw.decode('utf-16')
+        else:
+            text = raw.decode('utf-8-sig')
+    except (OSError, UnicodeError, ValueError):
+        return ''
+    for line in text.splitlines():
+        line = line.strip().strip('"\'').strip()
+        if line:
+            return line
+    return ''
+
+
+def default_otzaria_db():
+    """The seforim.db the Otzaria app actually uses on this machine.
+
+    The app records its library folder in ``%APPDATA%\\otzaria\\library_path.txt``;
+    the historical ProgramData path is only a last resort.
+    """
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        lib = _read_library_path(
+            os.path.join(appdata, 'otzaria', 'library_path.txt'))
+        try:
+            cand = os.path.join(lib, 'seforim.db')
+            if lib and os.path.isfile(cand):
+                return cand
+        except (OSError, ValueError):
+            pass
+    return LEGACY_OTZARIA_DB
+
+
+OTZARIA_DB = default_otzaria_db()
 
 
 def make_corpus(spec):
@@ -34,13 +83,30 @@ class SqliteCorpus:
         self.table = spec.get('table', 'line')
         self.id_col = spec.get('id_col', 'id')
         self.text_col = spec.get('text_col', 'content')
+        self.stats = ReadStats()
+        self._odb = None
+
+    def _otzaria(self):
+        """The schema-aware reader, for the otzaria preset."""
+        if self._odb is None:
+            self._odb = OtzariaDB(self.path)
+        return self._odb
+
+    def close(self):
+        if self._odb is not None:
+            self._odb.close()
+            self._odb = None
 
     def chunks(self, n):
-        con = sqlite3.connect(self.path)
-        lo, hi = con.execute(
-            f'SELECT MIN({self.id_col}), MAX({self.id_col}) FROM {self.table}'
-        ).fetchone()
-        con.close()
+        if self.spec.get('preset') == 'otzaria':
+            with OtzariaDB(self.path) as odb:
+                lo, hi = odb.id_range()
+        else:
+            con = sqlite3.connect(self.path)
+            lo, hi = con.execute(
+                f'SELECT MIN({self.id_col}), MAX({self.id_col}) '
+                f'FROM {self.table}').fetchone()
+            con.close()
         if lo is None:
             return []
         step = (hi - lo) // n + 1
@@ -60,23 +126,32 @@ class SqliteCorpus:
         """Yield (unit_id, doc_id, text); doc_id groups units into documents
         (books). Empty string when the table has no document column."""
         lo, hi = chunk
+        if self.spec.get('preset') == 'otzaria':
+            odb = self._otzaria()
+            for uid, doc, text in odb.iter_range(lo, hi, self.stats):
+                yield str(uid), str(doc), text
+            self.stats.version_lines_skipped += odb.count_version_lines(lo, hi)
+            return
         doc_col = self._doc_col()
         con = sqlite3.connect(self.path)
         try:
-            if doc_col:
-                for uid, doc, text in con.execute(
-                        f'SELECT {self.id_col}, {doc_col}, {self.text_col} '
-                        f'FROM {self.table} '
-                        f'WHERE {self.id_col}>=? AND {self.id_col}<? '
-                        f'AND {self.text_col} IS NOT NULL', (lo, hi)):
-                    yield str(uid), str(doc), text
-            else:
-                for uid, text in con.execute(
-                        f'SELECT {self.id_col}, {self.text_col} '
-                        f'FROM {self.table} '
-                        f'WHERE {self.id_col}>=? AND {self.id_col}<? '
-                        f'AND {self.text_col} IS NOT NULL', (lo, hi)):
-                    yield str(uid), '', text
+            doc_sel = doc_col if doc_col else "''"
+            for uid, doc, text in con.execute(
+                    f'SELECT {self.id_col}, {doc_sel}, {self.text_col} '
+                    f'FROM {self.table} '
+                    f'WHERE {self.id_col}>=? AND {self.id_col}<? '
+                    f'AND {self.text_col} IS NOT NULL', (lo, hi)):
+                if not isinstance(text, str):
+                    # a BLOB here would tokenize to nothing and look like an
+                    # empty line — count it as unreadable instead
+                    self.stats.decode_errors += 1
+                    if len(self.stats.error_samples) < 20:
+                        self.stats.error_samples.append(
+                            (str(uid), 'non-text value in text column'))
+                    continue
+                self.stats.lines += 1
+                self.stats.chars += len(text)
+                yield str(uid), str(doc), text
         finally:
             con.close()
 
@@ -85,6 +160,9 @@ class SqliteCorpus:
         if self.spec.get('preset') != 'otzaria':
             _default_enrich(con)
             return
+        if not os.path.isfile(self.path):
+            # ATTACH of a missing path silently creates an empty database
+            raise FileNotFoundError(self.path)
         con.execute("ATTACH DATABASE ? AS src", (self.path,))
         con.executescript('''
             CREATE TABLE occurrences_full AS
@@ -138,6 +216,7 @@ class TextDirCorpus:
         self.path = spec['path']
         self.pattern = spec.get('pattern', '**/*.txt')
         self.encoding = spec.get('encoding', 'utf-8')
+        self.stats = ReadStats()
 
     def _files(self):
         return sorted(glob.glob(os.path.join(self.path, self.pattern),
@@ -157,9 +236,16 @@ class TextDirCorpus:
     def iter_texts_docs(self, chunk):
         for fp in chunk:
             rel = os.path.relpath(fp, self.path)
-            with open(fp, encoding=self.encoding, errors='replace') as f:
-                for lineno, text in enumerate(f, 1):
+            try:
+                for lineno, text in enumerate(
+                        iter_file_lines(fp, self.encoding), 1):
+                    self.stats.lines += 1
+                    self.stats.chars += len(text)
                     yield f'{rel}:{lineno}', rel, text
+            except OSError as e:
+                self.stats.decode_errors += 1
+                if len(self.stats.error_samples) < 20:
+                    self.stats.error_samples.append((rel, repr(e)[:200]))
 
     def enrich(self, con):
         _default_enrich(con)

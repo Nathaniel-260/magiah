@@ -26,6 +26,8 @@ import os
 import sqlite3
 
 from .corpus import OTZARIA_DB
+from .textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
+                         split_lines)
 from .corpus_hybrid import (DEFAULT_LIBRARY, FALLBACK_ORIGIN,
                             FILE_UNIT_PREFIX, LibraryCorpus, _HDR_RE,
                             _header_text)
@@ -92,7 +94,7 @@ def list_library_books(library_dir=None, query='', limit=200):
     lib = LibraryCorpus({'type': 'library', 'path': library_dir})
     q = (query or '').strip()
     out = []
-    for rel in sorted(_scanned_files(library_dir, lib)):
+    for rel in sorted(_scanned_files(library_dir, lib, refresh=True)):
         title = os.path.splitext(rel.rsplit('/', 1)[-1])[0]
         if q and q not in title and q not in rel:
             continue
@@ -111,15 +113,16 @@ def list_library_books(library_dir=None, query='', limit=200):
 _scanned_cache = {}
 
 
-def _scanned_files(library_dir, lib):
+def _scanned_files(library_dir, lib, refresh=False):
     """The repo files a scan actually reads, cached per library dir.
 
     ``LibraryCorpus._files()`` walks ~17k files; a book scan asks for this
-    twice and the UI picker once more, so walking every time is wasteful.
-    Cached per process — the repo does not change mid-session.
+    twice, so the walk is cached. The repo DOES change mid-session (a user
+    adds a book and scans it), so the picker always refreshes and a cache
+    miss is re-checked before a book is refused.
     """
     key = os.path.abspath(library_dir)
-    hit = _scanned_cache.get(key)
+    hit = None if refresh else _scanned_cache.get(key)
     if hit is None:
         hit = frozenset(lib._files())
         _scanned_cache[key] = hit
@@ -127,10 +130,7 @@ def _scanned_files(library_dir, lib):
 
 
 def _connect_ro(path):
-    import urllib.request
-    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
-          + '?mode=ro'
-    con = sqlite3.connect(uri, uri=True, timeout=30.0)
+    con = sqlite3.connect(ro_uri(path), uri=True, timeout=30.0)
     con.execute('PRAGMA busy_timeout=30000')
     return con
 
@@ -165,8 +165,12 @@ def _read_text_file(path, encoding='utf-8'):
             f'הקובץ גדול מדי לסריקת ספר בודד ({size / 1e6:.0f} MB). '
             f'המגבלה היא {MAX_BOOK_BYTES / 1e6:.0f} MB.')
     try:
-        with open(path, encoding=encoding, errors='replace') as f:
-            return f.read().splitlines()
+        with open(path, encoding=encoding, errors='replace',
+                  newline='') as f:
+            # NOT str.splitlines(): it also breaks on U+2028 and friends,
+            # which would number lines differently from the full scan and
+            # from the patcher
+            return split_lines(f.read())
     except OSError as e:
         raise BookNotFound(f'לא ניתן לקרוא את הקובץ: {path} ({e})')
 
@@ -254,22 +258,30 @@ def _load_db_book(key, db_path):
         book_id = int(str(key).strip())
     except (TypeError, ValueError):
         raise BookNotFound(f'מזהה ספר לא תקין: {key}')
-    con = _connect_ro(db_path)
     try:
-        row = con.execute(
-            'SELECT b.title, COALESCE(s.name, \'\') FROM book b '
+        odb = OtzariaDB(db_path)
+    except TextSourceError as e:
+        raise BookNotFound(str(e))
+    stats = ReadStats()
+    try:
+        row = odb.con.execute(
+            "SELECT b.title, COALESCE(s.name, '') FROM book b "
             'LEFT JOIN source s ON s.id = b.sourceId WHERE b.id = ?',
             (book_id,)).fetchone()
         if row is None:
             raise BookNotFound(f'הספר לא נמצא במסד הנתונים (מזהה {book_id})')
         title, origin = row[0], row[1] or 'Unknown'
-        lines = [(str(uid), ref or '', content)
-                 for uid, content, ref in con.execute(
-                     'SELECT id, content, heRef FROM line '
-                     'WHERE bookId = ? AND content IS NOT NULL '
-                     'ORDER BY lineIndex, id', (book_id,))]
+        lines = [(str(uid), ref, text)
+                 for uid, ref, text in odb.book_lines(book_id, stats)]
     finally:
-        con.close()
+        odb.close()
+    if stats.unread():
+        # a book with unreadable (or missing) rows must not be scanned as if
+        # complete
+        raise BookNotFound(
+            f'{stats.unread():,} שורות בספר "{title}" לא פוענחו; '
+            f'הסריקה בוטלה כדי לא להציג תוצאה חלקית. '
+            f'דוגמה: {stats.error_samples[:1]}')
     if not lines:
         raise BookNotFound(f'לא נמצאו שורות טקסט בספר "{title}"')
     return BookText(str(book_id), title, origin, lines, 'db')
@@ -302,6 +314,8 @@ def _load_library_book(rel, library_dir):
     # its real path — so refuse, and point at the curated twin when there is
     # one.
     scanned = _scanned_files(library_dir, lib)
+    if rel not in scanned:
+        scanned = _scanned_files(library_dir, lib, refresh=True)
     if rel not in scanned:
         name = rel.rsplit('/', 1)[-1]
         twin = next((r for r in scanned
