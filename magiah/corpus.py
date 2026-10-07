@@ -18,6 +18,31 @@ from .textsource import OtzariaDB, ReadStats, iter_file_lines
 LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
 
 
+def _read_library_path(path):
+    """The library folder named in Otzaria's ``library_path.txt``, or ''.
+
+    Runs at import time (through OTZARIA_DB), so it must never raise: a file
+    saved as UTF-16 or cp1255 used to stop every command, ``ui`` included,
+    with a UnicodeDecodeError. UTF-8 (with or without BOM) and UTF-16 with a
+    BOM are read; anything else falls back to the default path. Only the
+    first non-empty line counts, without surrounding quotes.
+    """
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(64 * 1024)
+        if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+            text = raw.decode('utf-16')
+        else:
+            text = raw.decode('utf-8-sig')
+    except (OSError, UnicodeError, ValueError):
+        return ''
+    for line in text.splitlines():
+        line = line.strip().strip('"\'').strip()
+        if line:
+            return line
+    return ''
+
+
 def default_otzaria_db():
     """The seforim.db the Otzaria app actually uses on this machine.
 
@@ -26,14 +51,13 @@ def default_otzaria_db():
     """
     appdata = os.environ.get('APPDATA')
     if appdata:
+        lib = _read_library_path(
+            os.path.join(appdata, 'otzaria', 'library_path.txt'))
         try:
-            with open(os.path.join(appdata, 'otzaria', 'library_path.txt'),
-                      encoding='utf-8-sig') as f:
-                lib = f.read().strip()
             cand = os.path.join(lib, 'seforim.db')
             if lib and os.path.isfile(cand):
                 return cand
-        except OSError:
+        except (OSError, ValueError):
             pass
     return LEGACY_OTZARIA_DB
 

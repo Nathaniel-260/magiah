@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """The seforim.db reader: layouts, zstd rows, versions, coverage, lines."""
+import contextlib
+import io
+import json
 import os
+import pickle
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from magiah import book_source, core
+from magiah import book_scan, book_source, cli, core, corpus as corpus_mod
 from magiah.config import Config
 from magiah.corpus import make_corpus
 from magiah.corpus_hybrid import HybridCorpus, LibraryCorpus
@@ -55,9 +60,10 @@ def _train_dict():
     return _zstd.train_dict(samples, 4096)
 
 
-def make_schema6_db(path, corrupt_id=None, plain_id=None):
+def make_schema6_db(path, corrupt_id=None, plain_id=None, missing_id=None):
     """Schema 6: text in line_content, zstd frames with a stored dict, and
-    one alternative version with its own reading."""
+    one alternative version with its own reading. `missing_id` gets a `line`
+    row but no `line_content` row."""
     zd = _train_dict()
     con = sqlite3.connect(path)
     _base_schema(con)
@@ -76,6 +82,8 @@ def make_schema6_db(path, corrupt_id=None, plain_id=None):
     for i, b, t in LINES:
         con.execute('INSERT INTO line VALUES(?,?,?,?,NULL,?)',
                     (i, b, i, f'ref {i}', len(t)))
+        if i == missing_id:
+            continue
         if i == plain_id:
             val = t                                  # stored uncompressed
         elif i == corrupt_id:
@@ -266,6 +274,76 @@ class LineSplittingTest(unittest.TestCase):
             b = book_source.load_book('library', 'MoreBooks/ב.txt',
                                       library_dir=lib)
             self.assertEqual(len(b), 1)
+
+
+BROKEN_FRAME = b'\x28\xb5\x2f\xfd' + b'\x00' * 9
+
+
+def _corrupt_row(db_path, line_id):
+    con = sqlite3.connect(db_path)
+    con.execute('UPDATE line_content SET content = ? WHERE id = ?',
+                (BROKEN_FRAME, line_id))
+    con.commit()
+    con.close()
+
+
+def _otzaria_spec(db_path):
+    return {'type': 'sqlite', 'path': db_path, 'table': 'line',
+            'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+
+
+def _read(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def _coverage(out, stage):
+    with open(os.path.join(out, f'coverage_{stage}.json'),
+              encoding='utf-8') as f:
+        return json.load(f)
+
+
+class LibraryPathFileTest(unittest.TestCase):
+    """%APPDATA%\\otzaria\\library_path.txt in any encoding must not stop the
+    tool from starting (it is read at import time)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.appdata = self.tmp.name
+        os.makedirs(os.path.join(self.appdata, 'otzaria'))
+        self.lib = os.path.join(self.tmp.name, 'ספריית אוצריא')
+        os.makedirs(self.lib)
+        open(os.path.join(self.lib, 'seforim.db'), 'wb').close()
+        self.want = os.path.join(self.lib, 'seforim.db')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _resolve(self, data):
+        with open(os.path.join(self.appdata, 'otzaria', 'library_path.txt'),
+                  'wb') as f:
+            f.write(data)
+        with mock.patch.dict(os.environ, {'APPDATA': self.appdata}):
+            return corpus_mod.default_otzaria_db()
+
+    def test_utf8_with_bom(self):
+        self.assertEqual(self._resolve(self.lib.encode('utf-8-sig')),
+                         self.want)
+
+    def test_utf16_with_bom(self):
+        self.assertEqual(self._resolve(self.lib.encode('utf-16')), self.want)
+
+    def test_quotes_and_extra_lines(self):
+        data = f'\r\n  "{self.lib}"  \r\nsecond line\r\n'.encode('utf-8')
+        self.assertEqual(self._resolve(data), self.want)
+
+    def test_cp1255_falls_back_instead_of_crashing(self):
+        self.assertEqual(self._resolve(self.lib.encode('cp1255')),
+                         corpus_mod.LEGACY_OTZARIA_DB)
+
+    def test_garbage_falls_back(self):
+        self.assertEqual(self._resolve(b'\xff\x00\x81\x00\xfe'),
+                         corpus_mod.LEGACY_OTZARIA_DB)
 
 
 if __name__ == '__main__':
