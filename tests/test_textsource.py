@@ -304,6 +304,41 @@ def _coverage(out, stage):
 
 
 @unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class MissingContentRowTest(unittest.TestCase):
+    """A `line` row without its `line_content` row is unread, not absent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db, missing_id=3)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_range_read_counts_missing_row(self):
+        with OtzariaDB(self.db) as odb:
+            st = ReadStats()
+            got = [lid for lid, _, _ in odb.iter_range(1, 5, st)]
+        self.assertEqual(got, [1, 2, 4])
+        self.assertEqual(st.missing, 1)
+        self.assertEqual(st.unread(), 1)
+
+    def test_stage_with_missing_row_is_partial(self):
+        out = os.path.join(self.tmp.name, 'out')
+        os.makedirs(out)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(_otzaria_spec(self.db),
+                               Config(workers=1, n_chunks=2), out)
+        cov = _coverage(out, 'lexicon')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['missing'], 1)
+
+    def test_book_with_missing_row_is_refused(self):
+        with self.assertRaises(book_source.BookNotFound):
+            book_source.load_book('db', '2', db_path=self.db)
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
 class OpenFailureTest(unittest.TestCase):
     """A database that fails to open is released and reported in Hebrew."""
 

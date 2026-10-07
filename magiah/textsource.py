@@ -104,13 +104,19 @@ def connect_ro(path, timeout=30.0):
 class ReadStats:
     """Counts of what a reader actually read — the coverage evidence."""
 
+    # `missing`: a `line` row with no `line_content` row — unread, like a
+    # decode error, so it too makes a pass incomplete
     FIELDS = ('lines', 'chars', 'empty', 'decode_errors', 'null_content',
-              'version_lines', 'version_lines_skipped')
+              'version_lines', 'version_lines_skipped', 'missing')
 
     def __init__(self):
         for f in self.FIELDS:
             setattr(self, f, 0)
         self.error_samples = []          # first few (unit, message)
+
+    def unread(self):
+        """Rows that exist in the input but were not read."""
+        return self.decode_errors + self.missing
 
     def add(self, other):
         for f in self.FIELDS:
@@ -161,13 +167,17 @@ class OtzariaDB:
                 f'הקובץ אינו מסד ספרים של אוצריא (חסרות הטבלאות line/book): '
                 f'{path}')
         line_cols = {r[1] for r in self.con.execute('PRAGMA table_info(line)')}
+        # the 4th column says whether the content row exists at all: a LEFT
+        # JOIN, so a `line` without its `line_content` row is counted as
+        # missing instead of vanishing from the read unnoticed
         if 'line_content' in tables:
             self.layout = 'line_content'
-            self._text_sql = ('SELECT l.id, l.bookId, c.content FROM line l '
-                              'JOIN line_content c ON c.id = l.id')
+            self._text_sql = ('SELECT l.id, l.bookId, c.content, '
+                              'c.id IS NOT NULL FROM line l '
+                              'LEFT JOIN line_content c ON c.id = l.id')
         elif 'content' in line_cols:
             self.layout = 'inline'
-            self._text_sql = 'SELECT l.id, l.bookId, l.content FROM line l'
+            self._text_sql = 'SELECT l.id, l.bookId, l.content, 1 FROM line l'
         else:
             raise TextSourceError(f'לא נמצאה עמודת תוכן במסד: {path}')
         self.has_versions = {'book_version', 'version_line'} <= tables
@@ -205,7 +215,12 @@ class OtzariaDB:
             raise TextSourceError('תוכן בינארי במסד ללא מילון zstd')
         return self.decode_raw(bytes(value)).decode('utf-8')
 
-    def _decode_counted(self, unit, value, stats):
+    def _decode_counted(self, unit, value, stats, present=True):
+        if not present:
+            stats.missing += 1
+            if len(stats.error_samples) < 20:
+                stats.error_samples.append((str(unit), 'no line_content row'))
+            return None
         if value is None:
             stats.null_content += 1
             return None
@@ -238,8 +253,8 @@ class OtzariaDB:
         if book_ids_sql:
             sql += f' AND l.bookId IN ({book_ids_sql})'
             args.extend(params)
-        for lid, bid, raw in self.con.execute(sql, args):
-            text = self._decode_counted(lid, raw, stats)
+        for lid, bid, raw, present in self.con.execute(sql, args):
+            text = self._decode_counted(lid, raw, stats, present)
             if text is not None:
                 yield lid, bid, text
 
@@ -247,15 +262,15 @@ class OtzariaDB:
         """``[(line_id, heRef, text)]`` of one book in reading order."""
         stats = stats if stats is not None else ReadStats()
         if self.layout == 'line_content':
-            sql = ('SELECT l.id, l.heRef, c.content FROM line l '
-                   'JOIN line_content c ON c.id = l.id WHERE l.bookId = ? '
-                   'ORDER BY l.lineIndex, l.id')
+            sql = ('SELECT l.id, l.heRef, c.content, c.id IS NOT NULL '
+                   'FROM line l LEFT JOIN line_content c ON c.id = l.id '
+                   'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
         else:
-            sql = ('SELECT l.id, l.heRef, l.content FROM line l '
+            sql = ('SELECT l.id, l.heRef, l.content, 1 FROM line l '
                    'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
         out = []
-        for lid, ref, raw in self.con.execute(sql, (book_id,)):
-            text = self._decode_counted(lid, raw, stats)
+        for lid, ref, raw, present in self.con.execute(sql, (book_id,)):
+            text = self._decode_counted(lid, raw, stats, present)
             if text is not None:
                 out.append((lid, ref or '', text))
         return out
@@ -268,9 +283,9 @@ class OtzariaDB:
         for i in range(0, len(ids), 500):
             batch = ids[i:i + 500]
             ph = ','.join('?' * len(batch))
-            for lid, _bid, raw in self.con.execute(
+            for lid, _bid, raw, present in self.con.execute(
                     self._text_sql + f' WHERE l.id IN ({ph})', batch):
-                text = self._decode_counted(lid, raw, stats)
+                text = self._decode_counted(lid, raw, stats, present)
                 if text is not None:
                     out[lid] = text
         return out

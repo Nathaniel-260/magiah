@@ -121,13 +121,13 @@ class PartialRead(StageError):
 def _write_coverage(out_dir, stage, stats, extra=None):
     """Persist what a stage actually read (the run's coverage evidence)."""
     import json
-    info = {'stage': stage, 'complete': stats.decode_errors == 0,
+    info = {'stage': stage, 'complete': stats.unread() == 0,
             **stats.to_dict(), **(extra or {})}
     with open(os.path.join(out_dir, COVERAGE_F.format(stage=stage)), 'w',
               encoding='utf-8') as f:
         json.dump(info, f, ensure_ascii=False, indent=1)
     print(f'[{stage}] coverage: lines={stats.lines:,} chars={stats.chars:,} '
-          f'decode_errors={stats.decode_errors:,} '
+          f'decode_errors={stats.decode_errors:,} missing={stats.missing:,} '
           f'version_lines_skipped={stats.version_lines_skipped:,}',
           flush=True)
     return info
@@ -135,9 +135,9 @@ def _write_coverage(out_dir, stage, stats, extra=None):
 
 def _fail_if_partial(stage, stats, out_dir):
     """A pass with unreadable rows must never be reported as complete."""
-    if stats.decode_errors:
+    if stats.unread():
         raise PartialRead(
-            f'שלב "{stage}" לא הצליח לקרוא {stats.decode_errors:,} שורות '
+            f'שלב "{stage}" לא הצליח לקרוא {stats.unread():,} שורות '
             f'מהקלט, ולכן התוצאה חלקית ואינה מוצגת כהצלחה.' + chr(10) +
             f'פרטים: {os.path.join(out_dir, COVERAGE_F.format(stage=stage))}')
 
@@ -589,8 +589,8 @@ def _build_verse_index(db_path):
             for i in range(1, len(toks) - 1):
                 key = (toks[i - 1], toks[i + 1])
                 idx.setdefault(key, {}).setdefault(toks[i], set()).add(book_id)
-    if stats.decode_errors:
-        raise PartialRead(f'Tanach index: {stats.decode_errors:,} rows '
+    if stats.unread():
+        raise PartialRead(f'Tanach index: {stats.unread():,} rows '
                           f'could not be decoded')
     return idx
 

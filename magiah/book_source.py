@@ -275,10 +275,11 @@ def _load_db_book(key, db_path):
                  for uid, ref, text in odb.book_lines(book_id, stats)]
     finally:
         odb.close()
-    if stats.decode_errors:
-        # a book with unreadable rows must not be scanned as if complete
+    if stats.unread():
+        # a book with unreadable (or missing) rows must not be scanned as if
+        # complete
         raise BookNotFound(
-            f'{stats.decode_errors:,} שורות בספר "{title}" לא פוענחו; '
+            f'{stats.unread():,} שורות בספר "{title}" לא פוענחו; '
             f'הסריקה בוטלה כדי לא להציג תוצאה חלקית. '
             f'דוגמה: {stats.error_samples[:1]}')
     if not lines:
