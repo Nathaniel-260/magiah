@@ -712,3 +712,23 @@ class UnverifiedFinalLetterSplit(unittest.TestCase):
         rows = [r for r in res['findings'] if r['word'] == 'שלוםעליכם']
         self.assertEqual([(r['errtype'], r['suggestion']) for r in rows],
                          [('final_midword', '')])
+
+
+class FootnoteMarkerLetter(unittest.TestCase):
+    """A footnote marker letter glued to a word before ')' (e.g. 'word' + 'א)')
+    is notation, not an extra letter; a real word ending at ')' still counts."""
+
+    def _lex(self):
+        return {'אמר': 50, 'לנו': 50, 'שלום': 50, 'דבר': 50}
+
+    def test_marker_before_paren_is_not_an_extra_letter(self):
+        flagged = {'שלוםא': (1, 'edit1_ins', 'שלום', 50, 3.0)}
+        res = core.locate_line('אמר לנו שלוםא) דבר', self._lex(), small_cfg(),
+                               flagged)
+        self.assertEqual(res[0], [])
+
+    def test_other_errors_before_paren_are_still_reported(self):
+        flagged = {'שלמ': (1, 'nonfinal_end', 'שלם', 50, 3.0)}
+        res = core.locate_line('אמר לנו שלמ) דבר', self._lex(), small_cfg(),
+                               flagged)
+        self.assertEqual([o[0] for o in res[0]], ['שלמ'])

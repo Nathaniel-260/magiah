@@ -1183,6 +1183,11 @@ def locate_line(content, freq, cfg, flagged, prof=None):
         s, e = m.start(), m.end()
         if _editorial_adjacent(text, s, e):
             continue
+        # a footnote marker glued to a word ('...א)') is notation, not an
+        # extra last letter
+        if (e < len(text) and text[e] == ')' and fr[1] == 'edit1_ins'
+                and fr[2] == w[:-1]):
+            continue
         prev = toks[k - 1].group() if k else ''
         nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
         # a rare word right after a title (ר' פלוני, מוה"ר ר' פלוני) is a
