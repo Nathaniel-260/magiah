@@ -589,6 +589,46 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(counts['legacy_approvals_dropped'], 0)
         self.assertEqual(self._ui_state()[:3], (expect_st, expect_dec, 2))
 
+    def test_book_rescan_logs_and_withdraws_dropped_legacy_approvals(self):
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        for fid, w, unit, tan, sugg in ((1, 'פרץ', '7', 2, 'פרח'),
+                                        (2, 'בייתה', '8', 0, 'ביתה'),
+                                        (3, 'קפץ', '10', 2, 'קפה')):
+            con.execute('INSERT INTO findings(id, family, errtype, word, '
+                        'unit, ref, tanach, suggestion, source, origin, doc) '
+                        'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                        (fid, 'error', 'edit1_sub', w, unit, 'ר', tan, sugg,
+                         'ספר', 'Dicta', '3'))
+        con.commit()
+        uidb.set_status(con, self.dir, [1, 2], 'approved')
+        uidb.set_status(con, self.dir, [3], 'not_error')
+        con.close()
+
+        def found(word, unit, sugg):
+            return {'word': word, 'errtype': 'edit1_sub', 'suggestion': sugg,
+                    'score': 2.0, 'unit': unit, 'ref': 'ר', 'source': 'ספר',
+                    'origin': 'Dicta', 'snippet': 's'}
+        counts = uidb.import_book_scan(self.dir, {
+            'doc': '3', 'title': 'ספר',
+            'findings': [found('פרץ', '7', 'פרס'), found('בייתה', '8', 'ביתה'),
+                         found('קפץ', '10', 'קפה')]})
+        self.assertEqual(counts['legacy_approvals_dropped'], 1)
+        expect_st = {'פרץ': None, 'בייתה': 'approved', 'קפץ': 'not_error'}
+        expect_dec = {('בייתה', '8'): 'accept', ('קפץ', '10'): 'reject'}
+        st, dec, n, ids = self._ui_state()
+        self.assertEqual(st, expect_st)
+        self.assertEqual(dec, expect_dec)
+        con = uidb.connect(self.dir)
+        hist = con.execute("SELECT finding_id, word, old_status FROM history "
+                           "WHERE action = 'legacy_recheck'").fetchall()
+        uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        # logged against the re-scanned row, as a full refresh would
+        self.assertEqual([tuple(h) for h in hist],
+                         [(ids['פרץ'], 'פרץ', 'approved')])
+        self.assertEqual(self._ui_state()[:2], (expect_st, expect_dec))
+
 
 class PartialTanachReadTest(_DBCase):
     """A Tanach index built from a partial read never feeds report.db."""

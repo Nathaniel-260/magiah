@@ -639,6 +639,7 @@ def import_book_scan(outdir, result):
     where = '(f.doc = ? OR (f.doc IS NULL AND f.source = ?))'
     wparams = (doc, title)
     con = connect(outdir)
+    dec = None
     try:
         cur = con.cursor()
         cur.execute('BEGIN IMMEDIATE')
@@ -658,6 +659,11 @@ def import_book_scan(outdir, result):
                    r.status, r.note, r.custom_suggestion, r.updated_at
             FROM oldbook o JOIN review r ON r.finding_id = o.id
             WHERE o.lg = 0 OR r.status != 'approved' ''')
+        # ...and the legacy approvals it leaves behind (as in import_all)
+        cur.execute('''CREATE TEMP TABLE dropped AS
+            SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq
+            FROM oldbook o JOIN review r ON r.finding_id = o.id
+            WHERE o.lg != 0 AND r.status = 'approved' ''')
 
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
@@ -755,17 +761,40 @@ def import_book_scan(outdir, result):
              AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
         preserved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+        # -- log the dropped legacy approvals, withdraw their decisions -----
+        # The old ids are gone with their history; the entry points at the
+        # new row of the same identity when the re-scan still has one.
+        stale = cur.execute('''
+            SELECT n.id, d.w, d.u FROM dropped d LEFT JOIN newbook n
+              ON n.family = d.family AND n.w = d.w AND n.u = d.u
+             AND n.errtype = d.errtype AND n.r = d.r AND n.seq = d.seq
+            ''').fetchall()
+        ts = _now()
+        for fid, word, _unit in stale:
+            cur.execute('INSERT INTO history(ts, action, finding_id, word, '
+                        'old_status, new_status, note) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        (ts, 'legacy_recheck', fid, word, 'approved', None,
+                         'tanach_legacy'))
+        dec = _clear_dropped_decisions(con, outdir,
+                                       [(w, u) for _, w, u in stale])
+
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
-        for t in ('oldbook', 'oldrev', 'newbook'):
+        for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
+        if dec is not None:
+            dec.commit()
         return {'doc': doc, 'title': result.get('title'),
                 'added': added, 'replaced': old_total,
                 'preserved': preserved,
+                'legacy_approvals_dropped': len(stale),
                 'findings': len(result.get('findings') or []),
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
+        if dec is not None:
+            dec.close()
         con.close()
 
 
