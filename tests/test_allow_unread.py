@@ -736,6 +736,10 @@ class ScanPanelTest(_Case):
     def test_negative_value_is_refused(self):
         with self.assertRaises(ValueError):
             scanner._merge_config(self.out, {'allow_unread': -1})
+        # a count, written as one
+        for bad in ('1.5', 1.5, True, 'abc', float('inf')):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                scanner._merge_config(self.out, {'allow_unread': bad})
         self.assertEqual(
             scanner._merge_config(self.out, {'allow_unread': '2'})
             .allow_unread, 2)

@@ -138,11 +138,14 @@ def _merge_config(outdir, overrides):
                 if isinstance(val, str):
                     val = [v.strip() for v in val.splitlines() if v.strip()]
                 setattr(cfg, key, tuple(val))
+            elif key in Config.PER_RUN:
+                # a count, written as one: never a truncated 1.5 nor `true`
+                setattr(cfg, key, int(str(val).strip()))
             elif isinstance(cur, float):
                 setattr(cfg, key, float(val))
             else:
                 setattr(cfg, key, int(val))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 hebrew.SCAN_MESSAGES['bad_config_value'] + str(key))
     if cfg.allow_unread < 0:
