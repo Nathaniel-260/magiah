@@ -727,6 +727,64 @@ class LegacyTest(unittest.TestCase):
         finally:
             self.dir = base
 
+    def test_import_legacy_does_not_approve_tanach_backed_rows(self):
+        """An accept of the old tool (never owned by this UI) on a row backed
+        by Tanach evidence comes in as 'unsure', without its suggestion."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        # a row the new evidence backs (tanach = 4: the verse reads otherwise)
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "tanach, suggestion) VALUES(99, 'error', 'edit1_sub', "
+                    "'האוד', '32', 4, 'העוד')")
+        con.commit()
+        con.close()
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        dec.execute('CREATE TABLE decisions(word TEXT, unit TEXT, '
+                    'errtype TEXT, verdict TEXT, suggestion TEXT, '
+                    'source TEXT, ref TEXT, PRIMARY KEY(word, unit))')
+        dec.executemany('INSERT INTO decisions VALUES(?,?,?,?,?,?,?)', [
+            ('פרץ', '7', 'edit1_sub', 'accept', 'פרח', 'ספר', 'ר'),
+            ('אדוס', '9', 'tanach_edition', 'accept', 'אדום', 'ספר', 'ר'),
+            ('האוד', '32', 'edit1_sub', 'accept', 'האור', 'ספר', 'ר'),
+            ('בייתה', '8', 'edit1_sub', 'accept', 'בייתא', 'ספר', 'ר'),
+            ('קפץ', '10', 'edit1_sub', 'reject', 'קפה', 'ספר', 'ר')])
+        dec.commit()
+        dec.close()
+        con = uidb.connect(self.dir)
+        out = uidb.migrate_legacy_decisions(con, self.dir)
+        rows = {r[0]: tuple(r[1:]) for r in con.execute(
+            'SELECT f.word, r.status, r.custom_suggestion, r.note '
+            'FROM findings f JOIN review r ON r.finding_id = f.id')}
+        again = uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        self.assertEqual(out['recheck'], 3)
+        for w, sugg in (('פרץ', 'פרח'), ('אדוס', 'אדום'), ('האוד', 'האור')):
+            st, custom, note = rows[w]
+            self.assertEqual((st, custom), ('unsure', None), w)
+            self.assertIn(sugg, note)
+        # a row without Tanach evidence keeps the old tool's own correction
+        self.assertEqual(rows['בייתה'][:2], ('approved', 'בייתא'))
+        self.assertEqual(rows['קפץ'][0], 'not_error')
+        self.assertEqual((again['review'], again['recheck']), (0, 0))
+
+    def test_import_legacy_keeps_a_word_wide_approval_an_approval(self):
+        """decisions.db mirrors a word-wide approval as (word, '*', accept);
+        importing it back must not turn it into "not an error everywhere"."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
+                          ).fetchone()[0]
+        kid = con.execute("SELECT id FROM findings WHERE word = 'גשמ'"
+                          ).fetchone()[0]
+        uidb.set_status(con, self.dir, [fid], 'approved', scope='word')
+        uidb.set_status(con, self.dir, [kid], 'not_error', scope='word')
+        uidb.migrate_legacy_decisions(con, self.dir)
+        rules = dict(con.execute('SELECT word, status FROM word_rules'))
+        con.close()
+        self.assertEqual(rules, {'בייתה': 'approved', 'גשמ': 'not_error'})
+
 
 class BibleBookShareTest(unittest.TestCase):
     """The 90% heRef threshold is exact: 90% passes at every book size."""

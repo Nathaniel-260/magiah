@@ -824,13 +824,24 @@ def migrate_legacy_decisions(con, outdir):
     """OPT-IN migration of the old decisions.db into review / word_rules.
 
     accept -> approved (decision suggestion kept as custom_suggestion when it
-    differs from the finding's own suggestion); reject with unit='*' -> a
-    word_rules 'not_error' row; per-unit reject -> not_error; ignore ->
-    ignored. Matching is on (word, unit); existing review rows are never
-    overwritten. Returns counts.
+    differs from the finding's own suggestion); reject -> not_error; ignore
+    -> ignored. A unit='*' row becomes a word_rules row of the same status
+    (the old tool's "reject everywhere" -> 'not_error'). Matching is on
+    (word, unit); existing review rows are never overwritten. Returns counts.
+
+    Exception: an accept on a Tanach-backed finding (a tanach_legacy row, a
+    row with tanach != 0, or a tanach_* family row) is imported as 'unsure',
+    without a custom suggestion, its old suggestion kept only in the note
+    (counted in ``recheck``). Such an accept was given while the old trigram
+    heuristic replaced the suggestion and boosted the rank, so it may approve
+    a correction nobody would approve today. 'unsure' rather than skipping:
+    the user still sees that an old decision exists, and nothing is approved
+    or exported until they decide again. A differing suggestion alone is not
+    enough to demote: the old tool's "accept with my correction" writes one.
     """
     dec_path = os.path.join(outdir, DECISIONS_F)
-    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0}
+    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0,
+           'recheck': 0}
     if not os.path.exists(dec_path):
         return out
     dec = _decisions_con(outdir)
@@ -852,24 +863,34 @@ def migrate_legacy_decisions(con, outdir):
         # owns them and may delete them again on a later pending/unsure write
         _own_decision(con, word, unit)
         if unit == '*':
+            # the old tool writes '*' only for "reject everywhere"; this UI
+            # mirrors every word-wide status there, an approval included
             con.execute('INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (word, 'not_error', ts))
+                        (word, status, ts))
             out['word_rules'] += 1
             continue
         fids = con.execute(
-            'SELECT id, suggestion FROM findings WHERE word = ? AND unit = ?',
+            "SELECT id, suggestion, (COALESCE(tanach, 0) != 0 OR family IN "
+            "('tanach_error', 'tanach_match') OR COALESCE(extra, '') LIKE "
+            "'%tanach_legacy%') FROM findings WHERE word = ? AND unit = ?",
             (word, unit)).fetchall()
         if not fids:
             out['unmatched'] += 1
             continue
-        for fid, fsugg in fids:
-            custom = None
-            if (verdict == 'accept' and sugg and sugg != (fsugg or '')):
+        for fid, fsugg, tanach_backed in fids:
+            st, note, custom = status, None, None
+            if verdict == 'accept' and tanach_backed:
+                st = 'unsure'
+                note = hebrew.MESSAGES['legacy_accept_recheck'].format(
+                    sugg=sugg or '—')
+            elif (verdict == 'accept' and sugg and sugg != (fsugg or '')):
                 custom = sugg
             n = con.execute(
                 'INSERT OR IGNORE INTO review VALUES(?,?,?,?,?)',
-                (fid, status, None, custom, ts)).rowcount
+                (fid, st, note, custom, ts)).rowcount
             out['review'] += n
+            if st == 'unsure':
+                out['recheck'] += n
     con.commit()
     return out
 
