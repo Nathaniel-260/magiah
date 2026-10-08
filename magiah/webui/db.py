@@ -1159,13 +1159,21 @@ def set_status(con, outdir, ids, status, note=None, custom_suggestion=None,
     return out
 
 
+# history actions undo skips: its own entries, and imports' legacy drops
+NOT_UNDOABLE = "('undo', 'legacy_recheck')"
+
+
 def undo(con, outdir):
     """Revert the most recent not-yet-undone history group (one API call =
-    one ts = one undo step, bulk included). Returns what was reverted."""
+    one ts = one undo step, bulk included). Returns what was reverted.
+
+    A ``legacy_recheck`` entry is not a user action but an import dropping an
+    approval that rested on the old Tanach heuristic; undo never restores it
+    and reverts the user's last own action instead."""
     undone = {r[0] for r in con.execute(
         "SELECT note FROM history WHERE action = 'undo'")}
     row = con.execute(
-        "SELECT ts FROM history WHERE action != 'undo' "
+        f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
         + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
            if undone else '')
         + 'ORDER BY id DESC LIMIT 1',
@@ -1174,7 +1182,7 @@ def undo(con, outdir):
         return None
     group_ts = row[0]
     entries = con.execute(
-        "SELECT * FROM history WHERE ts = ? AND action != 'undo' "
+        f"SELECT * FROM history WHERE ts = ? AND action NOT IN {NOT_UNDOABLE} "
         'ORDER BY id DESC', (group_ts,)).fetchall()
     dec = _decisions_con(outdir)
     reverted = []

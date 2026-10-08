@@ -636,6 +636,46 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual([tuple(h) for h in hist],
                          [(ids['פרץ'], 'פרץ', 'approved')])
         self.assertEqual(self._ui_state()[:2], (expect_st, expect_dec))
+        # the re-scan removed this book's own history; its drop is not an
+        # undo step either (else undo would approve the re-scanned row)
+        con = uidb.connect(self.dir)
+        self.assertIsNone(uidb.undo(con, self.dir))
+        con.close()
+        self.assertIsNone(self._ui_state()[0]['פרץ'])
+
+    def _undo_all(self):
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        entries = []
+        try:
+            for _ in range(50):
+                res = uidb.undo(con, self.dir)
+                if res is None:
+                    break
+                entries += res['entries']
+        finally:
+            con.close()
+        return entries
+
+    def test_undo_never_restores_a_dropped_legacy_approval(self):
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        res = uidb.undo(con, self.dir)
+        con.close()
+        # the user's own last action (ירח -> fixed), not the refresh's drop
+        self.assertEqual([(e['word'], e['restored']) for e in res['entries']],
+                         [('ירח', 'pending')])
+        self.assertEqual(self._ui_state()[0],
+                         dict(self.EXPECT_ST, ירח=None))
+        # undoing everything walks back the user's actions only
+        entries = self._undo_all()
+        self.assertNotIn('approved', [e['restored'] for e in entries])
+        st, dec, n, _ = self._ui_state()
+        self.assertEqual(set(st.values()), {None})
+        self.assertEqual(dec, {})
+        self.assertEqual(n, 2)
 
     def test_locked_decisions_db_changes_nothing_and_heals(self):
         """decisions.db locked by another program (a read transaction, or a
