@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,29 @@ def scan_record(out):
 
 
 class RunStateCase(unittest.TestCase):
+    """Each test gets its own library and output folder. Most start from a
+    folder after one good full scan; that scan is run once per class and
+    copied (a full run costs seconds: every stage starts a worker pool)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._template = tempfile.TemporaryDirectory(prefix='magiah_rs_t_')
+        lib = os.path.join(cls._template.name, 'lib')
+        cls._template_out = os.path.join(cls._template.name, 'out')
+        make_library(lib)
+        rc, err = run_cli('all', '--textdir', lib, '--out',
+                          cls._template_out, *TUNE)
+        assert not rc, err
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._template.cleanup()
+
+    def start_from_good_scan(self):
+        """self.out as a good full scan left it (record, coverage, report)."""
+        shutil.copytree(self._template_out, self.out)
+        self.assertIsNone(runstate.scan_problem(self.out))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='magiah_rs_')
         self.lib = os.path.join(self.tmp.name, 'lib')
@@ -91,7 +115,7 @@ class PipelineRunTest(RunStateCase):
             os.path.join(self.out, runstate.STATE_DIR, 'scan.json.tmp')))
 
     def test_partial_read_is_stale_until_a_complete_run(self):
-        self.good_scan()
+        self.start_from_good_scan()
         break_library(self.lib)
         rc, err = self.scan()
         self.assertEqual(rc, 1)
@@ -103,7 +127,7 @@ class PipelineRunTest(RunStateCase):
         self.good_scan()                    # a complete run clears it
 
     def test_exception_is_recorded_with_its_stage(self):
-        self.good_scan()
+        self.start_from_good_scan()
         with mock.patch.object(core, 'detect',
                                side_effect=RuntimeError('boom')):
             with self.assertRaises(RuntimeError):
@@ -114,7 +138,7 @@ class PipelineRunTest(RunStateCase):
         self.assertEqual(p['reason'], 'RuntimeError: boom')
 
     def test_ctrl_c_is_recorded_cancelled(self):
-        self.good_scan()
+        self.start_from_good_scan()
         with mock.patch.object(core, 'locate',
                                side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -123,7 +147,7 @@ class PipelineRunTest(RunStateCase):
         self.assertEqual((p['state'], p['stage']), ('cancelled', 'locate'))
 
     def test_killed_process_reads_as_interrupted(self):
-        self.good_scan()
+        self.start_from_good_scan()
         # a real process, killed in the middle of `locate`: nothing gets to
         # finalize the record, exactly as with a power cut
         code = ('import os, sys; sys.path.insert(0, sys.argv[1]); '
@@ -153,7 +177,7 @@ class PipelineRunTest(RunStateCase):
         self.good_scan()
 
     def test_running_run_is_in_progress_not_interrupted(self):
-        self.good_scan()
+        self.start_from_good_scan()
         run = runstate.ScanRun(self.out, ['lexicon', 'detect'])
         try:
             run.enter('lexicon')
@@ -166,7 +190,7 @@ class PipelineRunTest(RunStateCase):
     def test_run_that_stops_before_its_planned_stages_is_stale(self):
         # the UI's default rescan: calibrate fails, so detect and locate —
         # which it was going to rebuild — never run
-        self.good_scan()
+        self.start_from_good_scan()
         stages = ['lexicon', 'calibrate', 'detect', 'locate', 'report']
         with runstate.ScanRun(self.out, stages, via='ui') as run:
             run.enter('lexicon')
@@ -177,7 +201,7 @@ class PipelineRunTest(RunStateCase):
         self.assertEqual(p['stages'], stages)
 
     def test_failures_outside_the_results_chain_are_not_stale(self):
-        self.good_scan()
+        self.start_from_good_scan()
         # calibrate alone, and the CSV export after a completed locate,
         # leave report.db exactly as current as it was
         with runstate.ScanRun(self.out, ['calibrate']) as run:
@@ -191,7 +215,7 @@ class PipelineRunTest(RunStateCase):
         self.assertIsNone(runstate.scan_problem(self.out))
 
     def test_second_concurrent_run_is_refused(self):
-        self.good_scan()
+        self.start_from_good_scan()
         with runstate.ScanRun(self.out, ['lexicon']):
             rc, err = self.scan()
             self.assertEqual(rc, 1)
@@ -199,7 +223,7 @@ class PipelineRunTest(RunStateCase):
         self.assertIsNone(runstate.scan_problem(self.out))
 
     def test_stage_subprocess_records_its_failure_in_the_parent_run(self):
-        self.good_scan()
+        self.start_from_good_scan()
         before = set(scan_record(self.out)['runs'])
         break_library(self.lib)
         run = runstate.ScanRun(self.out, ['lexicon', 'detect'], via='ui')
@@ -225,14 +249,13 @@ class PipelineRunTest(RunStateCase):
 
     def test_folder_without_marker_reports_nothing(self):
         # results from before run states were recorded work as they did
-        self.good_scan()
-        import shutil
+        self.start_from_good_scan()
         shutil.rmtree(os.path.join(self.out, runstate.STATE_DIR))
         self.assertIsNone(runstate.scan_problem(self.out))
         self.assertIsNone(runstate.book_problem(self.out))
 
     def test_unreadable_marker_is_unknown_and_replaced_by_next_run(self):
-        self.good_scan()
+        self.start_from_good_scan()
         with open(os.path.join(self.out, runstate.STATE_DIR, 'scan.json'),
                   'w', encoding='utf-8') as f:
             f.write('{"version": 1, "runs": ')
@@ -240,7 +263,7 @@ class PipelineRunTest(RunStateCase):
         self.good_scan()
 
     def test_concurrent_reads_always_see_a_whole_record(self):
-        self.good_scan()
+        self.start_from_good_scan()
         stop, seen = threading.Event(), []
 
         def reader():
@@ -268,7 +291,7 @@ class BookRunTest(RunStateCase):
                        '--textdir', self.lib, '--out', self.out, *TUNE)
 
     def test_failed_book_scan_leaves_the_scan_record_alone(self):
-        self.good_scan()
+        self.start_from_good_scan()
         before = scan_record(self.out)
         rc, err = self.book(os.path.join(self.lib, 'אין כזה.txt'))
         self.assertEqual(rc, 1)
@@ -280,7 +303,7 @@ class BookRunTest(RunStateCase):
         self.assertTrue(p['reason'])
 
     def test_successful_book_scan_does_not_clear_a_stale_scan(self):
-        self.good_scan()
+        self.start_from_good_scan()
         with mock.patch.object(core, 'locate',
                                side_effect=RuntimeError('boom')):
             with self.assertRaises(RuntimeError):
@@ -293,7 +316,7 @@ class BookRunTest(RunStateCase):
         self.assertIsNone(runstate.book_problem(self.out))
 
     def test_book_scan_clears_its_own_failure(self):
-        self.good_scan()
+        self.start_from_good_scan()
         self.book(os.path.join(self.lib, 'אין כזה.txt'))
         self.assertIsNotNone(runstate.book_problem(self.out))
         rc, err = self.book(os.path.join(self.lib, 'ספר.txt'))

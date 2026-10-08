@@ -38,7 +38,7 @@ def meta_status(out):
 class ResultStatusCase(RunStateCase):
 
     def import_good_scan(self):
-        self.good_scan()
+        self.start_from_good_scan()
         db.import_all(self.out)
         st = meta_status(self.out)['result_status']
         self.assertEqual(st['notices'], [])
@@ -115,7 +115,7 @@ class MetaTest(ResultStatusCase):
 
     def test_folder_from_before_run_states(self):
         # an old folder: no run_state/, a ui_review.db without report_mtime
-        self.good_scan()
+        self.start_from_good_scan()
         db.import_all(self.out)
         shutil.rmtree(os.path.join(self.out, runstate.STATE_DIR))
         con = sqlite3.connect(os.path.join(self.out, db.UI_DB_F))
@@ -125,8 +125,12 @@ class MetaTest(ResultStatusCase):
         st = meta_status(self.out)['result_status']
         self.assertEqual(st['notices'], [])
         self.assertFalse(st['stale'])
-        # report.db unchanged since the import still dates the results
-        self.assertTrue(st['results_at'])
+        self.assertIsNone(st['results_at'])      # not known, not guessed
+        # once it fails, the warning says so without inventing a date
+        break_library(self.lib)
+        self.scan()
+        (n,) = meta_status(self.out)['result_status']['notices']
+        self.assertIn('מסריקה קודמת שהושלמה', n['text'])
 
     def test_folder_from_before_run_states_with_partial_coverage(self):
         # the CLI refuses such results (coverage_problem); the UI agrees
@@ -147,6 +151,22 @@ class MetaTest(ResultStatusCase):
         self.assertIsNone(st['results_at'])
         self.assertEqual(n['title'], 'הסריקה האחרונה לא קראה את כל הקלט')
         self.assertIn('עדיין לא הושלמה', n['text'])
+
+    def test_completed_scan_that_found_nothing(self):
+        # a scan did complete — it is no "no scan has completed yet"
+        at = self.import_good_scan()
+        con = sqlite3.connect(os.path.join(self.out, db.UI_DB_F))
+        con.execute('DELETE FROM findings')
+        con.commit()
+        con.close()
+        break_library(self.lib)
+        self.scan()
+        st = meta_status(self.out)['result_status']
+        self.assertEqual(st['results_at'], at)
+        (n,) = st['notices']
+        self.assertIn(at, n['text'])
+        self.assertIn('לא מצאה ממצאים', n['text'])
+        self.assertNotIn('עדיין לא הושלמה', n['text'])
 
     def test_failed_book_scan_is_its_own_warning(self):
         self.import_good_scan()

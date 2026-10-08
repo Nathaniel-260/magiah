@@ -25,7 +25,6 @@ provider, and the banner shows it with no further change.
 """
 import os
 import time
-from datetime import datetime
 
 from .. import core, runstate
 from . import hebrew
@@ -56,27 +55,15 @@ def _report_mtime(outdir):
         return None
 
 
-def _imported_mtime(con, outdir):
-    """The mtime of the report.db the findings on screen were imported from,
-    or None if unknown.
-
-    Recorded by every import (``meta.report_mtime``). A ui_review.db from
-    before that has only ``last_import``; report.db then dates the results
-    only if it has not changed since — otherwise nothing is claimed.
+def _imported_mtime(con):
+    """The mtime of the report.db the findings on screen were imported from
+    (recorded by every import), or None — a ui_review.db imported before it
+    was recorded. Nothing is guessed: ``last_import`` also moves with every
+    single-book merge, so it cannot date the full scan's results.
     """
-    value = _meta(con, 'report_mtime')
-    if value is not None:
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    current, last = _report_mtime(outdir), _meta(con, 'last_import')
-    if current is None or last is None:
-        return None
     try:
-        return current if current <= datetime.fromisoformat(
-            last).timestamp() else None
-    except ValueError:
+        return float(_meta(con, 'report_mtime'))
+    except (TypeError, ValueError):
         return None
 
 
@@ -89,6 +76,18 @@ def _notice(kind, level, title, text, hint=None, details=None, action=None,
 
 def _stage_he(stage):
     return hebrew.STAGE_LABELS.get(stage, {}).get('hebrew', stage or '?')
+
+
+def _refused_stage(outdir):
+    """``(stage, message)`` of the first stage of the results chain whose
+    output the CLI refuses for a partial read — ``(None, None)`` if none.
+    Only an output the CLI refuses outright makes the results stale; one it
+    accepts as it is must not show up here."""
+    for stage in core._READ_STAGES:
+        problem = core.coverage_problem(outdir, stage)
+        if problem:
+            return stage, problem
+    return None, None
 
 
 def stale_notice(con, outdir, ctx):
@@ -107,16 +106,16 @@ def stale_notice(con, outdir, ctx):
             path=p['path'])
         details = p['reason']
     else:
-        for stage in core._READ_STAGES:
-            details = core.coverage_problem(outdir, stage)
-            if details:
-                break
-        else:
+        stage, details = _refused_stage(outdir)
+        if not stage:
             return None
         state = 'partial'
         what = T['stale_what']['coverage'].format(stage=_stage_he(stage))
-    if ctx['results_at']:
+    if ctx['results_at'] and ctx['has_results']:
         shown = T['stale_shown'].format(results_at=ctx['results_at'])
+    elif ctx['results_at']:
+        # a scan did complete — and found nothing
+        shown = T['stale_shown_empty'].format(results_at=ctx['results_at'])
     elif ctx['has_results']:
         shown = T['stale_shown_undated']
     else:
@@ -170,11 +169,12 @@ PROVIDERS = (stale_notice, refresh_notice, book_notice)
 
 def build(con, outdir):
     """The result status of `outdir` (`con`: its ui_review.db)."""
-    imported = _imported_mtime(con, outdir)
+    imported = _imported_mtime(con)
     has_results = con.execute('SELECT 1 FROM findings LIMIT 1').fetchone() \
         is not None
-    ctx = {'results_at': _clock(imported) if imported and has_results
-           else None,
+    # dated by the recorded import alone: also an import of a scan that
+    # found nothing, which is no "no scan yet"
+    ctx = {'results_at': _clock(imported) if imported else None,
            'has_results': has_results}
     notices = [n for n in (p(con, outdir, ctx) for p in PROVIDERS) if n]
     notices.sort(key=lambda n: LEVELS.index(n['level']))
