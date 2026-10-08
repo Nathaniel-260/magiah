@@ -547,14 +547,49 @@ class ReadStatsCountedTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _make_bible_book(self):
+        """Book 1 becomes a verified Bible book (category + title + heRefs);
+        its line 2 is the corrupt row."""
+        con = sqlite3.connect(self.db)
+        con.executescript('''
+            CREATE TABLE category(id INTEGER PRIMARY KEY, parentId INT,
+                                  title TEXT, level INT);
+            INSERT INTO category VALUES(1, NULL, 'תנ"ך', 0), (2, 1, 'תורה', 1);
+            ALTER TABLE book ADD COLUMN categoryId INT;
+            UPDATE book SET title = 'בראשית', categoryId = 2 WHERE id = 1;
+            UPDATE line SET heRef = 'בראשית, א, א' WHERE id = 1;
+            UPDATE line SET heRef = 'בראשית, א, ב' WHERE id = 2;
+        ''')
+        con.commit()
+        con.close()
+
     def test_tanach_passes_count_and_release_the_db(self):
+        # hasTeamim alone does not make a Bible edition: nothing is read
+        st = ReadStats()
+        core._build_verse_index(self.db, st)
+        self.assertEqual((st.lines, st.decode_errors), (0, 0))
+        # a verified Bible book with an unreadable row: counted
+        self._make_bible_book()
         st = ReadStats()
         vidx = core._build_verse_index(self.db, st)
         self.assertEqual(st.decode_errors, 1)
-        st2 = ReadStats()
-        core._tanach_edition_errors(self.db, vidx, st2)
-        self.assertEqual(st2.decode_errors, 1)
+        self.assertEqual(st.unread(), 1)
         os.remove(self.db)                      # closed: not locked
+        # the edition comparison works on the index alone — it does not read
+        # (or reopen) the database, so it has nothing further to count
+        rows = core._tanach_edition_errors(vidx)
+        self.assertEqual(rows, [])
+
+    def test_tanach_index_counts_missing_line_content(self):
+        self._make_bible_book()
+        con = sqlite3.connect(self.db)
+        con.execute('DELETE FROM line_content WHERE id = 1')
+        con.commit()
+        con.close()
+        st = ReadStats()
+        core._build_verse_index(self.db, st)
+        self.assertEqual(st.missing, 1)
+        self.assertEqual(st.unread(), 2)        # + the corrupt row 2
 
     def test_book_context_verification_refuses_partial_pass(self):
         with self.assertRaises(book_scan.BookScanError):

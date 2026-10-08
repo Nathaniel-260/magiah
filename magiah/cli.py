@@ -101,7 +101,11 @@ def _run_book_cmd(args, spec, cfg, out_dir):
         print(str(e), file=sys.stderr, flush=True)
         return 1
     from .webui import db as uidb
-    counts = uidb.import_book_scan(out_dir, result)
+    try:
+        counts = uidb.import_book_scan(out_dir, result)
+    except uidb.DecisionsLocked as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
     print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
           f"הוחלפו {counts['replaced']:,}, "
           f"נשמרו {counts['preserved']:,} החלטות", flush=True)

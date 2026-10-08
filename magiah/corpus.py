@@ -13,6 +13,7 @@ import glob
 import os
 import sqlite3
 
+from . import tanach
 from .textsource import OtzariaDB, ReadStats, iter_file_lines
 
 LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
@@ -164,17 +165,18 @@ class SqliteCorpus:
             # ATTACH of a missing path silently creates an empty database
             raise FileNotFoundError(self.path)
         con.execute("ATTACH DATABASE ? AS src", (self.path,))
-        con.executescript('''
+        con.execute(tanach.EVIDENCE_SCHEMA)
+        con.executescript(f'''
             CREATE TABLE occurrences_full AS
-              SELECT o.word, e.errtype,
-                     CASE WHEN o.tanach_sugg != '' THEN o.tanach_sugg
-                          ELSE e.suggestion END AS suggestion,
+              SELECT o.word, e.errtype, e.suggestion,
                      e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
                      o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet,
-                     COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc
+                     COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc,
+                     {tanach.ENRICH_COLS}
               FROM occurrences o
               JOIN errors e ON e.word = o.word
+              {tanach.ENRICH_JOIN}
               JOIN src.line l ON l.id = CAST(o.unit AS INTEGER)
               JOIN src.book b ON b.id = l.bookId
               LEFT JOIN src.source sr ON sr.id = b.sourceId;
@@ -188,7 +190,8 @@ class SqliteCorpus:
               LEFT JOIN src.source sr ON sr.id = b.sourceId;
             CREATE TABLE tanach_matches_full AS
               SELECT t.word, b.title AS source, l.heRef AS ref, t.unit,
-                     t.snippet, COALESCE(sr.name, 'Unknown') AS origin
+                     t.snippet, COALESCE(sr.name, 'Unknown') AS origin,
+                     t.evidence
               FROM tanach_matches t
               JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
               JOIN src.book b ON b.id = l.bookId
@@ -196,7 +199,7 @@ class SqliteCorpus:
             CREATE TABLE tanach_errors_full AS
               SELECT t.word, t.canonical, b.title AS source, l.heRef AS ref,
                      t.unit, t.snippet,
-                     COALESCE(sr.name, 'Unknown') AS origin
+                     COALESCE(sr.name, 'Unknown') AS origin, t.evidence
               FROM tanach_errors t
               JOIN src.line l ON l.id = CAST(t.unit AS INTEGER)
               JOIN src.book b ON b.id = l.bookId
@@ -252,24 +255,26 @@ class TextDirCorpus:
 
 
 def _default_enrich(con):
-    con.executescript('''
+    con.execute(tanach.EVIDENCE_SCHEMA)
+    con.executescript(f'''
         CREATE TABLE occurrences_full AS
           SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
                  o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet,
-                 '' AS origin, o.doc AS doc
-          FROM occurrences o JOIN errors e ON e.word = o.word;
+                 '' AS origin, o.doc AS doc, {tanach.ENRICH_COLS}
+          FROM occurrences o JOIN errors e ON e.word = o.word
+          {tanach.ENRICH_JOIN};
         CREATE TABLE space_errors_full AS
           SELECT part1, part2, joined, join_freq,
                  '' AS source, '' AS ref, unit, snippet, '' AS origin
           FROM space_errors;
         CREATE TABLE tanach_matches_full AS
           SELECT word, doc AS source, '' AS ref, unit, snippet,
-                 '' AS origin
+                 '' AS origin, evidence
           FROM tanach_matches;
         CREATE TABLE tanach_errors_full AS
           SELECT word, canonical, '' AS source, '' AS ref, unit, snippet,
-                 '' AS origin
+                 '' AS origin, evidence
           FROM tanach_errors;
         DROP TABLE occurrences;
         DROP TABLE space_errors;

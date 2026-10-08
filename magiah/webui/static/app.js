@@ -853,6 +853,37 @@ async function openDrawer(id) {
   renderDrawer(r, history);
 }
 
+// Each candidate correction with the evidence behind it: the detector's, and
+// the reading of the aligned verse (works / independent sources / alignment).
+function altList(word, alts) {
+  const box = el("div", { class: "alt-list" });
+  for (const a of alts) {
+    if (!a || typeof a !== "object") continue;
+    const by = a.by === "tanach" ? "נוסח המקרא" : "הגלאי";
+    const parts = [];
+    if (a.by === "tanach") {
+      if (a.ref) parts.push(a.ref);
+      if (a.works != null) parts.push("ספרים: " + a.works);
+      if (a.independent_sources != null) parts.push("מקורות בלתי תלויים: " + a.independent_sources);
+      if (a.occurrences != null) parts.push("מהדורות: " + a.occurrences);
+      if (a.aligned_tokens != null) parts.push("מילים מיושרות: " + a.aligned_tokens);
+    } else if (a.agrees_with_tanach) {
+      parts.push("זהה לנוסח המקרא");
+    }
+    box.append(el("div", null,
+      el("bdi", null, (word || "") + " ← " + (a.suggestion || "—")),
+      " (" + by + ")", parts.length ? " · " + parts.join(" · ") : ""));
+  }
+  return box;
+}
+
+// Hebrew label of a Tanach evidence kind / reason code (from /api/meta);
+// anything unknown — a user's own note included — is shown as-is.
+function evLabel(code) {
+  const m = (S.meta && S.meta.evidence_labels) || {};
+  return (typeof code === "string" && m[code]) || code;
+}
+
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
@@ -944,7 +975,17 @@ function renderDrawer(r, history) {
   if (typeof extra === "string" && extra) { try { extra = JSON.parse(extra); } catch (e) { extra = null; } }
   if (extra && typeof extra === "object") {
     for (const [k, v] of Object.entries(extra)) {
-      dl.append(el("dt", null, "פרטים: " + k), el("dd", null, el("bdi", null, String(v))));
+      if (k === "alternatives") {
+        // null: the evidence names no alternative to the detector's suggestion
+        if (Array.isArray(v) && v.length)
+          dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
+        continue;
+      }
+      const txt = (v && typeof v === "object") ? JSON.stringify(v)
+        : typeof v === "boolean" ? (v ? "כן" : "לא")
+        : (k === "evidence_kind" || k === "reason") ? String(evLabel(v)) : String(v);
+      const kl = ((S.meta && S.meta.extra_labels) || {})[k];
+      dl.append(el("dt", null, kl || ("פרטים: " + k)), el("dd", null, el("bdi", null, txt)));
     }
   }
   fSec.append(dl);
@@ -956,7 +997,7 @@ function renderDrawer(r, history) {
     const from = h.old_status ? statusInfo(h.old_status).hebrew : "—";
     const to = h.new_status ? statusInfo(h.new_status).hebrew : "—";
     hSec.append(el("div", { class: "h-item" },
-      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + h.note : ""));
+      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + evLabel(h.note) : ""));
   }
   body.append(hSec);
 }

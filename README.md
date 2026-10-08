@@ -31,7 +31,38 @@ suspected correction can be **verified against the corpus itself**.
 | **Abbreviation that lost its gershayim** | `רמבם` → `רמב"ם` | the quoted form must be a frequent abbreviation in the corpus |
 | **Book-specific OCR errors** | ד↔ר confusion throughout one scanned book | per-book OCR profiles learned by calibration allow a sensitized rescan of books with a proven systematic confusion |
 | **Spelling variant** (reported separately) | `חבותיו` ↔ `חובותיו` | an extra/missing ו or י is usually ktiv male/chaser variation, not a typo — exported to its own file so *you* decide the policy |
-| **Deviation from Tanach** (self-validating) | a verse quoted with one word off | verse trigrams are indexed across ~100 Tanach editions; a reading is only "canonical" if 2+ editions agree, and a single edition deviating from 3+ agreeing editions is itself reported as a suspected *edition* error — the Tanach text is never blindly trusted |
+| **Deviation from Tanach** (self-validating) | a verse quoted with one word off | only verified Bible books take part (see *Tanach evidence* below); a quotation must align with one verse position, and the verse reading must be backed by 2+ independent sources — it is stored as an alternative next to the detector's suggestion, and ranks higher only when the two agree |
+
+### Tanach evidence
+
+* **Which texts are editions.** A book counts only when it sits under
+  תנ"ך → תורה/נביאים/כתובים, its title is one of the 39 books, and its
+  lines carry `<book>, <chapter>, <verse>` heRefs. `hasTeamim` is not a
+  criterion (siddurim, haftara collections and commentaries carry
+  cantillation too). Each book row and each `book_version` with its own
+  reading is an edition; editions are grouped into **independent sources**
+  by provenance (the host of `versionSource`), so several renderings of one
+  upload count once.
+* **Quotations.** The context must align with a single verse position:
+  at least 5 consecutive context tokens (one on each side of the word) and at
+  least 2 *distinctive* ones (3+ letters, fewer than 200 occurrences in the
+  Tanach), so a run of common words cannot pin a rabbinic phrase to a verse.
+  Qere/ketiv slots, a single inner ו/י (male/haser) and readings backed by one
+  source are labelled, never counted.
+* **Ranking.** `tanach = 3` (rank +4) only when the verse reading equals the
+  detector's suggestion. `tanach = 4` means the verse reads otherwise: both
+  candidates are kept (`alternatives`, `tanach_reading`) for a human to
+  decide, with no bonus. `tanach = 2` marks findings of the old trigram
+  heuristic: no bonus, flagged `tanach_legacy` for re-check in the review UI.
+* **Edition errors need three independent sources.** A reading is reported as
+  an edition error (`tanach_edition_variant`) only when one source stands
+  against at least two independent sources that agree. With two sources a
+  disagreement is one witness against another and nobody can be outvoted,
+  so it is reported as `tanach_edition_unresolved` (rank 0, with a `reason`:
+  one_against_one, intra_source, plene, qere_ketiv, …), as are disagreements
+  between renderings of the same source. The current Otzaria database has two
+  independent Tanach sources (Wikisource's Miqra al pi ha-Masorah and
+  tanach.us), so it yields unresolved rows only.
 
 Every finding gets a confidence score; reports are sorted so genuine errors
 concentrate at the top, and each class also gets a high-precision
@@ -252,11 +283,11 @@ titles, references and source-repository names from Otzaria's schema. Use
 
 | File | Contents |
 |---|---|
-| `errors_<type>.csv` | one ranked CSV per error class: word, suggested correction, confidence rank, context-verification hits, book, snippet |
+| `errors_<type>.csv` | one ranked CSV per error class: word, suggested correction, the aligned verse's reading (`tanach_reading`, when 2+ sources back it), confidence rank, context-verification hits, book, snippet |
 | `errors_<type>_verified.csv` | high-precision subset (context-verified or correction already used in the same book) |
 | `spelling_variants.csv` | ktiv male/chaser ו/י differences — policy decisions, not typos |
 | `space_errors.csv` | extra-space findings |
-| `tanach_errors.csv` / `tanach_matches.csv` / `tanach_edition_errors.csv` | deviations from multi-edition-verified Tanach text / silent confirmations / suspected errors in the editions themselves |
+| `tanach_matches.csv` / `tanach_edition_errors.csv` | quotations confirmed by 2+ independent sources / edition disagreements (`evidence` JSON: variant vs. unresolved, witnesses) |
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |

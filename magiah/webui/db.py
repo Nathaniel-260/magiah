@@ -25,9 +25,16 @@ their rank is documented per family:
 
 * extra_space  — rank = round(log10(join_freq + 1), 2)  (log-scaled join
   frequency: the more often the joined form appears, the more confident).
-* tanach_edition — rank = 4.0 flat (mirrors the ``tanach = 2`` bonus in
-  RANK_SQL: a deviation from the agreed Tanach text is strong evidence).
+* tanach_edition — rank = 4.0 flat (mirrors the ``tanach = 3`` bonus in
+  RANK_SQL) for verified rows (report.db carries an ``evidence`` column);
+  0.0 for rows of the old trigram heuristic.
 * tanach_match — rank = 0.0 (informational only).
+
+Tanach findings of the old heuristic (``tanach = 2``, or tanach_* rows of a
+report.db without an ``evidence`` column) are marked
+``{"evidence_kind": "tanach_legacy", "recheck": true}`` in ``extra`` and get
+no rank bonus. A review decision made before that mark existed is NOT carried
+onto them: it was given on the strength of evidence now known to be unsound.
 * tokdiag      — rank = round(log10(freq + 1), 2) (log-scaled frequency).
 
 decisions.db sync-back
@@ -73,7 +80,7 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 2 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
 
 VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 # ---------------------------------------------------------------------------
@@ -157,13 +164,38 @@ CREATE INDEX IF NOT EXISTS idx_fe_key ON file_edits(book_key);
 SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
                  'owned_decisions', 'file_edits'}
 
-# effective status: per-finding review wins, else the word rule, else pending
-EFF = "COALESCE(r.status, w.status, 'pending')"
+# effective status: per-finding review wins, else the word rule, else pending.
+# A word-wide approval does not reach a row marked tanach_legacy: such a row
+# needs its own re-check, like a dropped per-row approval (a word-wide
+# not_error / ignored judges the word itself and still applies).
+EFF = ("COALESCE(r.status, CASE WHEN w.status IN ('approved', 'fixed') AND "
+       "COALESCE(f.extra, '') LIKE '%tanach_legacy%' THEN NULL "
+       "ELSE w.status END, 'pending')")
 JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
          'LEFT JOIN word_rules w ON w.word = f.word')
 
 KEY_COLS = "family, COALESCE(word,''), COALESCE(unit,''), errtype, " \
            "COALESCE(ref,'')"
+
+# Tanach evidence of the old (prev, next)-trigram heuristic. `lg` per row:
+# 0 = not legacy, 1 = legacy and already marked for re-check, 2 = legacy from
+# before the mark. An APPROVAL given under other evidence than the row now has
+# may rest on the legacy suggestion and is dropped (logged in `history`);
+# not_error / ignored / unsure judge the word itself and are kept.
+LEGACY_EXTRA = json.dumps({'evidence_kind': 'tanach_legacy', 'recheck': True})
+_NEW_TANACH = ("COALESCE({p}extra,'') LIKE '%tanach_verse_match%' OR "
+               "COALESCE({p}extra,'') LIKE '%tanach_edition_variant%' OR "
+               "COALESCE({p}extra,'') LIKE '%tanach_edition_unresolved%'")
+LEGACY_LG_SQL = (
+    "CASE WHEN COALESCE({p}extra,'') LIKE '%tanach_legacy%' THEN 1 "
+    "WHEN COALESCE({p}tanach,0) = 2 OR ({p}family IN "
+    "('tanach_error','tanach_match') AND NOT (" + _NEW_TANACH + ")) "
+    "THEN 2 ELSE 0 END")
+
+
+def _legacy_lg(prefix=''):
+    return LEGACY_LG_SQL.format(p=prefix)
+
 
 # Reading-order sort key for a unit id. DB units are plain integers, but
 # file-based units are 'file:<relpath>:<lineno>' (§9c) — a plain
@@ -213,9 +245,13 @@ def connect(outdir):
     return con
 
 
+DECISIONS_TIMEOUT = 30.0      # seconds to wait for a decisions.db lock
+
+
 def _decisions_con(outdir):
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=30.0)
-    con.execute('PRAGMA busy_timeout=30000')
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F),
+                          timeout=DECISIONS_TIMEOUT)
+    con.execute(f'PRAGMA busy_timeout={int(DECISIONS_TIMEOUT * 1000)}')
     if not con.execute("SELECT name FROM sqlite_master WHERE type='table' "
                        "AND name='decisions'").fetchone():
         con.execute('''CREATE TABLE IF NOT EXISTS decisions(
@@ -233,6 +269,75 @@ def _decisions_con(outdir):
 def _find_tokdiag_csv(outdir):
     hits = sorted(glob.glob(os.path.join(outdir, TOKDIAG_GLOB)))
     return hits[-1] if hits else None
+
+
+def _tanach_extra(evidence_json, verified):
+    if not verified:
+        return json.loads(LEGACY_EXTRA)
+    try:
+        return json.loads(evidence_json) if evidence_json else {}
+    except ValueError:
+        return {}
+
+
+class DecisionsLocked(PermissionError, ValueError):
+    """decisions.db is locked by another program. Carries a Hebrew message;
+    the server answers 423 with it, a book scan reports it as its error."""
+
+
+def _clear_dropped_decisions(con, outdir, keys):
+    """Withdraw the decisions.db 'accept' rows of dropped legacy approvals.
+
+    The approval is gone from `review`, but its mirror in decisions.db still
+    carries the old Tanach suggestion: the old review tool would keep honouring
+    it, and /api/import_legacy would turn it back into an approval. Only rows
+    this UI owns are removed (an unowned row is the old tool's own decision),
+    and only while no other approved / fixed finding still stands on the same
+    (word, unit) key. The `history` record of the drop is kept.
+
+    Order: runs inside the caller's still-open ui_review.db transaction and
+    commits decisions.db FIRST; the ownership markers are deleted (in the
+    caller's transaction) only after that commit. If the caller's commit then
+    fails, the next refresh recomputes the same drop and finds nothing left
+    to withdraw. If decisions.db cannot be written (another program holds a
+    lock on it) nothing is withdrawn and :class:`DecisionsLocked` is raised,
+    so the caller rolls back the drop as well and the next refresh redoes
+    both. Returns the number of decisions withdrawn.
+    """
+    keys = {(w or '', u or '') for w, u in keys}
+    if not keys or not os.path.exists(os.path.join(outdir, DECISIONS_F)):
+        return 0
+    todo = [(word, unit) for word, unit in sorted(keys)
+            if _owns_decision(con, word, unit) and not con.execute(
+                '''SELECT 1 FROM review r
+                   JOIN findings f ON f.id = r.finding_id
+                   WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
+                     AND r.status IN ('approved', 'fixed') LIMIT 1''',
+                (word, unit)).fetchone()]
+    if not todo:
+        return 0
+    dec = None
+    try:
+        dec = _decisions_con(outdir)
+        gone = []
+        for word, unit in todo:
+            dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
+                        "AND verdict = 'accept'", (word, unit))
+            # nothing of ours left under this key (also after a retry)
+            if not dec.execute('SELECT 1 FROM decisions '
+                               'WHERE word = ? AND unit = ?',
+                               (word, unit)).fetchone():
+                gone.append((word, unit))
+        dec.commit()
+    except sqlite3.OperationalError as e:
+        raise DecisionsLocked(hebrew.MESSAGES['decisions_locked']) from e
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
+    for word, unit in gone:
+        con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
+                    (word, unit))
+    return len(gone)
 
 
 def import_all(outdir, migrate_legacy=False):
@@ -275,14 +380,23 @@ def import_all(outdir, migrate_legacy=False):
 
         counts = {}
         # -- family 'error' ------------------------------------------------
+        occ_cols = {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(occurrences_full)')}
+        evid = ''
+        if {'evidence_kind', 'alternatives'} <= occ_cols:
+            evid = ("""WHEN evidence_kind IS NOT NULL THEN
+                       '{"evidence_kind": "' || evidence_kind ||
+                       '", "alternatives": ' || COALESCE(alternatives, 'null')
+                       || '}'""")
         cur.execute(f'''
             INSERT INTO imp
             SELECT 'error', errtype, word, suggestion, score,
                    ROUND({RANK_SQL}, 2), ctx_hits, sugg_local, book_repeat,
                    tanach,
                    CASE WHEN {VERIFIED_SQL} THEN 1 ELSE 0 END,
-                   origin, source, ref, unit, doc, snippet, NULL
-            FROM rep.occurrences_full ORDER BY rowid''')
+                   origin, source, ref, unit, doc, snippet,
+                   CASE WHEN tanach = 2 THEN ? {evid} ELSE NULL END
+            FROM rep.occurrences_full ORDER BY rowid''', (LEGACY_EXTRA,))
         counts['error'] = cur.rowcount
 
         # -- family 'extra_space' -------------------------------------------
@@ -305,27 +419,38 @@ def import_all(outdir, migrate_legacy=False):
 
         # -- family 'tanach_error' -------------------------------------------
         rows = []
-        for word, canonical, src, ref, unit, snip, org in cur.execute(
-                'SELECT word, canonical, source, ref, unit, snippet, origin '
-                'FROM rep.tanach_errors_full ORDER BY rowid').fetchall():
+        verified = 'evidence' in {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(tanach_errors_full)')}
+        for word, canonical, src, ref, unit, snip, org, evid in cur.execute(
+                'SELECT word, canonical, source, ref, unit, snippet, origin, '
+                + ('evidence' if verified else 'NULL') +
+                ' FROM rep.tanach_errors_full ORDER BY rowid').fetchall():
+            extra = _tanach_extra(evid, verified)
+            extra['canonical'] = canonical
+            # only an outvoted minority reading ranks; unresolved rows inform
+            rank = 4.0 if extra.get('evidence_kind') == \
+                'tanach_edition_variant' else 0.0
             rows.append((
                 'tanach_error', 'tanach_edition', word, canonical,
-                4.0, 4.0, None, None, None, None, 0, org, src, ref, unit,
-                None, snip,
-                json.dumps({'canonical': canonical}, ensure_ascii=False)))
+                rank, rank, None, None, None, None, 0, org, src, ref, unit,
+                None, snip, json.dumps(extra, ensure_ascii=False)))
         cur.executemany('INSERT INTO imp VALUES(' +
                         ','.join('?' * 18) + ')', rows)
         counts['tanach_error'] = len(rows)
 
         # -- family 'tanach_match' -------------------------------------------
         rows = []
-        for word, src, ref, unit, snip, org in cur.execute(
-                'SELECT word, source, ref, unit, snippet, origin '
-                'FROM rep.tanach_matches_full ORDER BY rowid').fetchall():
+        verified = 'evidence' in {r[1] for r in cur.execute(
+            'PRAGMA rep.table_info(tanach_matches_full)')}
+        for word, src, ref, unit, snip, org, evid in cur.execute(
+                'SELECT word, source, ref, unit, snippet, origin, '
+                + ('evidence' if verified else 'NULL') +
+                ' FROM rep.tanach_matches_full ORDER BY rowid').fetchall():
             rows.append((
                 'tanach_match', 'tanach_match', word, None,
                 0.0, 0.0, None, None, None, None, 0, org, src, ref, unit,
-                None, snip, None))
+                None, snip, json.dumps(_tanach_extra(evid, verified),
+                                       ensure_ascii=False)))
         cur.executemany('INSERT INTO imp VALUES(' +
                         ','.join('?' * 18) + ')', rows)
         counts['tanach_match'] = len(rows)
@@ -367,7 +492,7 @@ def import_all(outdir, migrate_legacy=False):
 
         # -- stable-id assignment (see module docstring) ---------------------
         cur.execute(f'''CREATE TEMP TABLE imp2 AS
-            SELECT imp.*, rowid AS irow,
+            SELECT imp.*, rowid AS irow, {_legacy_lg()} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY rowid) AS seq
             FROM imp''')
@@ -375,14 +500,15 @@ def import_all(outdir, migrate_legacy=False):
             family, word, unit, errtype, ref, seq)''')
         cur.execute(f'''CREATE TEMP TABLE oldmap AS
             SELECT id, family, COALESCE(word,'') AS w, COALESCE(unit,'') AS u,
-                   errtype, COALESCE(ref,'') AS r,
+                   errtype, COALESCE(ref,'') AS r, {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY id) AS seq
             FROM findings f''')
         cur.execute('''CREATE INDEX temp.ix_oldmap ON oldmap(
             family, w, u, errtype, r, seq)''')
         cur.execute('''CREATE TEMP TABLE assign AS
-            SELECT i.irow AS irow, o.id AS old_id
+            SELECT i.irow AS irow, o.id AS old_id,
+                   (o.lg = 2 OR o.lg != i.lg) AS lg_changed
             FROM imp2 i LEFT JOIN oldmap o
               ON o.family = i.family AND o.w = COALESCE(i.word, '')
              AND o.u = COALESCE(i.unit, '') AND o.errtype = i.errtype
@@ -443,10 +569,28 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute("INSERT OR REPLACE INTO meta VALUES('max_finding_id', ?)",
                     (str(max(max_id, new_max)),))
 
+        # approvals that may rest on legacy Tanach evidence: re-check
+        stale = cur.execute('''
+            SELECT r.finding_id, f.word, f.unit FROM review r
+            JOIN assign a ON a.old_id = r.finding_id AND a.lg_changed
+            JOIN findings f ON f.id = r.finding_id
+            WHERE r.status = 'approved' ''').fetchall()
+        ts = _now()
+        for fid, word, _unit in stale:
+            cur.execute('INSERT INTO history(ts, action, finding_id, word, '
+                        'old_status, new_status, note) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        (ts, 'legacy_recheck', fid, word, 'approved', None,
+                         'tanach_legacy'))
+            cur.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
+        counts['legacy_approvals_dropped'] = len(stale)
+
         # drop review rows of vanished findings; count what survived
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
                        (SELECT id FROM findings)''')
         preserved = cur.execute('SELECT COUNT(*) FROM review').fetchone()[0]
+        withdrawn = _clear_dropped_decisions(con, outdir,
+                                             [(w, u) for _, w, u in stale])
 
         counts.update({
             'total': total,
@@ -455,6 +599,7 @@ def import_all(outdir, migrate_legacy=False):
             'added': total - matched - kept,
             'removed': old_total - matched - kept,
             'preserved': preserved,
+            'legacy_decisions_withdrawn': withdrawn,
             'book_scan_kept': kept,
         })
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
@@ -530,6 +675,7 @@ def import_book_scan(outdir, result):
             SELECT f.id AS id, f.family AS family,
                    COALESCE(f.word,'') AS w, COALESCE(f.unit,'') AS u,
                    f.errtype AS errtype, COALESCE(f.ref,'') AS r,
+                   {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
                                       ORDER BY f.id) AS seq
             FROM findings f WHERE {where}''', wparams)
@@ -537,7 +683,13 @@ def import_book_scan(outdir, result):
         cur.execute('''CREATE TEMP TABLE oldrev AS
             SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
                    r.status, r.note, r.custom_suggestion, r.updated_at
-            FROM oldbook o JOIN review r ON r.finding_id = o.id''')
+            FROM oldbook o JOIN review r ON r.finding_id = o.id
+            WHERE o.lg = 0 OR r.status != 'approved' ''')
+        # ...and the legacy approvals it leaves behind (as in import_all)
+        cur.execute('''CREATE TEMP TABLE dropped AS
+            SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq
+            FROM oldbook o JOIN review r ON r.finding_id = o.id
+            WHERE o.lg != 0 AND r.status = 'approved' ''')
 
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
@@ -635,14 +787,34 @@ def import_book_scan(outdir, result):
              AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
         preserved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+        # -- log the dropped legacy approvals, withdraw their decisions -----
+        # The old ids are gone with their history; the entry points at the
+        # new row of the same identity when the re-scan still has one.
+        stale = cur.execute('''
+            SELECT n.id, d.w, d.u FROM dropped d LEFT JOIN newbook n
+              ON n.family = d.family AND n.w = d.w AND n.u = d.u
+             AND n.errtype = d.errtype AND n.r = d.r AND n.seq = d.seq
+            ''').fetchall()
+        ts = _now()
+        for fid, word, _unit in stale:
+            cur.execute('INSERT INTO history(ts, action, finding_id, word, '
+                        'old_status, new_status, note) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        (ts, 'legacy_recheck', fid, word, 'approved', None,
+                         'tanach_legacy'))
+        withdrawn = _clear_dropped_decisions(con, outdir,
+                                             [(w, u) for _, w, u in stale])
+
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
-        for t in ('oldbook', 'oldrev', 'newbook'):
+        for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
         return {'doc': doc, 'title': result.get('title'),
                 'added': added, 'replaced': old_total,
                 'preserved': preserved,
+                'legacy_approvals_dropped': len(stale),
+                'legacy_decisions_withdrawn': withdrawn,
                 'findings': len(result.get('findings') or []),
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
@@ -653,13 +825,24 @@ def migrate_legacy_decisions(con, outdir):
     """OPT-IN migration of the old decisions.db into review / word_rules.
 
     accept -> approved (decision suggestion kept as custom_suggestion when it
-    differs from the finding's own suggestion); reject with unit='*' -> a
-    word_rules 'not_error' row; per-unit reject -> not_error; ignore ->
-    ignored. Matching is on (word, unit); existing review rows are never
-    overwritten. Returns counts.
+    differs from the finding's own suggestion); reject -> not_error; ignore
+    -> ignored. A unit='*' row becomes a word_rules row of the same status
+    (the old tool's "reject everywhere" -> 'not_error'). Matching is on
+    (word, unit); existing review rows are never overwritten. Returns counts.
+
+    Exception: an accept on a Tanach-backed finding (a tanach_legacy row, a
+    row with tanach != 0, or a tanach_* family row) is imported as 'unsure',
+    without a custom suggestion, its old suggestion kept only in the note
+    (counted in ``recheck``). Such an accept was given while the old trigram
+    heuristic replaced the suggestion and boosted the rank, so it may approve
+    a correction nobody would approve today. 'unsure' rather than skipping:
+    the user still sees that an old decision exists, and nothing is approved
+    or exported until they decide again. A differing suggestion alone is not
+    enough to demote: the old tool's "accept with my correction" writes one.
     """
     dec_path = os.path.join(outdir, DECISIONS_F)
-    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0}
+    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0,
+           'recheck': 0}
     if not os.path.exists(dec_path):
         return out
     dec = _decisions_con(outdir)
@@ -681,24 +864,34 @@ def migrate_legacy_decisions(con, outdir):
         # owns them and may delete them again on a later pending/unsure write
         _own_decision(con, word, unit)
         if unit == '*':
+            # the old tool writes '*' only for "reject everywhere"; this UI
+            # mirrors every word-wide status there, an approval included
             con.execute('INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (word, 'not_error', ts))
+                        (word, status, ts))
             out['word_rules'] += 1
             continue
         fids = con.execute(
-            'SELECT id, suggestion FROM findings WHERE word = ? AND unit = ?',
+            "SELECT id, suggestion, (COALESCE(tanach, 0) != 0 OR family IN "
+            "('tanach_error', 'tanach_match') OR COALESCE(extra, '') LIKE "
+            "'%tanach_legacy%') FROM findings WHERE word = ? AND unit = ?",
             (word, unit)).fetchall()
         if not fids:
             out['unmatched'] += 1
             continue
-        for fid, fsugg in fids:
-            custom = None
-            if (verdict == 'accept' and sugg and sugg != (fsugg or '')):
+        for fid, fsugg, tanach_backed in fids:
+            st, note, custom = status, None, None
+            if verdict == 'accept' and tanach_backed:
+                st = 'unsure'
+                note = hebrew.MESSAGES['legacy_accept_recheck'].format(
+                    sugg=sugg or '—')
+            elif (verdict == 'accept' and sugg and sugg != (fsugg or '')):
                 custom = sugg
             n = con.execute(
                 'INSERT OR IGNORE INTO review VALUES(?,?,?,?,?)',
-                (fid, status, None, custom, ts)).rowcount
+                (fid, st, note, custom, ts)).rowcount
             out['review'] += n
+            if st == 'unsure':
+                out['recheck'] += n
     con.commit()
     return out
 
@@ -759,6 +952,8 @@ def get_meta(con):
     total = sum(o['count'] for o in origins)
     return {'origins': origins, 'errtypes': errtypes, 'statuses': statuses,
             'columns': columns, 'total': total,
+            'evidence_labels': hebrew.EVIDENCE_LABELS,
+            'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
             'last_import': last_import[0] if last_import else None}
@@ -986,13 +1181,21 @@ def set_status(con, outdir, ids, status, note=None, custom_suggestion=None,
     return out
 
 
+# history actions undo skips: its own entries, and imports' legacy drops
+NOT_UNDOABLE = "('undo', 'legacy_recheck')"
+
+
 def undo(con, outdir):
     """Revert the most recent not-yet-undone history group (one API call =
-    one ts = one undo step, bulk included). Returns what was reverted."""
+    one ts = one undo step, bulk included). Returns what was reverted.
+
+    A ``legacy_recheck`` entry is not a user action but an import dropping an
+    approval that rested on the old Tanach heuristic; undo never restores it
+    and reverts the user's last own action instead."""
     undone = {r[0] for r in con.execute(
         "SELECT note FROM history WHERE action = 'undo'")}
     row = con.execute(
-        "SELECT ts FROM history WHERE action != 'undo' "
+        f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
         + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
            if undone else '')
         + 'ORDER BY id DESC LIMIT 1',
@@ -1001,7 +1204,7 @@ def undo(con, outdir):
         return None
     group_ts = row[0]
     entries = con.execute(
-        "SELECT * FROM history WHERE ts = ? AND action != 'undo' "
+        f"SELECT * FROM history WHERE ts = ? AND action NOT IN {NOT_UNDOABLE} "
         'ORDER BY id DESC', (group_ts,)).fetchall()
     dec = _decisions_con(outdir)
     reverted = []
