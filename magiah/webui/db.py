@@ -646,6 +646,14 @@ def import_all(outdir, migrate_legacy=False):
             'legacy_decisions_withdrawn': withdrawn,
             'book_scan_kept': kept,
         })
+        # what the scan behind these findings could not read: report.db
+        # carries it only when locate wrote it partial (--allow-unread)
+        _set_meta_json(cur, 'coverage', _report_coverage(cur))
+        # a book scan's record stays only while the book's rows do
+        books = _meta_json(cur, 'book_coverage') or {}
+        kept_docs = {r[0] for r in cur.execute('SELECT doc FROM keep_docs')}
+        _set_meta_json(cur, 'book_coverage',
+                       {d: v for d, v in books.items() if d in kept_docs})
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('report_mtime', ?)",
@@ -674,6 +682,52 @@ def import_all(outdir, migrate_legacy=False):
         return counts
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# coverage: findings that rest on rows the scan could not read
+# ---------------------------------------------------------------------------
+
+def _meta_json(con, key):
+    """A JSON object stored in `meta`, or None (absent or unreadable)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (key,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _set_meta_json(con, key, value):
+    if value:
+        con.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (key, json.dumps(value, ensure_ascii=False)))
+    else:
+        con.execute('DELETE FROM meta WHERE key = ?', (key,))
+
+
+def _gap_summary(rec):
+    """What the UI needs of a coverage record (core.gap_record): not the row
+    ids, which may run to thousands."""
+    return {k: rec[k] for k in ('unread_rows', 'allow_unread', 'unread_refs',
+                                'inherited', 'unread_kind') if k in rec}
+
+
+def _report_coverage(con):
+    """The gap summary report.db (attached as `rep`) carries, or None."""
+    if not con.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                       "AND name='coverage'").fetchone():
+        return None
+    row = con.execute('SELECT info FROM rep.coverage').fetchone()
+    try:
+        info = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        info = None
+    if not isinstance(info, dict):
+        # a mark that cannot be read still says "partial", count unknown
+        return {'unread_rows': None, 'allow_unread': None, 'unread_refs': []}
+    return _gap_summary(info)
 
 
 def import_book_scan(outdir, result):
@@ -858,6 +912,13 @@ def import_book_scan(outdir, result):
         withdrawn = _clear_dropped_decisions(con, outdir,
                                              [(w, u) for _, w, u in stale])
 
+        # each scan of the book replaces its coverage record; a complete one
+        # removes it
+        books = _meta_json(cur, 'book_coverage') or {}
+        books.pop(doc, None)
+        if result.get('coverage'):
+            books[doc] = dict(_gap_summary(result['coverage']), title=title)
+        _set_meta_json(cur, 'book_coverage', books)
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
         for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):

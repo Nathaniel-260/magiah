@@ -561,6 +561,21 @@ CONFIG_LABELS = {
             'נתיבים לקבצי מילים (מילה בכל שורה) שלעולם לא יסומנו כשגיאה. '
             'שורה אחת לכל קובץ. ברירת מחדל: ללא.',
     },
+    # the label must start with core.ALLOW_UNREAD_UI — the CLI's messages
+    # send the user to this field by that name
+    'allow_unread': {
+        'hebrew': 'שורות לא קריאות מותרות (allow_unread)',
+        'explanation':
+            'כמה שורות קלט שאי אפשר לקרוא מותר לסריקה לדלג עליהן: שורות '
+            'פגומות או חסרות במסד הנתונים, או קובצי טקסט שלא נפתחו (קובץ '
+            'כזה נספר כשורה אחת). ב-0 הסריקה נעצרת בכל שורה שלא נקראה. ערך '
+            'גדול מ-0 מאפשר להשלים סריקה של מקור נתונים שהתקבל פגום: השורות '
+            'האלה לא נסרקות, והתוצאות מסומנות כחלקיות יחד עם רשימת השורות '
+            'שחסרו. '
+            'הערך חל על ההרצה הנוכחית בלבד ואינו נשמר — גם המשך עבודה על '
+            'תוצאות חלקיות קיימות (למשל סריקת ספר בודד מול מילון חלקי) '
+            'דורש אותו שוב. ברירת מחדל: 0.',
+    },
 }
 
 STAGE_LABELS = {
@@ -659,6 +674,11 @@ SCAN_MESSAGES = {
     'book_done': 'סריקת הספר הושלמה',
     # shown when a re-scan silently keeps decisions the user made earlier
     'book_kept_decisions': 'החלטות שנשמרו מהסריקה הקודמת של הספר: ',
+    # added to the start confirmation when allow_unread > 0 ({n}: the value)
+    'allow_unread_confirm': (
+        '⚠ הסריקה תדלג על עד {n} שורות שלא ניתן לקרוא (במסד הנתונים, או '
+        'קובצי טקסט שלא נפתחו), והתוצאות יסומנו כחלקיות. ההיתר חל על הרצה '
+        'זו בלבד.'),
 }
 
 # ---------------------------------------------------------------------------
@@ -812,6 +832,58 @@ RESULT_STATUS = {
     'refresh_stale': 'הממצאים נטענו מחדש, אבל הם מהסריקה הקודמת שהושלמה — '
                      'הסריקה האחרונה לא הושלמה (הפרטים בהודעה שבראש '
                      'המסך). {counts}',
+}
+
+# The findings rest on rows a scan could not read, skipped on explicit
+# request (--allow-unread / the "שורות לא קריאות מותרות" field): one more
+# result-status notice, built by result_status.coverage_notice().
+
+# Worded by what was skipped (core.gap_record's ``unread_kind``): rows of a
+# database (seforim.db, or an SQLite corpus), text files of a folder or of
+# the library — an unreadable file counts as one — both, or, for a record
+# that does not say, input in general.
+COVERAGE_NOTICE = {
+    'title': {
+        'db': 'הממצאים מבוססים על קריאה חלקית של מסד הנתונים',
+        'files': 'הממצאים מבוססים על קריאה חלקית של קובצי הטקסט',
+        'input': 'הממצאים מבוססים על קריאה חלקית של מקור הנתונים',
+    },
+    # {rows}: how many
+    'what': {
+        'db': '{rows} שורות במסד הנתונים',
+        'files': '{rows} קובצי טקסט',
+        'mixed': '{rows} שורות במסד הנתונים וקובצי טקסט',
+        'input': '{rows} שורות קלט',
+    },
+    'why': {
+        'db': ' (פגומות או חסרות)',
+        'files': ' (פגומים, חסרים או ללא הרשאת קריאה)',
+        'mixed': '',
+        'input': '',
+    },
+    'scan': 'הסריקה דילגה על {what} שלא ניתן היה לקרוא{why}, לפי אישור '
+            'מפורש (‎--allow-unread {limit}‎): שגיאות בקלט שדולג לא '
+            'אותרו.',
+    # the lexicon itself was built without them (inherited from `lexicon`)
+    'scan_lexicon': ' גם המילון נבנה בלעדיו, ולכן המילים שבו אינן נספרות '
+                    'בשכיחויות.',
+    'book': 'סריקת הספר «{title}» דילגה על {what} שלא ניתן היה לקרוא '
+            '(‎--allow-unread {limit}‎).',
+    'book_lexicon': 'סריקת הספר «{title}» נשענת על קריאה חלקית: {what} לא '
+                    'נקראו בה או במילון שנבנה לפניה (‎--allow-unread '
+                    '{limit}‎).',
+    'hint': {
+        'db': 'השורות פגומות במסד הנתונים כפי שהתקבל, ואין צורך לעשות דבר '
+              'כדי להמשיך לעבוד. כשיהיה מסד נתונים תקין, סריקה חוזרת בלי '
+              'ההיתר תסיר את ההודעה.',
+        'files': 'אין צורך לעשות דבר כדי להמשיך לעבוד. כשהקבצים יהיו '
+                 'קריאים (תוקנו, הוחזרו או קיבלו הרשאה), סריקה חוזרת בלי '
+                 'ההיתר תסיר את ההודעה.',
+        'input': 'אין צורך לעשות דבר כדי להמשיך לעבוד. כשמקור הנתונים יהיה '
+                 'תקין, סריקה חוזרת בלי ההיתר תסיר את ההודעה.',
+    },
+    'more': 'הרשימה חלקית — הרשימה המלאה בקובצי coverage_*.json בתיקיית '
+            'הסריקה.',
 }
 
 

@@ -2677,6 +2677,20 @@ function collectScanRequest() {
   };
 }
 
+/* allow_unread is per run and never saved (Config.PER_RUN). The field sits in
+   the collapsed advanced section, so a value left in it is named in the start
+   confirmation and cleared once a run has taken it — a later scan never
+   inherits it unseen. */
+function allowUnreadNote(req) {
+  const n = req.config.allow_unread || 0;
+  const tpl = SCAN.cfg && SCAN.cfg.allow_unread_confirm;
+  return n > 0 && tpl ? "\n\n" + tpl.replace("{n}", fmtNum(n)) : "";
+}
+function clearAllowUnread() {
+  const inp = $('#scanFields .scan-field[data-key="allow_unread"] input');
+  if (inp) inp.value = "0";
+}
+
 function stageHebrew(key) {
   const s = ((SCAN.cfg && SCAN.cfg.stages) || []).find(x => x.key === key);
   return s ? s.hebrew : (STAGE_HEBREW[key] || key);
@@ -2813,9 +2827,10 @@ function bindScanRun() {
   $("#scanStart").addEventListener("click", async () => {
     const req = collectScanRequest();
     if (!req.stages.length) { toast("יש לבחור לפחות שלב אחד להרצה", "err"); return; }
-    if (!confirm("להתחיל סריקה חדשה?\n\nשלבים: " + req.stages.map(stageHebrew).join(", ") + "\nהסריקה עשויה להימשך זמן רב; אפשר לעקוב אחרי ההתקדמות ביומן.")) return;
+    if (!confirm("להתחיל סריקה חדשה?\n\nשלבים: " + req.stages.map(stageHebrew).join(", ") + "\nהסריקה עשויה להימשך זמן רב; אפשר לעקוב אחרי ההתקדמות ביומן." + allowUnreadNote(req))) return;
     try {
       const r = await api("/api/scan/start", { method: "POST", body: req });
+      clearAllowUnread();
       toast((r && r.message) || "הסריקה הופעלה", "ok");
       $("#scanRunSection").setAttribute("open", "");
       renderScanStatus((r && r.status) || { state: "running", log_tail: [] });
@@ -2933,18 +2948,20 @@ function bindBookScan() {
       label = BS.chosen.title;
     }
     const verify = $("#bsVerifyCtx").checked;
+    const req = collectScanRequest();
     if (!confirm("לסרוק את «" + label + "»?\n\n" +
                  "הסריקה מתבססת על המילון הקיים ואורכת שניות." +
                  (verify ? "\n\n⚠ סימנת «אימות הקשר מול כל המאגר» — הסריקה " +
                            "תימשך כ־10 דקות במקום שניות." : "") +
-                 "\n\nממצאים קודמים של ספר זה יוחלפו; ההחלטות שלך עליהם יישמרו.")) return;
-    const req = collectScanRequest();
+                 "\n\nממצאים קודמים של ספר זה יוחלפו; ההחלטות שלך עליהם יישמרו." +
+                 allowUnreadNote(req))) return;
     try {
       const r = await api("/api/scan/book", {
         method: "POST",
         body: { source: src, book: key, verify_ctx: verify,
                 config: req.config, corpus: req.corpus },
       });
+      clearAllowUnread();
       toast((r && r.message) || "סריקת הספר הופעלה", "ok");
       $("#scanRunSection").setAttribute("open", "");
       renderScanStatus((r && r.status) || { state: "running", log_tail: [] });

@@ -145,10 +145,8 @@ class SqliteCorpus:
                 if not isinstance(text, str):
                     # a BLOB here would tokenize to nothing and look like an
                     # empty line — count it as unreadable instead
-                    self.stats.decode_errors += 1
-                    if len(self.stats.error_samples) < 20:
-                        self.stats.error_samples.append(
-                            (str(uid), 'non-text value in text column'))
+                    self.stats.unread_row(uid, 'decode_errors',
+                                          'non-text value in text column')
                     continue
                 self.stats.lines += 1
                 self.stats.chars += len(text)
@@ -246,9 +244,7 @@ class TextDirCorpus:
                     self.stats.chars += len(text)
                     yield f'{rel}:{lineno}', rel, text
             except OSError as e:
-                self.stats.decode_errors += 1
-                if len(self.stats.error_samples) < 20:
-                    self.stats.error_samples.append((rel, repr(e)[:200]))
+                self.stats.unread_row(rel, 'decode_errors', repr(e)[:200])
 
     def enrich(self, con):
         _default_enrich(con)
