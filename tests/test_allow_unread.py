@@ -13,13 +13,15 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
+import urllib.request
 from unittest import mock
 
 from magiah import book_scan, book_source, cli, core
 from magiah.config import Config
 from magiah.textsource import OtzariaDB, ReadStats
-from magiah.webui import scanner
+from magiah.webui import db as uidb, scanner, server
 
 from test_tanach import BIBLE, make_bible_db
 from test_textsource import (_corrupt_row, _coverage, _otzaria_spec, _zstd,
@@ -541,6 +543,101 @@ class BookScanTest(_Case):
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(base + ['--allow-unread', '1']), 0)
         self.assertIn('חלקית', out.getvalue())
+
+
+class ReviewUiTest(_Case):
+    """The review UI says, persistently, when what it shows is partial."""
+
+    def status(self):
+        con = uidb.connect(self.out)
+        try:
+            return uidb.get_meta(con, self.out)['result_status']
+        finally:
+            con.close()
+
+    def notice(self):
+        """The banner's notice about skipped rows, or None."""
+        found = [n for n in self.status()['notices']
+                 if n['kind'] == 'accepted_partial']
+        return found[0] if found else None
+
+    def full_scan(self, allow_unread):
+        for st in ('lexicon', 'detect', 'locate'):
+            self.run_stage(st, allow_unread)
+        uidb.import_all(self.out)
+
+    def test_partial_scan_is_noticed_until_a_complete_one(self):
+        self.full_scan(2)
+        n = self.notice()
+        self.assertEqual((n['kind'], n['level'], n['stale'], n['action']),
+                         ('accepted_partial', 'warning', False, None))
+        self.assertIn('2 שורות', n['text'])
+        self.assertIn('--allow-unread 2', n['text'])
+        self.assertEqual(n['details'].split('\n'),
+                         ['ספר א, ref 2 (מזהה שורה 2)',
+                          'ספר ב, ref 4 (מזהה שורה 4)'])
+        self.assertTrue(n['hint'])
+        # a run accepted partial succeeded: its results are not stale
+        self.assertFalse(self.status()['stale'])
+        self.repair_db()
+        self.full_scan(0)
+        self.assertIsNone(self.notice())
+
+    def test_served_by_api_meta(self):
+        self.full_scan(2)
+        server.Handler.outdir = self.out
+        srv = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f'http://127.0.0.1:{srv.server_address[1]}/api/meta'
+            with urllib.request.urlopen(url, timeout=30) as r:
+                meta = json.loads(r.read().decode('utf-8'))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual([n['kind'] for n in meta['result_status']['notices']],
+                         ['accepted_partial'])
+
+    def test_unreadable_mark_still_warns(self):
+        self.full_scan(2)
+        con = sqlite3.connect(os.path.join(self.out, core.REPORT_DB_F))
+        con.execute("UPDATE coverage SET info = '{broken'")
+        con.commit()
+        con.close()
+        uidb.import_all(self.out)
+        n = self.notice()
+        self.assertIn('דילגה על ? שורות', n['text'])     # count unknown
+        self.assertIn('הרשימה חלקית', n['details'])
+
+    def test_book_scan_notice_follows_the_book(self):
+        clean = os.path.join(self.tmp.name, 'clean.db')
+        make_schema6_db(clean)
+        with _quiet():
+            core.build_lexicon(_otzaria_spec(clean), self.cfg(), self.out)
+        res = book_scan.scan_book(self.out, 'db', '1', cfg=self.cfg(1),
+                                  db_path=self.db)
+        uidb.import_book_scan(self.out, res)
+        n = self.notice()
+        self.assertIn('ספר א', n['text'])
+        self.assertIn('מזהה שורה 2', n['details'])
+        # a complete re-scan of the same book clears it
+        uidb.import_book_scan(self.out, book_scan.scan_book(
+            self.out, 'db', '1', cfg=self.cfg(), db_path=clean))
+        self.assertIsNone(self.notice())
+
+    def test_full_import_drops_book_records_it_supersedes(self):
+        clean = os.path.join(self.tmp.name, 'clean.db')
+        make_schema6_db(clean)
+        with _quiet():
+            core.build_lexicon(_otzaria_spec(clean), self.cfg(), self.out)
+        uidb.import_book_scan(self.out, book_scan.scan_book(
+            self.out, 'db', '1', cfg=self.cfg(1), db_path=self.db))
+        self.assertIsNotNone(self.notice())
+        # a complete full scan that contains book 1 is the newer truth for it
+        self.spec = _otzaria_spec(clean)
+        self.full_scan(0)
+        self.assertIsNone(self.notice())
 
 
 class ScanPanelTest(_Case):

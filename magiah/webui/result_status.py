@@ -8,6 +8,10 @@ used to say that they are not the latest scan's. The answer now comes from
 the files, not from the server's memory, so it survives a restart and a
 reload, and it disappears by itself once a scan succeeds.
 
+Latest is not the same as complete: a scan allowed to skip unreadable input
+rows (``--allow-unread``) succeeds, and its findings are the latest but rest
+on gaps. That is said too (``accepted_partial``), never as stale.
+
 :func:`build` returns one structure, ``result_status``::
 
     {'stale': bool,          # the results are not from the latest scan
@@ -23,6 +27,7 @@ that part of the scan panel), 'refresh' (reload the findings) or None — and
 in :data:`PROVIDERS`; another kind of warning about the results is one more
 provider, and the banner shows it with no further change.
 """
+import json
 import os
 import time
 
@@ -83,10 +88,11 @@ def _stage_he(stage):
 def _refused_stage(outdir):
     """``(stage, message)`` of the first stage of the results chain whose
     output the CLI refuses for a partial read — ``(None, None)`` if none.
-    Only an output the CLI refuses outright makes the results stale; one it
-    accepts as it is must not show up here."""
+    Only an output the CLI refuses outright makes the results stale; one
+    written partial under ``--allow-unread`` came from a run that succeeded
+    (:func:`coverage_notice` tells of its gaps) and must not show up here."""
     for stage in core._READ_STAGES:
-        problem = core.coverage_problem(outdir, stage)
+        problem = core.failed_coverage(outdir, stage)
         if problem:
             return stage, problem
     return None, None
@@ -130,6 +136,67 @@ def stale_notice(con, outdir, ctx):
         title += shown_t.get(state, shown_t['default'])
     return _notice('scan_incomplete', 'error', title, text, T['stale_todo'],
                    details, 'scan', stale=True)
+
+
+def _meta_json(con, key):
+    """A JSON object stored in `meta`, or None (absent or unreadable)."""
+    try:
+        value = json.loads(_meta(con, key) or 'null')
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def coverage_notice(con, outdir, ctx):
+    """The findings on screen rest on input rows a scan skipped as
+    unreadable, on explicit request (``--allow-unread``): the full scan's
+    (``meta.coverage``, copied from report.db by every import) and each
+    single-book scan's (``meta.book_coverage``, per book).
+
+    Not stale: a run accepted partial succeeded, and its results are the
+    latest — with known gaps. It shows beside the stale notice when a later
+    scan failed, since the findings shown are then still these; and it goes
+    away only when the findings shown no longer rest on skipped rows.
+    """
+    C = hebrew.COVERAGE_NOTICE
+    scan = _meta_json(con, 'coverage')
+    books = {d: b for d, b in (_meta_json(con, 'book_coverage') or {}).items()
+             if isinstance(b, dict)}
+    if not scan and not books:
+        return None
+
+    def count(rec, key):
+        value = rec.get(key)
+        return value if isinstance(value, int) else None
+
+    def num(rec, key):
+        value = count(rec, key)
+        return '?' if value is None else f'{value:,}'
+
+    text, refs, listed_all = [], [], True
+    if scan:
+        text.append(C['scan'].format(rows=num(scan, 'unread_rows'),
+                                     limit=num(scan, 'allow_unread')))
+    for doc, b in sorted(books.items(),
+                         key=lambda kv: str(kv[1].get('title') or kv[0])):
+        text.append(C['book_lexicon' if b.get('inherited') else 'book']
+                    .format(title=b.get('title') or doc,
+                            rows=num(b, 'unread_rows'),
+                            limit=num(b, 'allow_unread')))
+    for rec in ([scan] if scan else []) + list(books.values()):
+        got = [r for r in rec.get('unread_refs') or () if isinstance(r, dict)]
+        refs += got
+        rows = count(rec, 'unread_rows')
+        listed_all = listed_all and rows is not None and len(got) >= rows
+    lines, seen = [], set()
+    for r in refs:
+        if r.get('unit') not in seen:
+            seen.add(r.get('unit'))
+            lines.append(core.ref_text(r))
+    if not listed_all:
+        lines.append(C['more'])
+    return _notice('accepted_partial', 'warning', C['title'], ' '.join(text),
+                   C['hint'], '\n'.join(lines) or None)
 
 
 def refresh_notice(con, outdir, ctx):
@@ -217,7 +284,7 @@ def book_notice(con, outdir, ctx):
                    'book_scan')
 
 
-PROVIDERS = (stale_notice, refresh_notice, book_notice)
+PROVIDERS = (stale_notice, coverage_notice, refresh_notice, book_notice)
 
 
 def build(con, outdir):

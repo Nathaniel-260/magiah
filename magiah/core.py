@@ -468,13 +468,7 @@ def coverage_problem(out_dir, stage, allow_unread=0):
         path = os.path.join(out_dir, COVERAGE_F.format(stage=st))
         he = _STAGE_HE.get(st, st)
         if state == 'partial':
-            msg = (f'הריצה האחרונה של שלב "{he}" לא קראה את כל הקלט '
-                   f'({rows:,} שורות לא נקראו), ולכן אין להשתמש בתוצרים '
-                   f'שלו ושל השלבים שאחריו.\n'
-                   f'יש לתקן את הבעיה ולהריץ שוב:  {_all_cmd(out_dir)}\n')
-            if rows:
-                msg += proceed_hint(rows, _all_cmd(out_dir)) + '\n'
-            return msg + f'פרטים: {path}'
+            return _partial_problem(out_dir, st, rows)
         if state == 'accepted' and rows > allow_unread:
             ran = ('ריצה זו לא אישרה דילוג על שורות שלא נקראו'
                    if not allow_unread else
@@ -489,6 +483,35 @@ def coverage_problem(out_dir, stage, allow_unread=0):
                     f'לתוצאה מלאה יש להריץ סריקה מלאה על מקור נתונים '
                     f'תקין:  {_all_cmd(out_dir)}\n'
                     f'פרטים: {path}')
+    return None
+
+
+def _partial_problem(out_dir, stage, rows):
+    """The refusal of an output whose latest attempt read partially and was
+    not accepted (see :func:`coverage_problem`)."""
+    path = os.path.join(out_dir, COVERAGE_F.format(stage=stage))
+    msg = (f'הריצה האחרונה של שלב "{_STAGE_HE.get(stage, stage)}" לא קראה '
+           f'את כל הקלט ({rows:,} שורות לא נקראו), ולכן אין להשתמש בתוצרים '
+           f'שלו ושל השלבים שאחריו.\n'
+           f'יש לתקן את הבעיה ולהריץ שוב:  {_all_cmd(out_dir)}\n')
+    if rows:
+        msg += proceed_hint(rows, _all_cmd(out_dir)) + '\n'
+    return msg + f'פרטים: {path}'
+
+
+def failed_coverage(out_dir, stage):
+    """Why NO run may use the output of `stage` — the latest attempt of a
+    stage in its chain read partially and stopped — or None.
+
+    Unlike :func:`coverage_problem` this holds no run's limit: an output
+    written partial under ``--allow-unread`` is the result of a run that
+    succeeded, accepted with gaps, and a run that states as many rows may
+    use it. Only a failed read makes the output out of date.
+    """
+    for st in _chain(stage):
+        state, rows, _ = _latest_coverage(out_dir, st)
+        if state == 'partial':
+            return _partial_problem(out_dir, st, rows)
     return None
 
 
@@ -525,8 +548,10 @@ def _latest_coverage(out_dir, stage):
         rows = int(info.get('unread_rows',
                             info.get('unread', info.get('decode_errors', 0))))
         refs = info.get('unread_refs')
+        limit = info.get('allow_unread')
+        # accepted only within the limit it was accepted under
         if (info.get('accepted') is True and 'unread_rows' in info
-                and rows > 0 and isinstance(info.get('allow_unread'), int)
+                and isinstance(limit, int) and 0 < rows <= limit
                 and isinstance(refs, list)):
             units = info.get('unread_units')
             info['unread_rows'] = rows

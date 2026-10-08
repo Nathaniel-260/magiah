@@ -224,10 +224,108 @@ class MetaTest(ResultStatusCase):
         self.assertIn('3', n['title'])
 
 
-def run_book(case, key):
+def run_book(case, key, *extra):
     from test_runstate import run_cli
     return run_cli('book', '--book', key, '--book-source', 'file',
-                   '--textdir', case.lib, '--out', case.out, *TUNE)
+                   '--textdir', case.lib, '--out', case.out, *TUNE, *extra)
+
+
+class AcceptedPartialTest(ResultStatusCase):
+    """A run accepted partial under --allow-unread succeeded: its results
+    are the latest, with known gaps (accepted_partial), never stale. A run
+    that failed still makes the results stale (scan_incomplete), and both
+    can show at once, each saying its own thing."""
+
+    def accepted_scan(self):
+        """A full scan that skips the one unreadable input (allowed)."""
+        from test_runstate import run_cli
+        break_library(self.lib)
+        rc, err = run_cli('all', '--textdir', self.lib, '--out', self.out,
+                          '--allow-unread', '1', *TUNE)
+        self.assertFalse(rc, err)
+        db.import_all(self.out)
+
+    def notices(self):
+        return {n['kind']: n
+                for n in meta_status(self.out)['result_status']['notices']}
+
+    def kinds(self):
+        return [n['kind']
+                for n in meta_status(self.out)['result_status']['notices']]
+
+    def test_accepted_run_is_not_stale(self):
+        self.start_from_good_scan()
+        self.accepted_scan()
+        self.assertIsNone(runstate.scan_problem(self.out))   # a success
+        st = meta_status(self.out)['result_status']
+        self.assertFalse(st['stale'])
+        (n,) = st['notices']
+        self.assertEqual((n['kind'], n['level'], n['stale'], n['action']),
+                         ('accepted_partial', 'warning', False, None))
+        self.assertIn('--allow-unread 1', n['text'])
+        self.assertIn('שבור.txt', n['details'])
+
+    def test_failed_run_after_an_accepted_one_shows_both(self):
+        self.start_from_good_scan()
+        self.accepted_scan()
+        at = meta_status(self.out)['result_status']['results_at']
+        # the next run does not state the allowance again: it stops
+        self.assertEqual(self.scan()[0], 1)
+        self.assertEqual(self.kinds(), ['scan_incomplete', 'accepted_partial'])
+        n = self.assert_stale('לא קראה את כל הקלט', at)
+        self.assertIn('--allow-unread 1', n['details'])   # how to go on
+        # the findings shown are still the accepted run's, gaps and all
+        self.assertIn('שבור.txt', self.notices()['accepted_partial']['details'])
+
+    def test_refused_consumer_of_an_accepted_output_is_a_failed_run(self):
+        self.start_from_good_scan()
+        self.accepted_scan()
+        rc, err = self.scan('detect')                   # no allowance
+        self.assertEqual(rc, 1)
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('partial', 'detect'))
+        self.assertIn('--allow-unread 1', p['reason'])
+        self.assertEqual(self.kinds(), ['scan_incomplete', 'accepted_partial'])
+
+    def test_complete_run_clears_both(self):
+        self.start_from_good_scan()
+        self.accepted_scan()
+        self.scan()                                     # fails: no allowance
+        mend_library(self.lib)
+        time.sleep(0.05)                 # a report.db mtime the import lacks
+        self.good_scan()
+        # not stale any more; what is shown is still the accepted run's
+        # until it is refreshed
+        self.assertEqual(self.kinds(), ['accepted_partial', 'refresh_needed'])
+        db.import_all(self.out)
+        self.assertEqual(self.kinds(), [])
+
+    def test_folder_without_run_record(self):
+        # only the coverage files are left to judge by: accepted is no
+        # failure there either
+        self.start_from_good_scan()
+        self.accepted_scan()
+        shutil.rmtree(os.path.join(self.out, runstate.STATE_DIR))
+        self.assertEqual(self.kinds(), ['accepted_partial'])
+
+    def test_book_scan_states_the_allowance_too(self):
+        self.start_from_good_scan()
+        self.accepted_scan()
+        book = os.path.join(self.lib, 'ספר.txt')
+        # the lexicon is partial: a book scan without the allowance refuses
+        # it, and that book's failure is its own notice
+        self.assertEqual(run_book(self, book)[0], 1)
+        (p,) = runstate.book_problems(self.out)
+        self.assertIn('--allow-unread 1', p['reason'])
+        self.assertEqual(self.kinds(),
+                         ['accepted_partial', 'book_scan_incomplete'])
+        # with it, the scan succeeds: its failure goes, its gaps are told
+        rc, err = run_book(self, book, '--allow-unread', '1')
+        self.assertFalse(rc, err)
+        self.assertEqual(runstate.book_problems(self.out), [])
+        self.assertEqual(self.kinds(), ['accepted_partial'])
+        self.assertIn('«ספר»', self.notices()['accepted_partial']['text'])
+        self.assertFalse(meta_status(self.out)['result_status']['stale'])
 
 
 class RefreshApiTest(ResultStatusCase):
