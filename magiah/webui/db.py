@@ -1836,7 +1836,10 @@ def _set_status_locked(con, outdir, ids, found, status, note,
                        custom_suggestion, scope, decided_by):
     ts = _now()
     action = 'bulk' if len(ids) > 1 else 'set_status'
-    dec = _decisions_con(outdir)
+    # decisions.db committed before ui_review.db: a write that changes
+    # nothing is skipped, so a retry could never re-sync a decisions.db that
+    # fell behind a committed ui_review.db
+    dec = _decisions_for_write(outdir)
     updated = word_rules = 0
     warnings = []
 
@@ -1906,10 +1909,9 @@ def _set_status_locked(con, outdir, ids, found, status, note,
                            'updated_at': ts})
                 warn(_sync_rule(con, dec, scope, key, status, decided_by))
                 word_rules += 1
-        con.commit()
-        dec.commit()
+        _commit_decisions_first(con, dec)
     finally:
-        dec.close()
+        dec.close()                     # without a commit: rolled back
     out = {'updated': updated, 'word_rules': word_rules, 'status': status,
            'scope': scope, 'decided_by': decided_by, 'ts': ts}
     if warnings:
@@ -1945,22 +1947,32 @@ def undo(con, outdir):
 
     decisions.db is written in the same step and committed first (see
     :func:`_commit_decisions_first`); a lock on it fails the undo with
-    :class:`DecisionsLocked` and changes nothing."""
-    undone = {r[0] for r in con.execute(
-        "SELECT note FROM history WHERE action = 'undo'")}
-    row = con.execute(
-        f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
-        + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
-           if undone else '')
-        + 'ORDER BY id DESC LIMIT 1',
-        list(undone)).fetchone()
+    :class:`DecisionsLocked` and changes nothing. ui_review.db is locked
+    before decisions.db, in the order every status write takes them, and
+    for the whole step, so two undo requests revert two steps."""
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    try:
+        undone = {r[0] for r in con.execute(
+            "SELECT note FROM history WHERE action = 'undo'")}
+        row = con.execute(
+            f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
+            + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
+               if undone else '')
+            + 'ORDER BY id DESC LIMIT 1',
+            list(undone)).fetchone()
+        if row is not None:
+            entries = con.execute(
+                f"SELECT * FROM history WHERE ts = ? AND action NOT IN "
+                f"{NOT_UNDOABLE} ORDER BY id DESC", (row[0],)).fetchall()
+            dec = _decisions_for_write(outdir)
+    except BaseException:
+        con.rollback()
+        raise
     if row is None:
+        con.rollback()
         return None
     group_ts = row[0]
-    entries = con.execute(
-        f"SELECT * FROM history WHERE ts = ? AND action NOT IN {NOT_UNDOABLE} "
-        'ORDER BY id DESC', (group_ts,)).fetchall()
-    dec = _decisions_for_write(outdir)
     reverted, restored = [], []
     warnings = []
 
@@ -2631,7 +2643,14 @@ def restore_backup(con, outdir, filename):
         raise FileNotFoundError(hebrew.MESSAGES['not_found'])
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
-    dec = _decisions_for_write(outdir)
+    # ui_review.db first, then decisions.db: the order every write takes
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    try:
+        dec = _decisions_for_write(outdir)
+    except BaseException:
+        con.rollback()
+        raise
     out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0}
     warnings, restored = [], []
     try:

@@ -1148,6 +1148,71 @@ class TestStaleWithdrawal(ServerCase):
         self.assertEqual([r[:3] for r in self._state()[3]],
                          [('אבי', '10', 'accept')])
 
+    def test_status_write_waits_for_decisions_db_and_never_desyncs(self):
+        """A reader holding decisions.db used to let ui_review.db commit and
+        decisions.db fail; the retry was a no-op, so decisions.db never
+        caught up. Now the write fails whole (423) and the retry writes
+        both."""
+        from unittest import mock
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'unsure', note='x')
+        before = self._state()
+        holder = self._locked('BEGIN')
+        try:
+            with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                code, res = self.call('/api/status', {
+                    'ids': [1], 'status': 'not_error', 'scope': 'word'})
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+        self.assertEqual(code, 423)
+        self.assertIn('decisions.db', res['error'])
+        self.assertEqual(self._state(), before)
+        code, res = self.call('/api/status', {
+            'ids': [1], 'status': 'not_error', 'scope': 'word'})
+        self.assertEqual((code, res['updated']), (200, 1))
+        self.assertIn(('בית', '*', 'reject', ''), self._state()[3])
+        self.assertIn('בית', core.load_review_rejections(self.outdir))
+
+    def test_ui_review_is_locked_before_decisions_db(self):
+        """Every write takes ui_review.db's lock first and decisions.db's
+        second, so two writers never hold one each and wait for the other."""
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'approved')
+        backup = os.path.basename(db.write_backup(self.con, self.outdir))
+        orig, seen = db._decisions_for_write, []
+
+        def checked(outdir):
+            other = sqlite3.connect(os.path.join(outdir, db.UI_DB_F),
+                                    timeout=0)
+            try:
+                other.execute('BEGIN IMMEDIATE')
+                other.rollback()
+                seen.append('ui_review.db was free')
+            except sqlite3.OperationalError:
+                seen.append('locked')
+            finally:
+                other.close()
+            return orig(outdir)
+        db._decisions_for_write = checked
+        try:
+            db.set_status(self.con, self.outdir, [1], 'not_error')
+            db.undo(self.con, self.outdir)
+            db.restore_backup(self.con, self.outdir, backup)
+        finally:
+            db._decisions_for_write = orig
+        self.assertEqual(seen, ['locked'] * 3)
+
+    def test_undo_with_nothing_to_undo_releases_its_lock(self):
+        self.assertIsNone(db.undo(self.con, self.outdir))
+        self.assertFalse(self.con.in_transaction)
+        other = db.connect(self.outdir)
+        try:
+            other.execute('BEGIN IMMEDIATE')
+            other.rollback()
+        finally:
+            other.close()
+
 
 if __name__ == '__main__':
     unittest.main()
