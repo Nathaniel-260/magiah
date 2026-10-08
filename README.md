@@ -147,6 +147,17 @@ corpus source and thresholds are remembered in `results/run_config.json`, so
 after tuning thresholds you can rerun from `detect` without recounting the
 lexicon.
 
+A failed stage never replaces its previous output, so after a failed run the
+folder still holds the last good results. Every run therefore records itself
+in `results/run_state/` — when it started, the stage it reached, and how it
+ended (done, failed, partial, cancelled). A run that never got to say how it
+ended (killed, window closed, power cut) is recognized as *interrupted*: it
+holds an OS file lock for as long as it lives. The review UI (`magiah ui`)
+reads this record and, until a scan that rebuilds the results succeeds, shows
+a warning above the findings that they come from the previous complete scan.
+Two pipeline runs on one folder at a time are refused — they would overwrite
+each other's files.
+
 **Second, sharper pass** (recommended):
 
 ```bash
@@ -290,6 +301,8 @@ titles, references and source-repository names from Otzaria's schema. Use
 | `tanach_matches.csv` / `tanach_edition_errors.csv` | quotations confirmed by 2+ independent sources / edition disagreements (`evidence` JSON: variant vs. unresolved, witnesses) |
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
+| `coverage_<stage>.json` | what each stage read — a partial read stops the stage and is recorded here |
+| `run_state/` | how the latest runs ended (`scan.json`, `book.json`) — read by the review UI |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |
 
 ```sql

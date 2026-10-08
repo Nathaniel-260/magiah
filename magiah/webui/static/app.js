@@ -1588,6 +1588,47 @@ function updateFixHead() {
 }
 
 /* -------------------------------------------------- banners */
+/* Result status (UI_SPEC §9f): are the findings on screen the latest scan's?
+   It is derived from the output folder, not from this page, so it survives
+   a reload and a server restart; it cannot be dismissed — it goes away when a
+   scan succeeds. One block per notice, worst first, as /api/meta sends them. */
+const RESULT_ICONS = { error: "⚠", warning: "⚠", info: "ℹ" };
+const openScanSection = id => () => {
+  openScanModal();
+  const d = $(id); if (d) d.open = true;
+};
+const RESULT_ACTIONS = {
+  scan: openScanSection("#scanRunSection"),
+  book_scan: openScanSection("#bookScanSection"),
+  refresh: () => refreshFindings(),
+};
+
+function renderResultBanner() {
+  const box = $("#resultBanner");
+  const rs = S.meta && S.meta.result_status;
+  const notices = (rs && rs.notices) || [];
+  box.hidden = !notices.length;
+  box.replaceChildren(...notices.map(n => {
+    const body = el("div", { class: "rb-body" },
+      el("div", { class: "rb-title" }, n.title),
+      el("div", { class: "rb-text" }, n.text));
+    if (n.hint) body.append(el("div", { class: "rb-hint" }, el("b", null, "מה לעשות: "), n.hint));
+    if (n.details) body.append(el("details", { class: "rb-details" },
+      el("summary", null, "פרטים"), el("div", { class: "rb-reason" }, n.details)));
+    const run = RESULT_ACTIONS[n.action];
+    return el("div", { class: "rb-notice rb-" + n.level },
+      el("div", { class: "rb-icon", "aria-hidden": "true" }, RESULT_ICONS[n.level] || "ℹ"),
+      body,
+      run && n.action_label ? el("button", { class: "btn rb-action", onclick: run }, n.action_label) : null);
+  }));
+}
+
+/* Re-read the result status after a scan ends, leaving the page as it is. */
+async function reloadResultStatus() {
+  try { S.meta = await api("/api/meta"); } catch (e) { return; }
+  renderResultBanner();
+}
+
 function setFixBanner(node, kind) {
   const bn = $("#fixerBanner");
   if (!node) { bn.hidden = true; bn.replaceChildren(); return; }
@@ -2475,21 +2516,29 @@ function hebrewResult(resp, fallback) {
   return parts.length ? parts.join(", ") : fallback;
 }
 
+async function refreshFindings() {
+  if (!confirm("לרענן את הממצאים מהסריקה הנוכחית (report.db)?\n\nהחלטות על ממצאים שעדיין קיימים — יישמרו. ממצאים שנעלמו — יוסרו. ממצאים חדשים יתווספו כ«טרם נבדק».")) return;
+  try {
+    toast("מרענן מסריקה חדשה — נא להמתין…");
+    refreshToast(await api("/api/refresh", { method: "POST", body: {} }));
+    afterDataChanged();
+  } catch (e) { toast("הרענון נכשל: " + e.message, "err"); }
+}
+
+/* /api/refresh says whether what it loaded is the latest scan's results:
+   reloading the previous scan's results after a failed scan is no success. */
+function refreshToast(r) {
+  if (r && r.stale) toast(r.message, "warn", 15000);
+  else toast(hebrewResult(r, "הרענון הושלם"), "ok", 8000);
+}
+
 function bindScanModal() {
   $("#btnScan").addEventListener("click", openScanModal);
   bindScanRun();
   bindBookScan();
   $("#scanClose").addEventListener("click", closeScanModal);
   $("#scanScrim").addEventListener("click", closeScanModal);
-  $("#scanRefresh").addEventListener("click", async () => {
-    if (!confirm("לרענן את הממצאים מהסריקה הנוכחית (report.db)?\n\nהחלטות על ממצאים שעדיין קיימים — יישמרו. ממצאים שנעלמו — יוסרו. ממצאים חדשים יתווספו כ«טרם נבדק».")) return;
-    try {
-      toast("מרענן מסריקה חדשה — נא להמתין…");
-      const r = await api("/api/refresh", { method: "POST", body: {} });
-      toast("הרענון הושלם: " + hebrewResult(r, "בוצע"), "ok", 7000);
-      afterDataChanged();
-    } catch (e) { toast("הרענון נכשל: " + e.message, "err"); }
-  });
+  $("#scanRefresh").addEventListener("click", refreshFindings);
   $("#scanImportLegacy").addEventListener("click", async () => {
     if (!confirm("לייבא את ההחלטות מהכלי הישן (decisions.db)?\n\nהחלטות accept יהפכו ל«אושר», reject ל«לא שגיאה» (כולל חוקי «בכל מקום»), ignore ל«התעלם». ההחלטות ישויכו לממצאים לפי מילה ומזהה שורה.")) return;
     try {
@@ -2730,6 +2779,9 @@ function renderScanStatus(st) {
     else if (st.state === "done") toast("הסריקה הושלמה — אפשר לרענן את הממצאים", "ok", 8000);
     else if (st.state === "failed") toast("הסריקה נכשלה: " + (st.error || "ראו את יומן הריצה"), "err", 10000);
     else if (st.state === "cancelled") toast("הסריקה בוטלה", "", 5000);
+    // the scan's run record is final before its status turns, so the banner
+    // can show this outcome now (a finished book scan reloaded it above)
+    if (!(st.state === "done" && st.is_book)) reloadResultStatus();
   }
   SCAN.lastState = st.state;
 }
@@ -2782,8 +2834,7 @@ function bindScanRun() {
   $("#scanRefreshAfter").addEventListener("click", async () => {
     try {
       toast("מרענן ממצאים מהסריקה החדשה — נא להמתין…");
-      const r = await api("/api/refresh", { method: "POST", body: {} });
-      toast(hebrewResult(r, "הרענון הושלם"), "ok", 8000);
+      refreshToast(await api("/api/refresh", { method: "POST", body: {} }));
       $("#scanRefreshAfter").hidden = true;
       afterDataChanged();
     } catch (e) { toast("הרענון נכשל: " + e.message, "err", 8000); }
@@ -2910,6 +2961,7 @@ async function reloadAfterBookScan() {
   S.sel.clear();
   S.cardStale = true;
   try { S.meta = await api("/api/meta"); buildSidebar(); } catch (e) {}
+  renderResultBanner();
   loadBooks();
   refreshCurrentView();
   updateProgress();
@@ -2921,6 +2973,7 @@ async function afterDataChanged() {
   S.sel.clear();
   S.cardStale = true;
   try { S.meta = await api("/api/meta"); buildSidebar(); } catch (e) {}
+  renderResultBanner();
   loadBooks();
   refreshCurrentView();
   updateProgress();
@@ -3190,6 +3243,7 @@ async function init() {
     S.meta = { origins: [], errtypes: [], statuses: FALLBACK_STATUSES, columns: [] };
   }
   buildSidebar();
+  renderResultBanner();
   loadBooks();
   showView(S.view, true);
   updateProgress();
