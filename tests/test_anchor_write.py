@@ -1091,6 +1091,108 @@ class TestRepeatedWordInSeparateBatches(Env):
         self.assertEqual(raw(self.path), before)
 
 
+class TestRepeatedWordNeedsProof(Env):
+    """A copy of a repeated word is written only when it is proven to be the
+    copy the scan meant — through the real book-scan -> apply path.
+
+    Counting the copies left is no proof: a copy fixed by hand plus a new one
+    typed in keeps the count, and every copy after them moves up one place.
+    """
+    W, FIX = 'לשמיס', 'לשמים'
+    REL = 'מקור/חוזר.txt'
+    # far enough apart that the fixer's recorded context (24 characters)
+    # around its own edit does not reach the next copy
+    THREE = ('רבו {w} כעבד לפני רבו והלכה כדברי {w} כעבד לפני רבו והלכה כדברי '
+             '{w} סוף')
+    TWO = 'כעבד לפני רבו {w} כעבד לפני רבו {w}'
+
+    def scan(self, line):
+        import pickle
+        from collections import Counter
+        from magiah import book_scan, core
+        words = set(normalize.tokenize(
+            self.THREE + ' ' + self.TWO + ' פתיחה סוף הקובץ ' + self.FIX))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq[self.W] = 2
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            pickle.dump(freq, f)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'פתיחה\n%s\nסוף הקובץ\n' % line.format(w=self.W))
+        self.key = 'file:' + self.REL
+        db.merge_book_scan(self.outdir, book_scan.scan_book(
+            self.outdir, 'library', self.REL, library_dir=self.lib))
+        con = self.con()
+        try:
+            ids = [r[0] for r in con.execute(
+                'SELECT id FROM findings WHERE word = ? AND unit = ? '
+                'ORDER BY id', (self.W, self.key + ':1'))]
+            db.set_status(con, self.outdir, ids, 'approved')
+        finally:
+            con.close()
+        return ids
+
+    def line(self):
+        return raw(self.path).decode('utf-8').split('\n')[1]
+
+    def by_hand(self, text):
+        write(self.path, 'פתיחה\n%s\nסוף הקובץ\n' % text)
+
+    def refused(self, fid, code='ambiguous_occurrence'):
+        before = raw(self.path)
+        res, status = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(status, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']], [code])
+        # a click on the right copy is still offered
+        self.assertEqual(res['failed'][0]['located_line'], 1)
+        self.assertEqual(raw(self.path), before)
+
+    def test_three_copies_one_fixed_by_hand_and_one_typed(self):
+        """QA's case: the fixer writes copy 0; by hand copy 1 is fixed and a
+        new copy typed at the end; copy 1's finding used to be written onto
+        copy 2 (the count was 3 again)."""
+        ids = self.scan(self.THREE)
+        self.assertEqual(len(ids), 3)
+        res, code = self.apply(self.key, [{'id': ids[0]}])
+        self.assertEqual(code, 200, res)
+        t = self.line()
+        i = t.index(self.W)                  # copy 1: copy 0 is fixed now
+        self.by_hand(t[:i] + self.FIX + t[i + len(self.W):] + ' ' + self.W)
+        for fid in ids[1:]:
+            with self.subTest(fid=fid):
+                self.refused(fid)
+
+    def test_fixer_wrote_copy_0_then_a_copy_typed_at_the_end(self):
+        """With the fixer's edit undone the line has three copies, not the
+        scan's two: copy 1's finding used to land on the typed copy."""
+        ids = self.scan(self.TWO)
+        res, code = self.apply(self.key, [{'id': ids[0]}])
+        self.assertEqual(code, 200, res)
+        self.by_hand(self.line() + ' ' + self.W)
+        self.refused(ids[1], 'occurrence_count_changed')
+
+    def test_copy_0_fixed_by_hand_and_a_copy_typed_at_the_end(self):
+        """Pre-existing: two copies again, but the second is the typed one."""
+        ids = self.scan(self.TWO)
+        self.by_hand(self.TWO.format(w=self.W).replace(self.W, self.FIX, 1)
+                     + ' ' + self.W)
+        self.refused(ids[1])
+
+    def _one_batch_each(self, line, order):
+        ids = self.scan(line)
+        for k in order:
+            res, code = self.apply(self.key, [{'id': ids[k]}])
+            self.assertEqual(code, 200, res)
+            self.assertIn(res['applied'][0]['confidence'],
+                          ('exact', 'indexed'))
+        self.assertEqual(self.line(), line.format(w=self.FIX))
+
+    def test_separate_batches_still_apply_two_copies(self):
+        self._one_batch_each(self.TWO, (0, 1))
+
+    def test_separate_batches_still_apply_three_copies(self):
+        self._one_batch_each(self.THREE, (1, 2, 0))
+
+
 class TestManualPickNeedsIdentity(Env):
     """A refused anchor must never turn an unidentified line into a click
     target: the human may only choose among snippet-identified lines."""

@@ -573,28 +573,88 @@ def _own_bracket(line, a, b, end, correction, own_edits):
     return bool(tail) and tail in _GERESH and paren == corr + tail
 
 
-def _own_rewrites(line, lineno, word, own_edits):
-    """Where on this line the fixer's own recorded edits replaced a copy of
-    `word` that is now gone (replace mode; bracket mode keeps the copy).
+def _as_scanned(line, lineno, own_edits):
+    """The line with the fixer's own live edits on it undone: as the scan
+    saw it, as far as the fixer had a hand in it.
 
-    Only edits recorded for this very line count, each one proven still in
-    place by its recorded context — a copy that vanished by hand, or any
-    doubt, explains nothing.
+    Returns ``(text, undone)`` with each undone edit as ``(now_start,
+    now_end, then_start, then_end)``. An edit no longer found where its
+    record says (edited around by hand since) is left as it is: wherever it
+    matters, the exact checks made on the result then fail, which is the
+    point. None when two records overlap — nothing is proven then.
     """
-    want = word.split()
-    out = []
+    found = []
     for e in own_edits or ():
-        if e.get('lineno') != lineno \
-                or normalize.tokenize(e.get('old') or '') != want:
-            continue
-        new = normalize.tokenize(e.get('new') or '')
-        if any(new[i:i + len(want)] == want
-               for i in range(len(new) - len(want) + 1)):
+        if e.get('lineno') != lineno:
             continue
         pos = _locate_entry(line, e)
         if pos is not None:
-            out.append(pos)
-    return out
+            found.append((pos, pos + len(e.get('new') or ''),
+                          e.get('old') or ''))
+    found.sort()
+    parts, undone, prev, then = [], [], 0, 0
+    for a, b, old in found:
+        if a < prev:
+            return None
+        parts.append(line[prev:a])
+        then += a - prev
+        undone.append((a, b, then, then + len(old)))
+        parts.append(old)
+        then += len(old)
+        prev = b
+    parts.append(line[prev:])
+    return ''.join(parts), undone
+
+
+def _scanned_copy(line, lineno, word, finding, spans, own_edits):
+    """Index in `spans` (the copies of `word` on the line now) of the copy
+    the finding means, chosen by the scan's order — and proven, or refused.
+
+    Counting the copies that are left proves nothing: a copy fixed by hand
+    and another one typed in keep the count while shifting every copy after
+    them. So the line is rebuilt as the scan saw it (the fixer's own edits on
+    it undone); there the word must occur as often as the scan counted, and
+    the copy at the finding's place in that order must have the scan's
+    snippet window EXACTLY. Only then is it mapped back onto the line as it
+    is now. Anything less is refused, with the copies offered for a click.
+    """
+    fid = finding.get('id')
+    expected = finding.get('expected_count')
+    occurrence = finding.get('occurrence') or 0
+    snippet = finding.get('snippet')
+
+    def refuse(code):
+        raise PatchError(code, _msg(code, word=word, n=lineno + 1,
+                                    k=len(spans)),
+                         id=fid, candidates=[[s[0], s[1]] for s in spans],
+                         located_line=lineno)
+
+    rebuilt = _as_scanned(line, lineno, own_edits)
+    if rebuilt is None:
+        refuse('ambiguous_occurrence')
+    then, undone = rebuilt
+    clean_then, occs = _occurrences(then, word)
+    if expected is not None and expected != len(occs):
+        refuse('occurrence_count_changed')
+    if not 0 <= occurrence < len(occs):
+        refuse('ambiguous_occurrence')
+    o, r = occs[occurrence], SNIPPET_RADIUS
+    if not snippet or \
+            clean_then[max(0, o[2] - r):o[3] + r].strip() != snippet:
+        refuse('ambiguous_occurrence')
+    shift = 0
+    for a, b, ta, tb in undone:
+        if tb <= o[0]:
+            shift += (b - a) - (tb - ta)
+        elif ta < o[1]:
+            # the fixer already rewrote this very copy (for another finding)
+            raise PatchError('already_applied', _msg(
+                'already_applied', n=lineno + 1), id=fid)
+    hit = [i for i, s in enumerate(spans)
+           if (s[0], s[1]) == (o[0] + shift, o[1] + shift)]
+    if len(hit) != 1:
+        refuse('ambiguous_occurrence')
+    return hit[0]
 
 
 def manual_lines(doc, finding):
@@ -675,45 +735,19 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             finding.get('trusted', False))
         line = doc.lines[lineno]
         total = len(spans)
-        expected = finding.get('expected_count')
-        occurrence = finding.get('occurrence') or 0
         if level == LEVEL_WINDOW and len(ident) == 1:
             # the window pins the occurrence, whatever else changed
             occurrence, confidence = ident[0], 'exact'
+        elif total == 1 and finding.get('expected_count') in (None, 1):
+            # the one copy, on a line identified by its words: as scanned
+            occurrence, confidence = 0, 'weak'
         else:
-            # Several equally-identified copies (a short line: every window is
-            # the whole line). Only the scan's own order can choose, and only
-            # while the line still has the count the scan saw — "only one is
-            # left" says nothing about WHICH one the finding meant. Unless the
-            # missing copies are provably the fixer's own earlier edits on
-            # this line: then they still hold their places in that order.
-            if expected is not None and expected != total:
-                own = _own_rewrites(line, lineno, word, own_edits)
-                order = sorted([(s[0], i) for i, s in enumerate(spans)]
-                               + [(p, None) for p in own])
-                if not own or len(order) != expected \
-                        or not 0 <= occurrence < expected:
-                    raise PatchError(
-                        'occurrence_count_changed',
-                        _msg('occurrence_count_changed', word=word,
-                             n=lineno + 1),
-                        id=fid, candidates=[[s[0], s[1]] for s in spans],
-                        located_line=lineno)
-                occurrence = order[occurrence][1]
-                if occurrence is None:
-                    # this very copy was rewritten by the fixer already
-                    raise PatchError('already_applied', _msg(
-                        'already_applied', n=lineno + 1), id=fid)
-            if total == 1:
-                occurrence = 0
-            elif not (0 <= occurrence < total) or occurrence not in ident:
-                raise PatchError(
-                    'ambiguous_occurrence',
-                    _msg('ambiguous_occurrence', word=word, n=lineno + 1,
-                         k=total),
-                    id=fid, candidates=[[s[0], s[1]] for s in spans],
-                    located_line=lineno)
-            confidence = 'indexed' if level == LEVEL_WINDOW else 'weak'
+            # Several copies to choose from (on a short line every window is
+            # the whole line), or copies gone or added since the scan: only
+            # the scan's own order can choose, and only with proof.
+            occurrence = _scanned_copy(line, lineno, word, finding, spans,
+                                       own_edits)
+            confidence = 'indexed'
         start, end = spans[occurrence][0], spans[occurrence][1]
 
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
