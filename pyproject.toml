@@ -34,3 +34,12 @@ include = ["magiah*"]
 # installs a UI that only shows its "files not installed" placeholder
 [tool.setuptools.package-data]
 "magiah.webui" = ["static/*"]
+
+[tool.ruff]
+target-version = "py39"
+extend-exclude = ["build", "dist", "scan-results", ".claude", ".git-rewrite"]
+
+[tool.ruff.lint]
+# pyflakes + syntax errors only: catches real bugs (undefined names, unused
+# imports) without imposing a style on existing code
+select = ["E9", "F"]

@@ -12,3 +12,7 @@ __pycache__/
 dist/
 build/
 .venv/
+
+# local tooling leftovers
+.claude/worktrees/
+.git-rewrite/

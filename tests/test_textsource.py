@@ -221,7 +221,6 @@ class Schema6Test(unittest.TestCase):
         spec = {'type': 'sqlite', 'path': p, 'table': 'line', 'id_col': 'id',
                 'text_col': 'content', 'preset': 'otzaria'}
         core.build_lexicon(spec, Config(workers=1, n_chunks=2), out)
-        import pickle
         with open(os.path.join(out, core.LEXICON_F), 'rb') as f:
             lex = pickle.load(f)
         self.assertEqual(lex.get('שלום'), 1)
