@@ -360,7 +360,11 @@ def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None,
     """
     passes = passes or {}
     policy = policy or _Policy()
-    if _missing_rows({'main': stats, **passes})[0] <= policy.limit:
+    # the rows inherited count too: each part within the limit does not make
+    # their union so — and an output is written only if its record says
+    # accepted
+    if _missing_rows({'main': stats, **passes},
+                     policy.inherited)[0] <= policy.limit:
         return
     info = _write_coverage(out_dir, _coverage_info(stage, stats, extra,
                                                    passes, policy))
@@ -369,6 +373,8 @@ def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None,
     lines = [f'שלב "{_STAGE_HE.get(stage, stage)}" לא הצליח לקרוא '
              f'{rows:,} שורות מהקלט, ולכן התוצאה חלקית ואינה מוצגת '
              f'כהצלחה.']
+    if policy.inherited:
+        lines.append('(כולל שורות שחסרו כבר בתוצרים של השלבים שקדמו לו.)')
     if limit:
         lines.append(f'הריצה אישרה לדלג על {limit:,} שורות לכל היותר '
                      f'(‎--allow-unread {limit}‎).')
@@ -555,7 +561,8 @@ def _latest_coverage(out_dir, stage):
                 and isinstance(refs, list)):
             units = info.get('unread_units')
             info['unread_rows'] = rows
-            info['unread_refs'] = [r for r in refs if isinstance(r, dict)]
+            info['unread_refs'] = [dict(r, unit=str(r.get('unit', '')))
+                                   for r in refs if isinstance(r, dict)]
             # ids are only an aid to counting: without them, rows add up
             info['unread_units'] = ([str(u) for u in units]
                                     if isinstance(units, list) else [])

@@ -395,6 +395,45 @@ class DistinctRowsTest(_Case):
             os.path.join(self.out, core.REPORT_DB_F)))
 
 
+class UnionLimitTest(_Case):
+    """Parts each within the limit can miss different rows; the limit holds
+    for their union, so a written output is always an accepted one."""
+
+    def test_stage_counts_inherited_and_own_rows_together(self):
+        clean = os.path.join(self.tmp.name, 'one.db')
+        make_schema6_db(clean, corrupt_id=2)          # lexicon misses row 2
+        self.spec = _otzaria_spec(clean)
+        self.run_stage('lexicon', 1)
+        make_schema6_db(os.path.join(self.tmp.name, 'other.db'),
+                        corrupt_id=3)                 # detect misses row 3
+        self.spec = _otzaria_spec(os.path.join(self.tmp.name, 'other.db'))
+        with self.assertRaises(core.PartialRead) as cm:
+            self.run_stage('detect', 1)
+        self.assertIn('לא הצליח לקרוא 2 שורות', str(cm.exception))
+        self.assertIn('כולל שורות שחסרו', str(cm.exception))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, core.FLAGGED_F)))
+        self.run_stage('detect', 2)
+        cov = _coverage(self.out, 'detect')
+        self.assertEqual((cov['unread_rows'], cov['accepted']), (2, True))
+        self.assertEqual(sorted(cov['unread_units']), ['2', '3'])
+
+    def test_book_scan_counts_book_and_lexicon_rows_together(self):
+        lex_db = os.path.join(self.tmp.name, 'lex.db')
+        make_schema6_db(lex_db, missing_id=4)        # lexicon misses row 4
+        with _quiet():
+            core.build_lexicon(_otzaria_spec(lex_db), self.cfg(1), self.out)
+        # book 1 of self.db misses row 2: within 1, and so is the lexicon
+        with self.assertRaises(book_scan.BookScanError) as cm:
+            book_scan.scan_book(self.out, 'db', '1', cfg=self.cfg(1),
+                                db_path=self.db)
+        self.assertIn('בסך הכול', str(cm.exception))
+        self.assertIn('--allow-unread 2', str(cm.exception))
+        cov = book_scan.scan_book(self.out, 'db', '1', cfg=self.cfg(2),
+                                  db_path=self.db)['coverage']
+        self.assertEqual((cov['unread_rows'], cov['accepted']), (2, True))
+
+
 class CliTest(_Case):
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()

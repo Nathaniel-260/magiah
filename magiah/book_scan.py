@@ -617,6 +617,16 @@ def scan_book(out_dir, source, key, cfg=None, db_path=None, library_dir=None,
     coverage = core.gap_record(
         passes, core.accepted_gaps(out_dir, 'lexicon'), limit,
         db_path or (spec and core.spec_db(spec)) or OTZARIA_DB)
+    if coverage and not coverage['accepted']:
+        # each part was within the limit, their union is not: the book's
+        # rows, the context pass and the lexicon missed different rows
+        raise BookScanError('\n'.join(
+            [f'הסריקה של «{book.title}» חסרה {coverage["unread_rows"]:,} '
+             f'שורות בסך הכול (בספר, באימות ההקשר ובמילון), יותר מ-'
+             f'{limit:,} שהותרו; היא בוטלה כדי לא להציג תוצאה חלקית.']
+            + core.refs_lines(coverage['unread_refs'],
+                              coverage['unread_rows'])
+            + [core.proceed_hint(coverage['unread_rows'])]))
     say(f'[book] הסתיים: {len(rows):,} ממצאים, '
         f'{len(space_rows):,} רווחים מיותרים  ({time.time() - t0:.1f} שניות)')
     if coverage:
