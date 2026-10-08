@@ -78,6 +78,9 @@ def make_schema6_db(path, corrupt_id=None, plain_id=None, missing_id=None):
         CREATE TABLE version_line(versionId INT, lineId INT, content TEXT,
                                   charCount INT,
                                   PRIMARY KEY(versionId, lineId));
+        -- the real database's indexes: the query plans depend on them
+        CREATE INDEX idx_line_book_index ON line(bookId, lineIndex);
+        CREATE INDEX idx_version_line_line ON version_line(lineId);
     ''')
     con.execute('INSERT INTO zstd_dict VALUES(1, ?)', (zd.dict_content,))
     for i, b, t in LINES:
@@ -607,6 +610,179 @@ class ReadStatsCountedTest(unittest.TestCase):
         corpus.close()
         # the version row belongs to book 1 (Sefaria), so hybrid skips it too
         self.assertEqual(corpus.stats.version_lines_skipped, 1)
+
+
+# make_schema6_db + add_version_edge_cases: line id -> book id
+_LINE_BOOKS = {1: 1, 2: 1, 3: 2, 4: 2, 6: 3, 7: 3, 9: 3}
+# (versionId, lineId) of their version rows with content; no line 8 or 50
+_VERSION_READINGS = [(1, 2), (4, 2), (2, 3), (3, 6), (3, 7), (3, 8), (3, 50)]
+_BY_SOURCE = ('SELECT b.id FROM book b JOIN source s ON s.id = b.sourceId '
+              'WHERE s.name = ?')
+# name -> (book_ids_sql, params, the book ids it selects)
+_BOOK_FILTERS = {
+    'none': (None, (), None),
+    'Sefaria': (_BY_SOURCE, ('Sefaria',), {1, 3}),
+    'Dicta': (_BY_SOURCE, ('DictaToOtzaria',), {2}),
+    'hasTeamim': ('SELECT id FROM book WHERE hasTeamim = 1', (), {3}),
+    'no book': ('SELECT id FROM book WHERE 0', (), set()),
+}
+
+
+def add_version_edge_cases(path):
+    """On top of make_schema6_db: a second Sefaria book (3, cantillated)
+    with gaps in its line ids, a line with two versions, NULL rows in two
+    books, and version rows whose line does not exist (8 and 50)."""
+    con = sqlite3.connect(path)
+    zd = _zstd.ZstdDict(
+        con.execute('SELECT dict FROM zstd_dict').fetchone()[0])
+
+    def z(text):
+        return _zstd.compress(text.encode('utf-8'), zstd_dict=zd)
+
+    con.execute("INSERT INTO book VALUES(3, 'ספר ג', 1, 1)")
+    for i in (6, 7, 9):
+        con.execute('INSERT INTO line VALUES(?,3,?,?,NULL,0)',
+                    (i, i, f'ref {i}'))
+        con.execute('INSERT INTO line_content VALUES(?,?)',
+                    (i, z(f'שורה {i}')))
+    con.executemany('INSERT INTO book_version VALUES(?,?,?,1)',
+                    [(2, 2, 'v2'), (3, 3, 'v3'), (4, 1, 'v4')])
+    con.executemany('INSERT INTO version_line VALUES(?,?,?,0)',
+                    [(v, ln, z('נוסח אחר')) for v, ln in _VERSION_READINGS
+                     if (v, ln) != (1, 2)]   # make_schema6_db's own row
+                    + [(2, 4, None), (3, 9, None)])
+    con.commit()
+    con.close()
+
+
+def _in_subquery_sql(lo, hi, book_ids_sql, params):
+    """count_version_lines' query before the join, ``(sql, args)``: the
+    reference for which rows count."""
+    sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
+    args = []
+    if lo is not None:
+        sql += ' AND lineId >= ? AND lineId < ?'
+        args = [lo, hi]
+    if book_ids_sql:
+        sql += (' AND lineId IN (SELECT id FROM line '
+                f'WHERE bookId IN ({book_ids_sql}))')
+        args.extend(params)
+    return sql, args
+
+
+class _Recorder:
+    """Stands in for a connection and keeps every statement run on it."""
+
+    def __init__(self, con):
+        self.con, self.calls = con, []
+
+    def execute(self, sql, args=()):
+        self.calls.append((sql, tuple(args)))
+        return self.con.execute(sql, args)
+
+
+@contextlib.contextmanager
+def _recording(odb):
+    """Record the statements `odb` runs; its connection is restored after."""
+    rec = odb.con = _Recorder(odb.con)
+    try:
+        yield rec
+    finally:
+        odb.con = rec.con
+
+
+def _plan(con, sql, args):
+    """The EXPLAIN QUERY PLAN details of a statement, joined. Only the
+    details are used: the other columns differ between SQLite versions."""
+    return ' | '.join(str(r[-1]) for r in
+                      con.execute('EXPLAIN QUERY PLAN ' + sql, args))
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class BookFilteredReadTest(unittest.TestCase):
+    """Reads restricted to some books: the same rows, with a chunk's id range
+    — not the list of the selected books' lines — driving the scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+        add_version_edge_cases(self.db)
+        bounds = list(range(12)) + [50, 51]
+        self.ranges = [(lo, hi) for lo in bounds for hi in bounds if lo <= hi]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _hybrid(self):
+        lib = os.path.join(self.tmp.name, 'lib')
+        os.makedirs(lib, exist_ok=True)
+        return HybridCorpus({'type': 'hybrid', 'path': lib, 'db': self.db})
+
+    def test_version_counts_match_the_in_subquery_form(self):
+        ranges = [(None, None)] + self.ranges       # None: the whole table
+        with OtzariaDB(self.db) as odb:
+            for name, (sql, params, books) in _BOOK_FILTERS.items():
+                with self.subTest(name):
+                    got = [odb.count_version_lines(lo, hi, sql, params)
+                           for lo, hi in ranges]
+                    self.assertEqual(got, [
+                        odb.con.execute(*_in_subquery_sql(
+                            lo, hi, sql, params)).fetchone()[0]
+                        for lo, hi in ranges])
+                    self.assertEqual(got, [
+                        sum(1 for _, ln in _VERSION_READINGS
+                            if (lo is None or lo <= ln < hi) and (
+                                books is None
+                                or _LINE_BOOKS.get(ln) in books))
+                        for lo, hi in ranges])
+
+    def test_hybrid_skipped_count_does_not_depend_on_chunking(self):
+        for n in (1, 2, 3, 7):
+            with self.subTest(chunks=n):
+                corpus = self._hybrid()
+                for ch in corpus.chunks(n):
+                    list(corpus.iter_texts_docs(ch))
+                corpus.close()
+                # (1,2) (4,2) (3,6) (3,7): the Sefaria books' own readings
+                self.assertEqual(corpus.stats.version_lines_skipped, 4)
+
+    def test_range_reads_return_exactly_the_selected_books(self):
+        with OtzariaDB(self.db) as odb:
+            for name, (sql, params, books) in _BOOK_FILTERS.items():
+                with self.subTest(name):
+                    for lo, hi in self.ranges:
+                        st = ReadStats()
+                        got = sorted((lid, bid) for lid, bid, _ in
+                                     odb.iter_range(lo, hi, st, sql, params))
+                        self.assertEqual(got, sorted(
+                            (i, b) for i, b in _LINE_BOOKS.items()
+                            if lo <= i < hi
+                            and (books is None or b in books)), (lo, hi))
+                        self.assertEqual(st.unread(), 0)
+
+    def test_hybrid_chunk_is_driven_by_its_id_range(self):
+        corpus = self._hybrid()
+        try:
+            _, lo, hi = next(c for c in corpus.chunks(2) if c[0] == 'db')
+            with _recording(corpus._otzaria()) as rec:
+                list(corpus.iter_texts_docs(('db', lo, hi)))
+            [read] = [c for c in rec.calls if 'line_content' in c[0]]
+            [count] = [c for c in rec.calls if 'version_line' in c[0]]
+            read_plan = _plan(rec.con, *read)
+            count_plan = _plan(rec.con, *count)
+            old_plan = _plan(rec.con, *_in_subquery_sql(
+                lo, hi, _BY_SOURCE, ('Sefaria',)))
+        finally:
+            corpus.close()
+        # driven by the book index, SQLite walked the lines of every
+        # selected book on each chunk; the range must drive instead
+        self.assertIn('rowid>?', read_plan)
+        self.assertIn('lineId>?', count_plan)
+        for plan in (read_plan, count_plan):
+            self.assertNotIn('idx_line_book_index', plan)
+        # and the check is not vacuous: the IN-subquery form fails it
+        self.assertIn('idx_line_book_index', old_plan)
 
 
 class ReadOnlyUriTest(unittest.TestCase):

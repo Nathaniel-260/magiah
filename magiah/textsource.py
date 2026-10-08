@@ -252,14 +252,17 @@ class OtzariaDB:
     def iter_range(self, lo, hi, stats, book_ids_sql=None, params=()):
         """Yield ``(line_id, book_id, text)`` for ``lo <= id < hi``.
 
-        `book_ids_sql` optionally restricts to a sub-select of book ids.
+        `book_ids_sql` optionally restricts to a sub-select of book ids; the
+        range still drives the scan, the books are only checked per row.
         Unreadable rows are counted in `stats` and skipped — never yielded as
         empty text, which would make a broken read look like an empty book.
         """
         sql = self._text_sql + ' WHERE l.id >= ? AND l.id < ?'
         args = [lo, hi]
         if book_ids_sql:
-            sql += f' AND l.bookId IN ({book_ids_sql})'
+            # unary '+' keeps idx_line_book_index from driving the scan:
+            # through it, every chunk walked the lines of every selected book
+            sql += f' AND +l.bookId IN ({book_ids_sql})'
             args.extend(params)
         for lid, bid, raw, present in self.con.execute(sql, args):
             text = self._decode_counted(lid, raw, stats, present)
@@ -304,15 +307,22 @@ class OtzariaDB:
         optionally only of the books `book_ids_sql` selects."""
         if not self.has_versions:
             return 0
-        sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
-        args = []
+        sql = 'SELECT COUNT(*) FROM version_line v'
+        conds, args = ['v.content IS NOT NULL'], []
         if lo is not None:
-            sql += ' AND lineId >= ? AND lineId < ?'
+            conds.append('v.lineId >= ? AND v.lineId < ?')
             args = [lo, hi]
         if book_ids_sql:
-            sql += (' AND lineId IN (SELECT id FROM line '
-                    f'WHERE bookId IN ({book_ids_sql}))')
+            # a join on line's primary key, not `lineId IN (SELECT id FROM
+            # line WHERE bookId IN ...)`: SQLite drove that from the IN list,
+            # building every selected book's line ids (~5M for Sefaria) on
+            # each chunk. Same rows (a version row without its `line` row
+            # matches neither); '+' keeps the book index from driving the
+            # join too.
+            sql += ' JOIN line l ON l.id = v.lineId'
+            conds.append(f'+l.bookId IN ({book_ids_sql})')
             args.extend(params)
+        sql += ' WHERE ' + ' AND '.join(conds)
         return self.con.execute(sql, args).fetchone()[0]
 
     def iter_version_range(self, lo, hi, stats):
