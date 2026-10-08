@@ -1581,24 +1581,46 @@ def _shuffle(x, bits, keys):
     return (left << h) | right
 
 
+def _id_bits(con):
+    """The random walk's width: every id issued so far is below 2**bits
+    (the high-water mark counts too: ids are never reissued)."""
+    top = con.execute('SELECT MAX(id) FROM findings').fetchone()[0] or 0
+    row = con.execute(
+        "SELECT value FROM meta WHERE key='max_finding_id'").fetchone()
+    try:
+        top = max(top, int(row[0])) if row else top
+    except (TypeError, ValueError):
+        pass
+    bits = max(2, top.bit_length())
+    return bits + bits % 2
+
+
 def _random_page(con, wsql, params, page_size, cursor, seed):
     """'random' sort: walk a seed-keyed permutation of the id space.
 
     Position k of the walk holds id _shuffle(k); every id is visited once,
     a different seed gives a different order, and a page costs only primary
     key lookups for a few hundred candidate ids — no table-wide sort.
+
+    The cursor is [position, bits]. One that is not a position of a walk
+    this table could have started (two integers, an even width no wider
+    than the ids issued so far) is refused: a crafted width of 62 made the
+    server walk 2**62 positions.
     """
+    bits = _id_bits(con)
+    k = -1
     if cursor:
         try:
-            k, bits = json.loads(cursor)
-            k, bits = int(k), int(bits)
+            ck, cbits = json.loads(cursor)
+            if not all(type(v) is int for v in (ck, cbits)):
+                raise TypeError
         except (ValueError, TypeError):
             raise ValueError(hebrew.MESSAGES['bad_request'])
-    else:
-        top = con.execute('SELECT MAX(id) FROM findings').fetchone()[0] or 0
-        bits = max(2, top.bit_length())
-        bits += bits % 2
-        k = -1
+        # ids only grow: a cursor's walk is never wider than one started now
+        if not (2 <= cbits <= bits and cbits % 2 == 0
+                and -1 <= ck < (1 << cbits)):
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        k, bits = ck, cbits
     digest = hashlib.sha256(str(seed or 0).encode('utf-8')).digest()
     keys = [int.from_bytes(digest[i:i + 4], 'big') for i in range(0, 16, 4)]
     end = 1 << bits

@@ -687,24 +687,29 @@ def walk(con, filters=None, **kw):
             return seen
 
 
+def add_r2_rows(con):
+    """400 findings with NULLs, empty strings and ties in every sort key."""
+    import random
+    rnd = random.Random(1)
+    rows = []
+    for i in range(1, 401):
+        rows.append((i, 'error', 'edit1_sub',
+                     rnd.choice([None, 'אב', 'גד', '']), 'ס',
+                     rnd.choice([None, 1.0, 2.5, 2.5, -1.0, 0.0]), 0, 'o',
+                     rnd.choice([None, 'א', 'ב', '']), 'r',
+                     rnd.choice([None, '', '5', '17', 'file:x/y.txt:3',
+                                 'abc']), 'd', ''))
+    con.executemany(f'INSERT INTO findings({FCOLS}) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+    con.commit()
+
+
 class TestR2Paging(Case):
     """NULLs, empty strings and ties in every sort key; seeds that differ."""
 
     def setUp(self):
         super().setUp()
-        import random
-        rnd = random.Random(1)
-        rows = []
-        for i in range(1, 401):
-            rows.append((i, 'error', 'edit1_sub',
-                         rnd.choice([None, 'אב', 'גד', '']), 'ס',
-                         rnd.choice([None, 1.0, 2.5, 2.5, -1.0, 0.0]), 0, 'o',
-                         rnd.choice([None, 'א', 'ב', '']), 'r',
-                         rnd.choice([None, '', '5', '17', 'file:x/y.txt:3',
-                                     'abc']), 'd', ''))
-        self.con.executemany(f'INSERT INTO findings({FCOLS}) '
-                             'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-        self.con.commit()
+        add_r2_rows(self.con)
 
     def test_every_sort_walks_every_row_once(self):
         for sort in ('rank', 'source', 'word', 'random'):
@@ -1212,6 +1217,47 @@ class TestStaleWithdrawal(ServerCase):
             other.rollback()
         finally:
             other.close()
+
+
+# ===========================================================================
+# The random sort's cursor
+# ===========================================================================
+
+class TestRandomCursor(Case):
+    """A random-sort cursor must name a position of a walk this table could
+    have started; a crafted width made the server walk 2**62 positions."""
+
+    def setUp(self):
+        super().setUp()
+        add_r2_rows(self.con)
+
+    def test_crafted_cursors_are_refused(self):
+        bits = db._id_bits(self.con)
+        for cur in ('[0, 62]', '[0, %d]' % (bits + 2), '[0, 5]', '[-5, 10]',
+                    '[%d, 10]' % (1 << 10), '["a", 10]', '[1.5, 10]',
+                    '[1e400, 10]', '[0]', '{}', '7', 'x', '[true, 10]'):
+            with self.subTest(cursor=cur):
+                with self.assertRaises(ValueError):
+                    db.query_findings_page(self.con, {}, sort='random',
+                                           cursor=cur, seed=1)
+        rows, _t, _c = db.query_findings_page(
+            self.con, {}, sort='random', cursor='[-1, %d]' % bits, seed=1)
+        self.assertEqual(len(rows), 50)
+
+    def test_a_crafted_cursor_is_a_400_over_http(self):
+        server.Handler.outdir = self.outdir
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = ('http://127.0.0.1:%d/api/findings?sort=random&seed=1'
+                   '&cursor=%%5B0%%2C62%%5D' % srv.server_address[1])
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(url, timeout=30)
+            self.assertEqual(cm.exception.code, 400)
+            cm.exception.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == '__main__':
