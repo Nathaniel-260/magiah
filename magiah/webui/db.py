@@ -244,9 +244,13 @@ def connect(outdir):
     return con
 
 
+DECISIONS_TIMEOUT = 30.0      # seconds to wait for a decisions.db lock
+
+
 def _decisions_con(outdir):
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=30.0)
-    con.execute('PRAGMA busy_timeout=30000')
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F),
+                          timeout=DECISIONS_TIMEOUT)
+    con.execute(f'PRAGMA busy_timeout={int(DECISIONS_TIMEOUT * 1000)}')
     if not con.execute("SELECT name FROM sqlite_master WHERE type='table' "
                        "AND name='decisions'").fetchone():
         con.execute('''CREATE TABLE IF NOT EXISTS decisions(
@@ -275,6 +279,11 @@ def _tanach_extra(evidence_json, verified):
         return {}
 
 
+class DecisionsLocked(PermissionError, ValueError):
+    """decisions.db is locked by another program. Carries a Hebrew message;
+    the server answers 423 with it, a book scan reports it as its error."""
+
+
 def _clear_dropped_decisions(con, outdir, keys):
     """Withdraw the decisions.db 'accept' rows of dropped legacy approvals.
 
@@ -285,28 +294,49 @@ def _clear_dropped_decisions(con, outdir, keys):
     and only while no other approved / fixed finding still stands on the same
     (word, unit) key. The `history` record of the drop is kept.
 
-    Runs inside the caller's ui_review.db transaction. Returns the
-    decisions.db connection (or None); the caller commits it only after its
-    own transaction has committed, and closes it.
+    Order: runs inside the caller's still-open ui_review.db transaction and
+    commits decisions.db FIRST; the ownership markers are deleted (in the
+    caller's transaction) only after that commit. If the caller's commit then
+    fails, the next refresh recomputes the same drop and finds nothing left
+    to withdraw. If decisions.db cannot be written (another program holds a
+    lock on it) nothing is withdrawn and :class:`DecisionsLocked` is raised,
+    so the caller rolls back the drop as well and the next refresh redoes
+    both. Returns the number of decisions withdrawn.
     """
     keys = {(w or '', u or '') for w, u in keys}
     if not keys or not os.path.exists(os.path.join(outdir, DECISIONS_F)):
-        return None
-    dec = _decisions_con(outdir)
-    for word, unit in keys:
-        if not _owns_decision(con, word, unit):
-            continue
-        if con.execute('''SELECT 1 FROM review r
-                JOIN findings f ON f.id = r.finding_id
-                WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
-                  AND r.status IN ('approved', 'fixed') LIMIT 1''',
-                       (word, unit)).fetchone():
-            continue
-        if dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
-                       "AND verdict = 'accept'", (word, unit)).rowcount:
-            con.execute('DELETE FROM owned_decisions '
-                        'WHERE word = ? AND unit = ?', (word, unit))
-    return dec
+        return 0
+    todo = [(word, unit) for word, unit in sorted(keys)
+            if _owns_decision(con, word, unit) and not con.execute(
+                '''SELECT 1 FROM review r
+                   JOIN findings f ON f.id = r.finding_id
+                   WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
+                     AND r.status IN ('approved', 'fixed') LIMIT 1''',
+                (word, unit)).fetchone()]
+    if not todo:
+        return 0
+    dec = None
+    try:
+        dec = _decisions_con(outdir)
+        gone = []
+        for word, unit in todo:
+            dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
+                        "AND verdict = 'accept'", (word, unit))
+            # nothing of ours left under this key (also after a retry)
+            if not dec.execute('SELECT 1 FROM decisions '
+                               'WHERE word = ? AND unit = ?',
+                               (word, unit)).fetchone():
+                gone.append((word, unit))
+        dec.commit()
+    except sqlite3.OperationalError as e:
+        raise DecisionsLocked(hebrew.MESSAGES['decisions_locked']) from e
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
+    for word, unit in gone:
+        con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
+                    (word, unit))
+    return len(gone)
 
 
 def import_all(outdir, migrate_legacy=False):
@@ -325,7 +355,6 @@ def import_all(outdir, migrate_legacy=False):
         raise FileNotFoundError(
             hebrew.MESSAGES['report_missing'].format(outdir=outdir))
     con = connect(outdir)
-    dec = None
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
         # A report.db can exist but hold no results: a 0-byte file left by an
@@ -559,8 +588,8 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
                        (SELECT id FROM findings)''')
         preserved = cur.execute('SELECT COUNT(*) FROM review').fetchone()[0]
-        dec = _clear_dropped_decisions(con, outdir,
-                                       [(w, u) for _, w, u in stale])
+        withdrawn = _clear_dropped_decisions(con, outdir,
+                                             [(w, u) for _, w, u in stale])
 
         counts.update({
             'total': total,
@@ -569,6 +598,7 @@ def import_all(outdir, migrate_legacy=False):
             'added': total - matched - kept,
             'removed': old_total - matched - kept,
             'preserved': preserved,
+            'legacy_decisions_withdrawn': withdrawn,
             'book_scan_kept': kept,
         })
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
@@ -582,8 +612,6 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('DROP TABLE keep_rows')
         cur.execute('DROP TABLE keep_docs')
         con.commit()
-        if dec is not None:
-            dec.commit()
         con.execute('DETACH DATABASE rep')
 
         if migrate_legacy:
@@ -591,8 +619,6 @@ def import_all(outdir, migrate_legacy=False):
         counts['seconds'] = round(time.time() - t0, 1)
         return counts
     finally:
-        if dec is not None:
-            dec.close()
         con.close()
 
 
@@ -639,7 +665,6 @@ def import_book_scan(outdir, result):
     where = '(f.doc = ? OR (f.doc IS NULL AND f.source = ?))'
     wparams = (doc, title)
     con = connect(outdir)
-    dec = None
     try:
         cur = con.cursor()
         cur.execute('BEGIN IMMEDIATE')
@@ -776,25 +801,22 @@ def import_book_scan(outdir, result):
                         'VALUES(?,?,?,?,?,?,?)',
                         (ts, 'legacy_recheck', fid, word, 'approved', None,
                          'tanach_legacy'))
-        dec = _clear_dropped_decisions(con, outdir,
-                                       [(w, u) for _, w, u in stale])
+        withdrawn = _clear_dropped_decisions(con, outdir,
+                                             [(w, u) for _, w, u in stale])
 
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
         for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
-        if dec is not None:
-            dec.commit()
         return {'doc': doc, 'title': result.get('title'),
                 'added': added, 'replaced': old_total,
                 'preserved': preserved,
                 'legacy_approvals_dropped': len(stale),
+                'legacy_decisions_withdrawn': withdrawn,
                 'findings': len(result.get('findings') or []),
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
-        if dec is not None:
-            dec.close()
         con.close()
 
 

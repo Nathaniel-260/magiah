@@ -532,9 +532,27 @@ class LegacyTest(unittest.TestCase):
         dec.close()
         return st, d, n, ids
 
-    def test_dropped_legacy_approval_is_withdrawn_from_decisions_db(self):
-        """A dropped approval must not come back through decisions.db: not via
-        "import legacy decisions", and not in the old review tool."""
+    # statuses set through the UI before the re-check mark existed, so
+    # decisions.db mirrors them (and the UI owns those rows)
+    SEED = ((1, 'error', 'edit1_sub', 'פרץ', '7', 2, 'פרח', 'approved'),
+            (2, 'error', 'edit1_sub', 'בייתה', '8', 0, 'ביתה', 'approved'),
+            (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None, 'אדום',
+             'approved'),
+            (4, 'error', 'edit1_sub', 'קפץ', '10', 2, 'קפה', 'not_error'),
+            (5, 'error', 'edit1_sub', 'גשמ', '11', 2, 'גשם', 'ignored'),
+            (6, 'error', 'edit1_sub', 'שמש', '12', 2, 'שמס', 'unsure'),
+            (7, 'error', 'edit1_sub', 'ירח', '13', 2, 'ירך', 'fixed'))
+    SEED_ST = {'פרץ': 'approved', 'בייתה': 'approved', 'אדוס': 'approved',
+               'קפץ': 'not_error', 'גשמ': 'ignored', 'שמש': 'unsure',
+               'ירח': 'fixed'}
+    SEED_DEC = {('פרץ', '7'): 'accept', ('בייתה', '8'): 'accept',
+                ('אדוס', '9'): 'accept', ('קפץ', '10'): 'reject',
+                ('גשמ', '11'): 'ignore', ('ירח', '13'): 'accept'}
+    EXPECT_ST = dict(SEED_ST, פרץ=None, אדוס=None)
+    EXPECT_DEC = {k: v for k, v in SEED_DEC.items()
+                  if k not in (('פרץ', '7'), ('אדוס', '9'))}
+
+    def _seed_ui(self):
         from magiah.webui import db as uidb
         rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
         rep.executemany(
@@ -545,33 +563,23 @@ class LegacyTest(unittest.TestCase):
                  '13', 's', 'Dicta', '3')])
         rep.commit()
         rep.close()
-        # statuses set through the UI before the re-check mark existed, so
-        # decisions.db mirrors them (and the UI owns those rows)
         con = uidb.connect(self.dir)
-        seed = ((1, 'error', 'edit1_sub', 'פרץ', '7', 2, 'פרח', 'approved'),
-                (2, 'error', 'edit1_sub', 'בייתה', '8', 0, 'ביתה',
-                 'approved'),
-                (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None,
-                 'אדום', 'approved'),
-                (4, 'error', 'edit1_sub', 'קפץ', '10', 2, 'קפה', 'not_error'),
-                (5, 'error', 'edit1_sub', 'גשמ', '11', 2, 'גשם', 'ignored'),
-                (6, 'error', 'edit1_sub', 'שמש', '12', 2, 'שמס', 'unsure'),
-                (7, 'error', 'edit1_sub', 'ירח', '13', 2, 'ירך', 'fixed'))
-        for fid, fam, et, w, unit, tan, sugg, _ in seed:
+        for fid, fam, et, w, unit, tan, sugg, _ in self.SEED:
             con.execute('INSERT INTO findings(id, family, errtype, word, '
                         'unit, ref, tanach, suggestion, source) '
                         'VALUES(?,?,?,?,?,?,?,?,?)',
                         (fid, fam, et, w, unit, 'ר', tan, sugg, 'ספר'))
         con.commit()
-        for fid, *_, status in seed:
+        for fid, *_, status in self.SEED:
             uidb.set_status(con, self.dir, [fid], status)
         con.close()
 
-        expect_st = {'פרץ': None, 'בייתה': 'approved', 'אדוס': None,
-                     'קפץ': 'not_error', 'גשמ': 'ignored', 'שמש': 'unsure',
-                     'ירח': 'fixed'}
-        expect_dec = {('בייתה', '8'): 'accept', ('קפץ', '10'): 'reject',
-                      ('גשמ', '11'): 'ignore', ('ירח', '13'): 'accept'}
+    def test_dropped_legacy_approval_is_withdrawn_from_decisions_db(self):
+        """A dropped approval must not come back through decisions.db: not via
+        "import legacy decisions", and not in the old review tool."""
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        expect_st, expect_dec = self.EXPECT_ST, self.EXPECT_DEC
         counts = uidb.import_all(self.dir)
         self.assertEqual(counts['legacy_approvals_dropped'], 2)
         st, dec, n, _ = self._ui_state()
@@ -628,6 +636,56 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual([tuple(h) for h in hist],
                          [(ids['פרץ'], 'פרץ', 'approved')])
         self.assertEqual(self._ui_state()[:2], (expect_st, expect_dec))
+
+    def test_locked_decisions_db_changes_nothing_and_heals(self):
+        """decisions.db locked by another program (a read transaction, or a
+        pending write): the refresh fails in Hebrew and changes nothing; the
+        next refresh drops and withdraws as usual."""
+        from unittest import mock
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        base = self.dir
+        try:
+            for mode in ('BEGIN', 'BEGIN IMMEDIATE'):
+                with self.subTest(lock=mode):
+                    self.dir = os.path.join(base, mode.replace(' ', '_'))
+                    os.makedirs(self.dir)
+                    for f in ('report.db', 'ui_review.db', 'decisions.db'):
+                        shutil.copy(os.path.join(base, f), self.dir)
+                    before = self._ui_state()
+                    self.assertEqual(before[1], self.SEED_DEC)
+                    holder = sqlite3.connect(
+                        os.path.join(self.dir, 'decisions.db'),
+                        isolation_level=None)
+                    try:
+                        holder.execute(mode)
+                        holder.execute('SELECT * FROM decisions').fetchall()
+                        with mock.patch.object(uidb, 'DECISIONS_TIMEOUT', 0.2):
+                            with self.assertRaises(uidb.DecisionsLocked) as cm:
+                                uidb.import_all(self.dir)
+                    finally:
+                        holder.execute('ROLLBACK')
+                        holder.close()
+                    self.assertIn('decisions.db', str(cm.exception))
+                    self.assertIsInstance(cm.exception, PermissionError)
+                    # nothing dropped, nothing withdrawn, ownership intact
+                    self.assertEqual(self._ui_state(), before)
+                    con = uidb.connect(self.dir)
+                    owned = set(tuple(r) for r in con.execute(
+                        'SELECT word, unit FROM owned_decisions'))
+                    con.close()
+                    self.assertTrue(set(self.SEED_DEC) <= owned)
+                    # the lock is gone: the next refresh does it all
+                    counts = uidb.import_all(self.dir)
+                    self.assertEqual(counts['legacy_approvals_dropped'], 2)
+                    self.assertEqual(counts['legacy_decisions_withdrawn'], 2)
+                    con = uidb.connect(self.dir)
+                    uidb.migrate_legacy_decisions(con, self.dir)
+                    con.close()
+                    self.assertEqual(self._ui_state()[:3],
+                                     (self.EXPECT_ST, self.EXPECT_DEC, 2))
+        finally:
+            self.dir = base
 
 
 class BibleBookShareTest(unittest.TestCase):
