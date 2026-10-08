@@ -1,0 +1,315 @@
+# -*- coding: utf-8 -*-
+"""Run-state markers: a scan that fails, reads partially or never finishes
+must leave the results marked as not current — and only a scan that rebuilds
+them may clear that.
+
+Every test runs the real pipeline (or the real CLI) over a small folder of
+text files; the only things simulated are the failures themselves.
+"""
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+
+from magiah import cli, core, runstate
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TUNE = ['--workers', '1', '--n-chunks', '1']
+
+
+def make_library(path):
+    """Enough text for a real finding: בדאשית is one letter from the
+    frequent בראשית."""
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, 'ספר.txt'), 'w', encoding='utf-8') as f:
+        f.write('בראשית ברא אלהים את השמים ואת הארץ\n' * 60)
+        f.write('בדאשית ברא אלהים את השמים ואת הארץ\n')
+
+
+def break_library(path):
+    """A '*.txt' entry that cannot be opened: the read stages count it as an
+    unread input and stop with core.PartialRead."""
+    os.makedirs(os.path.join(path, 'שבור.txt'), exist_ok=True)
+
+
+def mend_library(path):
+    os.rmdir(os.path.join(path, 'שבור.txt'))
+
+
+def run_cli(*argv):
+    """cli.main quietly; returns (exit code, stderr)."""
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(err):
+        rc = cli.main(list(argv))
+    return rc, err.getvalue()
+
+
+def scan_record(out):
+    with open(os.path.join(out, runstate.STATE_DIR, 'scan.json'),
+              encoding='utf-8') as f:
+        return json.load(f)
+
+
+class RunStateCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='magiah_rs_')
+        self.lib = os.path.join(self.tmp.name, 'lib')
+        self.out = os.path.join(self.tmp.name, 'out')
+        make_library(self.lib)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scan(self, command='all'):
+        return run_cli(command, '--textdir', self.lib, '--out', self.out,
+                       *TUNE)
+
+    def good_scan(self):
+        rc, err = self.scan()
+        self.assertFalse(rc, err)
+        self.assertIsNone(runstate.scan_problem(self.out))
+
+
+class PipelineRunTest(RunStateCase):
+
+    def test_successful_run_is_recorded_done(self):
+        self.good_scan()
+        rec = scan_record(self.out)
+        (run,) = rec['runs'].values()
+        self.assertEqual(run['state'], 'done')
+        self.assertEqual(run['stages'], ['lexicon', 'detect', 'locate',
+                                         'report'])
+        self.assertEqual(set(rec['stages']), {'lexicon', 'detect', 'locate'})
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, runstate.STATE_DIR, 'scan.json.tmp')))
+
+    def test_partial_read_is_stale_until_a_complete_run(self):
+        self.good_scan()
+        break_library(self.lib)
+        rc, err = self.scan()
+        self.assertEqual(rc, 1)
+        p = runstate.scan_problem(self.out)
+        self.assertEqual(p['state'], 'partial')
+        self.assertEqual(p['stage'], 'lexicon')
+        self.assertIn('לא הצליח לקרוא', p['reason'])
+        mend_library(self.lib)
+        self.good_scan()                    # a complete run clears it
+
+    def test_exception_is_recorded_with_its_stage(self):
+        self.good_scan()
+        with mock.patch.object(core, 'detect',
+                               side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self.scan()
+        p = runstate.scan_problem(self.out)
+        self.assertEqual(p['state'], 'failed')
+        self.assertEqual(p['stage'], 'detect')
+        self.assertEqual(p['reason'], 'RuntimeError: boom')
+
+    def test_ctrl_c_is_recorded_cancelled(self):
+        self.good_scan()
+        with mock.patch.object(core, 'locate',
+                               side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.scan()
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('cancelled', 'locate'))
+
+    def test_killed_process_reads_as_interrupted(self):
+        self.good_scan()
+        # a real process, killed in the middle of `locate`: nothing gets to
+        # finalize the record, exactly as with a power cut
+        code = ('import os, sys; sys.path.insert(0, sys.argv[1]); '
+                'from magiah import cli, core; '
+                'core.locate = lambda *a, **k: os._exit(9); '
+                'cli.main(sys.argv[2:])')
+        proc = subprocess.run(
+            [sys.executable, '-X', 'utf8', '-c', code, REPO, 'all',
+             '--textdir', self.lib, '--out', self.out, *TUNE],
+            capture_output=True, cwd=REPO)
+        self.assertEqual(proc.returncode, 9, proc.stderr)
+        self.assertEqual(scan_record(self.out)['runs'][
+            scan_record(self.out)['stages']['locate']]['state'], 'running')
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('interrupted', 'locate'))
+
+        # `report` alone succeeds (the old report.db is complete) but does
+        # not rebuild the results: the warning stays
+        rc, err = self.scan('report')
+        self.assertFalse(rc, err)
+        self.assertEqual(runstate.scan_problem(self.out)['state'],
+                         'interrupted')
+        # the next run persists what it found
+        self.assertEqual(scan_record(self.out)['runs'][
+            scan_record(self.out)['stages']['locate']]['state'],
+            'interrupted')
+        self.good_scan()
+
+    def test_running_run_is_in_progress_not_interrupted(self):
+        self.good_scan()
+        run = runstate.ScanRun(self.out, ['lexicon', 'detect'])
+        try:
+            run.enter('lexicon')
+            self.assertIsNone(runstate.scan_problem(self.out))
+        finally:
+            run.close()                     # dies without finishing
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('interrupted', 'lexicon'))
+
+    def test_run_that_stops_before_its_planned_stages_is_stale(self):
+        # the UI's default rescan: calibrate fails, so detect and locate —
+        # which it was going to rebuild — never run
+        self.good_scan()
+        stages = ['lexicon', 'calibrate', 'detect', 'locate', 'report']
+        with runstate.ScanRun(self.out, stages, via='ui') as run:
+            run.enter('lexicon')
+            run.enter('calibrate')
+            run.fail('calibrate failed')
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('failed', 'calibrate'))
+        self.assertEqual(p['stages'], stages)
+
+    def test_failures_outside_the_results_chain_are_not_stale(self):
+        self.good_scan()
+        # calibrate alone, and the CSV export after a completed locate,
+        # leave report.db exactly as current as it was
+        with runstate.ScanRun(self.out, ['calibrate']) as run:
+            run.enter('calibrate')
+            run.fail('x')
+        self.assertIsNone(runstate.scan_problem(self.out))
+        with runstate.ScanRun(self.out, ['locate', 'report']) as run:
+            run.enter('locate')
+            run.enter('report')
+            run.fail('x')
+        self.assertIsNone(runstate.scan_problem(self.out))
+
+    def test_second_concurrent_run_is_refused(self):
+        self.good_scan()
+        with runstate.ScanRun(self.out, ['lexicon']):
+            rc, err = self.scan()
+            self.assertEqual(rc, 1)
+            self.assertIn('סריקה אחרת כבר רצה', err)
+        self.assertIsNone(runstate.scan_problem(self.out))
+
+    def test_stage_subprocess_records_its_failure_in_the_parent_run(self):
+        self.good_scan()
+        before = set(scan_record(self.out)['runs'])
+        break_library(self.lib)
+        run = runstate.ScanRun(self.out, ['lexicon', 'detect'], via='ui')
+        try:
+            run.enter('lexicon')
+            with mock.patch.dict(os.environ,
+                                 {runstate.ENV_RUN_ID: run.id}):
+                rc, _ = self.scan('lexicon')
+            self.assertEqual(rc, 1)
+            # the child started no run of its own: it recorded its failure
+            # in the parent's
+            rec = scan_record(self.out)
+            self.assertEqual(set(rec['runs']), before | {run.id})
+            self.assertEqual(rec['stages']['lexicon'], run.id)
+            self.assertEqual(rec['runs'][run.id]['state'], 'partial')
+            # the parent only knows an exit code; the child's reason stays
+            run.fail('exit code 1')
+        finally:
+            run.close()
+        p = runstate.scan_problem(self.out)
+        self.assertEqual((p['state'], p['stage']), ('partial', 'lexicon'))
+        self.assertIn('לא הצליח לקרוא', p['reason'])
+
+    def test_folder_without_marker_reports_nothing(self):
+        # results from before run states were recorded work as they did
+        self.good_scan()
+        import shutil
+        shutil.rmtree(os.path.join(self.out, runstate.STATE_DIR))
+        self.assertIsNone(runstate.scan_problem(self.out))
+        self.assertIsNone(runstate.book_problem(self.out))
+
+    def test_unreadable_marker_is_unknown_and_replaced_by_next_run(self):
+        self.good_scan()
+        with open(os.path.join(self.out, runstate.STATE_DIR, 'scan.json'),
+                  'w', encoding='utf-8') as f:
+            f.write('{"version": 1, "runs": ')
+        self.assertEqual(runstate.scan_problem(self.out)['state'], 'unknown')
+        self.good_scan()
+
+    def test_concurrent_reads_always_see_a_whole_record(self):
+        self.good_scan()
+        stop, seen = threading.Event(), []
+
+        def reader():
+            while not stop.is_set():
+                seen.append(runstate.scan_problem(self.out))
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            with runstate.ScanRun(self.out, list(core._READ_STAGES)) as run:
+                for _ in range(30):
+                    for st in core._READ_STAGES:
+                        run.enter(st)
+        finally:
+            stop.set()
+            t.join()
+        self.assertTrue(seen)
+        # in progress or done — never "unknown" (a torn read) nor a crash
+        self.assertEqual({p and p['state'] for p in seen}, {None})
+
+
+class BookRunTest(RunStateCase):
+
+    def book(self, key, source='file'):
+        return run_cli('book', '--book', key, '--book-source', source,
+                       '--textdir', self.lib, '--out', self.out, *TUNE)
+
+    def test_failed_book_scan_leaves_the_scan_record_alone(self):
+        self.good_scan()
+        before = scan_record(self.out)
+        rc, err = self.book(os.path.join(self.lib, 'אין כזה.txt'))
+        self.assertEqual(rc, 1)
+        self.assertEqual(scan_record(self.out), before)
+        self.assertIsNone(runstate.scan_problem(self.out))
+        p = runstate.book_problem(self.out)
+        self.assertEqual(p['state'], 'failed')
+        self.assertEqual(p['source'], 'file')
+        self.assertTrue(p['reason'])
+
+    def test_successful_book_scan_does_not_clear_a_stale_scan(self):
+        self.good_scan()
+        with mock.patch.object(core, 'locate',
+                               side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self.scan()
+        # the book scan uses the (complete) lexicon and merges its findings,
+        # but the full scan's results are as stale as before
+        rc, err = self.book(os.path.join(self.lib, 'ספר.txt'))
+        self.assertFalse(rc, err)
+        self.assertEqual(runstate.scan_problem(self.out)['stage'], 'locate')
+        self.assertIsNone(runstate.book_problem(self.out))
+
+    def test_book_scan_clears_its_own_failure(self):
+        self.good_scan()
+        self.book(os.path.join(self.lib, 'אין כזה.txt'))
+        self.assertIsNotNone(runstate.book_problem(self.out))
+        rc, err = self.book(os.path.join(self.lib, 'ספר.txt'))
+        self.assertFalse(rc, err)
+        self.assertIsNone(runstate.book_problem(self.out))
+
+    def test_killed_and_cancelled_book_scans(self):
+        run = runstate.BookRun(self.out, 'db', '7')
+        self.assertIsNone(runstate.book_problem(self.out))   # in progress
+        run.close()
+        self.assertEqual(runstate.book_problem(self.out)['state'],
+                         'interrupted')
+        with runstate.BookRun(self.out, 'db', '7') as run:
+            run.cancel()                    # nothing was merged
+        self.assertIsNone(runstate.book_problem(self.out))
+
+
+if __name__ == '__main__':
+    unittest.main()

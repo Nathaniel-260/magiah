@@ -5,13 +5,15 @@ import json
 import os
 import sys
 
-from . import core
+from . import core, runstate
 from .config import Config
 from .corpus import OTZARIA_DB
 from .corpus_hybrid import DEFAULT_LIBRARY
 from .textsource import TextSourceError
 
 RUN_CONFIG = 'run_config.json'
+# the stages each pipeline command runs, in order
+PIPELINE = {'all': ('lexicon', 'detect', 'locate', 'report')}
 
 
 def _build_spec(args):
@@ -98,20 +100,22 @@ def _run_book_cmd(args, spec, cfg, out_dir):
               file=sys.stderr, flush=True)
         return 1
     source = args.book_source or _guess_book_source(args.book)
-    try:
-        result = book_scan.scan_book(
-            out_dir, source, args.book, cfg=cfg, db_path=db_path,
-            library_dir=library_dir, verify_ctx=args.book_verify_ctx,
-            spec=spec, progress=lambda s: print(s, flush=True))
-    except (book_scan.BookScanError, book_source.BookNotFound) as e:
-        print(str(e), file=sys.stderr, flush=True)
-        return 1
     from .webui import db as uidb
-    try:
-        counts = uidb.merge_book_scan(out_dir, result)
-    except uidb.DecisionsLocked as e:
-        print(str(e), file=sys.stderr, flush=True)
-        return 1
+    # recorded apart from the pipeline's runs: a book scan never touches the
+    # full scan's results, so it must neither raise nor clear their warning
+    with runstate.BookRun(out_dir, source, args.book) as run:
+        try:
+            result = book_scan.scan_book(
+                out_dir, source, args.book, cfg=cfg, db_path=db_path,
+                library_dir=library_dir, verify_ctx=args.book_verify_ctx,
+                spec=spec, progress=lambda s: print(s, flush=True))
+            counts = uidb.merge_book_scan(out_dir, result)
+        except (book_scan.BookScanError, book_source.BookNotFound,
+                uidb.DecisionsLocked) as e:
+            run.fail(str(e))
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
+        run.done(title=counts['title'])
     print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
           f"הוחלפו {counts['replaced']:,}, "
           f"נשמרו {counts['preserved']:,} החלטות", flush=True)
@@ -205,23 +209,28 @@ def main(argv=None):
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
     _save_run_config(out_dir, spec, cfg, prev)
 
+    if args.command == 'review':
+        from . import review
+        review.serve(out_dir, port=args.port or 8765)
+        return
+
+    steps = {
+        'lexicon': lambda: core.build_lexicon(spec, cfg, out_dir),
+        'calibrate': lambda: core.calibrate(cfg, out_dir),
+        'detect': lambda: core.detect(spec, cfg, out_dir),
+        'locate': lambda: core.locate(spec, cfg, out_dir),
+        'report': lambda: core.report(cfg, out_dir, top=args.top),
+    }
     try:
         if args.command == 'book':
             return _run_book_cmd(args, spec, cfg, out_dir)
-        if args.command in ('lexicon', 'all'):
-            core.build_lexicon(spec, cfg, out_dir)
-        if args.command == 'calibrate':
-            core.calibrate(cfg, out_dir)
-        if args.command == 'review':
-            from . import review
-            review.serve(out_dir, port=args.port or 8765)
-            return
-        if args.command in ('detect', 'all'):
-            core.detect(spec, cfg, out_dir)
-        if args.command in ('locate', 'all'):
-            core.locate(spec, cfg, out_dir)
-        if args.command in ('report', 'all'):
-            core.report(cfg, out_dir, top=args.top)
+        stages = PIPELINE.get(args.command, (args.command,))
+        # the run records itself (run_state/), so a run that fails or never
+        # finishes cannot leave the previous results looking current
+        with runstate.track_scan(out_dir, stages) as run:
+            for stage in stages:
+                run.enter(stage)
+                steps[stage]()
     except (core.StageError, TextSourceError) as e:
         # a stage was run before its prerequisite, or the database cannot be
         # read (missing, not Otzaria's, no zstd decoder): print the Hebrew

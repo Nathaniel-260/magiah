@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 
+from .. import runstate
 from ..config import Config
 from ..corpus import OTZARIA_DB
 from ..corpus_hybrid import DEFAULT_LIBRARY
@@ -174,10 +175,21 @@ def start_scan(outdir, stages=None, config_overrides=None,
     with _lock:
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
-        with open(os.path.join(outdir, RUN_CONFIG), 'w',
-                  encoding='utf-8') as f:
-            json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                      ensure_ascii=False, indent=2)
+        # the run is recorded before anything is written, so a scan that
+        # dies at any point leaves the results marked as not current
+        try:
+            run = runstate.ScanRun(outdir, stages, via='ui')
+        except runstate.RunBusy as e:            # a CLI scan holds the folder
+            raise ValueError(str(e))
+        try:
+            with open(os.path.join(outdir, RUN_CONFIG), 'w',
+                      encoding='utf-8') as f:
+                json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
+                          ensure_ascii=False, indent=2)
+        except BaseException as e:      # the scan never started
+            run.fail(f'{type(e).__name__}: {e}')
+            run.close()
+            raise
         _log.clear()
         if skipped_calibrate:
             _log.append('[webui] ' + hebrew.SCAN_MESSAGES['calibrate_skipped'])
@@ -188,13 +200,16 @@ def start_scan(outdir, stages=None, config_overrides=None,
                       chunk_done=0, chunk_total=0, book=None,
                       started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                       started_epoch=time.time())
-        _thread = threading.Thread(target=_run, args=(outdir, stages),
+        _thread = threading.Thread(target=_run, args=(outdir, stages, run),
                                    daemon=True)
         _thread.start()
     return dict(get_status())
 
 
-def _run(outdir, stages):
+def _run(outdir, stages, run):
+    """Worker: run `stages` as subprocesses. `run` (runstate.ScanRun) is
+    this scan's record; it is finalized before the in-memory state, so the
+    UI never sees the scan end ahead of the record that explains it."""
     global _proc
     log_path = os.path.join(outdir, LOG_FILE)
     rc = 0
@@ -217,7 +232,10 @@ def _run(outdir, stages):
                 pass
 
     try:
-        env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+        # each stage joins this run instead of recording its own: it is the
+        # one that knows why it failed
+        env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1',
+                   **{runstate.ENV_RUN_ID: run.id})
         for i, stage in enumerate(stages):
             if _cancel.is_set():
                 break
@@ -225,6 +243,7 @@ def _run(outdir, stages):
                 # new stage — its chunk counters start fresh
                 _state.update(stage=stage, stage_index=i,
                               chunk_done=0, chunk_total=0)
+            run.enter(stage)
             cmd = _stage_cmd(stage, outdir)
             emit(f'===== [{stage}] {" ".join(cmd)}')
             _proc = subprocess.Popen(
@@ -246,6 +265,7 @@ def _run(outdir, stages):
     except Exception as e:                          # noqa: BLE001
         rc = -1
         emit(f'===== internal error: {e!r}')
+        run.fail(f'{type(e).__name__}: {e}')
         with _lock:
             _state['error'] = str(e)
     finally:
@@ -254,6 +274,14 @@ def _run(outdir, stages):
                 logf.close()
             except OSError:
                 pass
+        # a stage that failed has already recorded why (first writer wins)
+        if _cancel.is_set():
+            run.cancel()
+        elif rc == 0:
+            run.done()
+        else:
+            run.fail(hebrew.SCAN_MESSAGES['stage_exit'].format(rc=rc))
+        run.close()
         with _lock:
             if _cancel.is_set():
                 _state.update(state='cancelled', returncode=rc)
@@ -371,6 +399,10 @@ def start_book_scan(outdir, source, key, config_overrides=None,
     with _lock:
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
+        try:
+            run = runstate.BookRun(outdir, source, key, via='ui')
+        except runstate.RunBusy as e:            # a CLI book scan is running
+            raise ValueError(str(e))
         _log.clear()
         _cancel.clear()
         _state.update(state='running', stage='book', stages=['book'],
@@ -384,15 +416,16 @@ def start_book_scan(outdir, source, key, config_overrides=None,
         _thread = threading.Thread(
             target=_run_book,
             args=(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
-                  spec),
+                  spec, run),
             daemon=True)
         _thread.start()
     return dict(get_status())
 
 
 def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
-              spec):
-    """Worker: scan one book, then merge it into ui_review.db."""
+              spec, run):
+    """Worker: scan one book, then merge it into ui_review.db. `run`
+    (runstate.BookRun) is finalized before the in-memory state."""
     from .. import book_scan
     from ..book_source import BookNotFound
     from ..textsource import TextSourceError
@@ -459,6 +492,13 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
                 logf.close()
             except OSError:
                 pass
+        if cancelled and not merged:
+            run.cancel()
+        elif rc == 0:
+            run.done(title=result.get('title'))
+        else:
+            run.fail(err)
+        run.close()
         with _lock:
             # a cancel that arrived *during* the merge is too late: the rows
             # are committed, so report the truth (done), not "cancelled"

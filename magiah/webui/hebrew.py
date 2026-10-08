@@ -643,6 +643,10 @@ SCAN_MESSAGES = {
     'cancelled': 'הסריקה בוטלה על ידי המשתמש',
     'cancel_sent': 'בקשת הביטול נשלחה — התהליך מופסק',
     'started': 'הסריקה הופעלה',
+    # recorded when a stage process ended without saying why (killed from
+    # outside, or it could not even start)
+    'stage_exit': 'תהליך השלב הסתיים בקוד שגיאה {rc} בלי לדווח על הסיבה '
+                  '(ייתכן שנסגר מבחוץ, או שלא הצליח לעלות)',
     # --- single-book scan ---------------------------------------------------
     'book_started': 'סריקת הספר הופעלה',
     'book_no_book': 'לא נבחר ספר לסריקה',
