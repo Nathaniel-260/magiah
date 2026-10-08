@@ -868,6 +868,27 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(eff[('קפץ', '10')], 'not_error')   # the convention
         self.assertEqual(approved, {('פרץ', '14'), ('פרץ', '15')})
 
+    def test_status_filter_works_with_the_legacy_guard(self):
+        """EFF carries a LIKE '%tanach_legacy%' pattern; the status filter
+        must not run it through %-formatting (it used to fail every
+        status-filtered query with "unsupported format character")."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        try:
+            fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
+                              ).fetchone()[0]
+            uidb.set_status(con, self.dir, [fid], 'approved')
+            rows, total = uidb.query_findings(con, {'status': 'approved'})
+            self.assertEqual(([r['word'] for r in rows], total),
+                             (['בייתה'], 1))
+            _rows, total = uidb.query_findings(
+                con, {'status': 'pending,approved'})
+            self.assertEqual(total, con.execute(
+                'SELECT COUNT(*) FROM findings').fetchone()[0])
+        finally:
+            con.close()
+
     def test_import_legacy_keeps_a_word_wide_approval_an_approval(self):
         """decisions.db mirrors a word-wide approval as (word, '*', accept);
         importing it back must not turn it into "not an error everywhere"."""
