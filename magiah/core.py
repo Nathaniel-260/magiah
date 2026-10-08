@@ -372,7 +372,7 @@ def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None,
     if limit:
         lines.append(f'הריצה אישרה לדלג על {limit:,} שורות לכל היותר '
                      f'(‎--allow-unread {limit}‎).')
-    lines += _refs_lines(info['unread_refs'], rows)
+    lines += refs_lines(info['unread_refs'], rows)
     lines += [proceed_hint(rows, _all_cmd(out_dir)), f'פרטים: {path}']
     raise PartialRead('\n'.join(lines))
 
@@ -391,7 +391,7 @@ def ref_text(r):
     return f'{where} ({label})' if where else label
 
 
-def _refs_lines(refs, rows, show=5):
+def refs_lines(refs, rows, show=5):
     """Hebrew lines listing the first `show` unread rows."""
     if not refs:
         return []
@@ -402,12 +402,13 @@ def _refs_lines(refs, rows, show=5):
     return out
 
 
-def proceed_hint(rows, cmd):
-    """How to go on despite `rows` unreadable rows (Hebrew): `cmd` again,
-    with ``--allow-unread``."""
+def proceed_hint(rows, cmd=None):
+    """How to go on despite `rows` unreadable rows (Hebrew): `cmd` again with
+    ``--allow-unread`` — or, without `cmd`, the same scan again with it."""
+    how = (f'\n    {cmd} --allow-unread {rows}' if cmd else
+           f' יש להריץ את אותה סריקה שוב עם ‎--allow-unread {rows}‎')
     return (f'אם אי אפשר לתקן את מקור הנתונים, אפשר להמשיך בלי השורות האלה, '
-            f'והתוצאה תסומן כחלקית:\n'
-            f'    {cmd} --allow-unread {rows}\n'
+            f'והתוצאה תסומן כחלקית:{how}\n'
             f'(בממשק: השדה "{ALLOW_UNREAD_UI}" בהגדרות המתקדמות של הסריקה)')
 
 
@@ -429,7 +430,7 @@ def _accepted_warning(info, path):
         lines.append('התוצאה נשענת על תוצרים חלקיים של '
                      + ('שלב ' if len(names) == 1 else 'השלבים ')
                      + ', '.join(names) + '.')
-    return '\n'.join(lines + _refs_lines(info['unread_refs'], rows))
+    return '\n'.join(lines + refs_lines(info['unread_refs'], rows))
 
 
 _STAGE_HE = {cmd: he for cmd, he in _STAGE_OF.values()}

@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from magiah import cli, core
+from magiah import book_scan, book_source, cli, core
 from magiah.config import Config
 from magiah.textsource import OtzariaDB, ReadStats
 from magiah.webui import scanner
@@ -444,6 +444,103 @@ class CliTest(_Case):
         self.assertEqual(rc, 1)
         self.assertIn('לא אישרה', err)
         self.assertNotIn('allow_unread', self.run_config())
+
+
+class BookScanTest(_Case):
+    """A single-book scan follows the full scan's rule: the bad rows of a
+    book are skipped only when allowed, and the result is then partial."""
+
+    def setUp(self):
+        super().setUp()
+        self.clean = os.path.join(self.tmp.name, 'clean.db')
+        make_schema6_db(self.clean)
+
+    def lexicon(self, db, allow_unread=0):
+        with _quiet():
+            core.build_lexicon(_otzaria_spec(db), self.cfg(allow_unread),
+                               self.out)
+
+    def scan(self, key, db, allow_unread=0):
+        return book_scan.scan_book(self.out, 'db', key,
+                                   cfg=self.cfg(allow_unread), db_path=db)
+
+    def test_book_with_a_bad_row_is_refused_with_the_way_on(self):
+        with self.assertRaises(book_source.BookNotFound) as cm:
+            book_source.load_book('db', '1', db_path=self.db)
+        msg = str(cm.exception)
+        self.assertIn('ספר א', msg)
+        self.assertIn('ref 2', msg)
+        self.assertIn('--allow-unread 1', msg)
+        self.assertIn(core.ALLOW_UNREAD_UI, msg)
+
+    def test_boundary(self):
+        for n, ok in ((0, False), (1, True), (2, True)):
+            with self.subTest(allow_unread=n):
+                if not ok:
+                    with self.assertRaises(book_source.BookNotFound):
+                        book_source.load_book('db', '1', db_path=self.db,
+                                              allow_unread=n)
+                    continue
+                b = book_source.load_book('db', '1', db_path=self.db,
+                                          allow_unread=n)
+                self.assertEqual([u for u, _, _ in b.lines], ['1'])
+                self.assertEqual(b.stats.unread(), 1)
+
+    def test_book_that_is_all_unreadable_says_so(self):
+        _corrupt_row(self.db, 1)
+        with self.assertRaises(book_source.BookNotFound) as cm:
+            book_source.load_book('db', '1', db_path=self.db, allow_unread=5)
+        self.assertIn('אף אחת', str(cm.exception))
+
+    def test_scan_skips_the_rows_and_marks_the_result(self):
+        self.lexicon(self.clean)
+        res = self.scan('1', self.db, 1)
+        self.assertEqual(res['lines'], 1)
+        cov = res['coverage']
+        self.assertIs(cov['accepted'], True)
+        self.assertEqual(cov['unread_rows'], 1)
+        self.assertEqual([r['unit'] for r in cov['unread_refs']], ['2'])
+        self.assertEqual(cov['unread_refs'][0]['book'], 'ספר א')
+        self.assertNotIn('inherited', cov)
+
+    def test_complete_scan_is_unmarked(self):
+        self.lexicon(self.clean)
+        self.assertIsNone(self.scan('1', self.clean, 3)['coverage'])
+
+    def test_partial_lexicon_needs_the_option_and_marks_the_result(self):
+        self.lexicon(self.db, 2)
+        for n in (0, 1):
+            with self.subTest(allow_unread=n), \
+                    self.assertRaises(book_scan.BookScanError) as cm:
+                self.scan('1', self.clean, n)
+            self.assertIn('--allow-unread 2', str(cm.exception))
+        cov = self.scan('1', self.clean, 2)['coverage']
+        self.assertEqual(cov['inherited'], {'lexicon': 2})
+        self.assertEqual(cov['unread_rows'], 2)
+        self.assertEqual(sorted(r['unit'] for r in cov['unread_refs']),
+                         ['2', '4'])
+
+    def test_context_pass_obeys_the_limit(self):
+        pairs = {('בראשית', 'ברא')}
+        with self.assertRaises(book_scan.BookScanError) as cm:
+            book_scan.verify_context(self.spec, self.cfg(1), pairs, {})
+        self.assertIn('--allow-unread 2', str(cm.exception))
+        st = ReadStats()
+        book_scan.verify_context(self.spec, self.cfg(2), pairs, {}, stats=st)
+        self.assertEqual(st.unread(), 2)
+
+    def test_cli_book_command(self):
+        self.lexicon(self.clean)
+        base = ['book', '--book', '1', '--otzaria', '--db', self.db,
+                '--out', self.out]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), _quiet():
+            self.assertEqual(cli.main(base), 1)
+        self.assertIn('--allow-unread 1', err.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(base + ['--allow-unread', '1']), 0)
+        self.assertIn('חלקית', out.getvalue())
 
 
 class ScanPanelTest(_Case):
