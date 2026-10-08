@@ -53,10 +53,11 @@ import os
 import re
 import sqlite3
 import time
-import urllib.request
 from datetime import datetime
 
 from . import hebrew
+# one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
+from ..textsource import sqlite_uri as _uri
 
 UI_DB_F = 'ui_review.db'
 REPORT_DB_F = 'report.db'
@@ -180,11 +181,6 @@ FINDING_COLS = ['id', 'family', 'errtype', 'word', 'suggestion', 'score',
 
 def _now():
     return datetime.now().isoformat(timespec='microseconds')
-
-
-def _uri(path, ro=False):
-    u = 'file:' + urllib.request.pathname2url(os.path.abspath(path))
-    return u + '?mode=ro' if ro else u
 
 
 def connect(outdir):
