@@ -62,7 +62,7 @@ import sqlite3
 import time
 from datetime import datetime
 
-from . import hebrew
+from . import hebrew, result_status
 from ..corpus_hybrid import DEFAULT_LIBRARY
 # one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
 from ..textsource import sqlite_uri as _uri
@@ -395,6 +395,10 @@ def import_all(outdir, migrate_legacy=False):
     if not os.path.exists(report_path):
         raise FileNotFoundError(
             hebrew.MESSAGES['report_missing'].format(outdir=outdir))
+    # identifies the report.db these findings come from (result_status.py:
+    # a newer report.db means a refresh is due); taken before reading, so a
+    # report.db replaced meanwhile reads as newer, never as already loaded
+    report_mtime = os.path.getmtime(report_path)
     con = connect(outdir)
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
@@ -644,6 +648,8 @@ def import_all(outdir, migrate_legacy=False):
         })
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('report_mtime', ?)",
+                    (repr(report_mtime),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
         # which library these rows were scanned from, committed with the rows
@@ -957,7 +963,9 @@ def _rowdict(row):
     return d
 
 
-def get_meta(con):
+def get_meta(con, outdir=None):
+    """Labels, counts and — given the output folder — ``result_status``:
+    whether the findings are those of the latest scan (result_status.py)."""
     origins = []
     for raw, cnt, done in con.execute(f'''
             SELECT f.origin, COUNT(*),
@@ -1003,7 +1011,9 @@ def get_meta(con):
             'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
-            'last_import': last_import[0] if last_import else None}
+            'last_import': last_import[0] if last_import else None,
+            'result_status': (result_status.build(con, outdir)
+                              if outdir else None)}
 
 
 def get_books(con, origin=None, q=None):

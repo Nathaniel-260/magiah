@@ -727,6 +727,76 @@ MESSAGES = {
 
 
 # ---------------------------------------------------------------------------
+# Result status (UI_SPEC §9f): the persistent banner that says whether the
+# findings shown are those of the latest scan. Built by result_status.py.
+# ---------------------------------------------------------------------------
+
+RESULT_STATUS = {
+    # -- the results are not those of the latest scan -------------------------
+    'stale_title': {
+        'failed': 'הסריקה האחרונה נכשלה',
+        'partial': 'הסריקה האחרונה לא קראה את כל הקלט',
+        'cancelled': 'הסריקה האחרונה בוטלה לפני שהסתיימה',
+        'interrupted': 'הסריקה האחרונה נקטעה באמצע',
+        'unknown': 'לא ידוע אם הסריקה האחרונה הסתיימה',
+    },
+    # appended to the title when there are findings on screen
+    'stale_title_shown': {
+        'unknown': ' — ייתכן שהממצאים המוצגים אינם מעודכנים',
+        'default': ' — הממצאים המוצגים אינם מעודכנים',
+    },
+    'stale_what': {
+        'failed': 'הסריקה שהתחילה ב־{started} נכשלה בשלב «{stage}».',
+        # also a stage that refused the partial output of an earlier one
+        'partial': 'בסריקה שהתחילה ב־{started}, שלב «{stage}» נעצר כי חלק '
+                   'מהקלט שלו לא נקרא (הסיבה המלאה בפרטים).',
+        'cancelled': 'הסריקה שהתחילה ב־{started} בוטלה בשלב «{stage}».',
+        'interrupted': 'הסריקה שהתחילה ב־{started} נעצרה בשלב «{stage}» '
+                       'בלי לסיים — למשל כי החלון נסגר, התהליך הופסק או '
+                       'שהמחשב כבה.',
+        'unknown': 'קובץ מצב הסריקה פגום ואי אפשר לקרוא אותו: {path}',
+        # no run record: the evidence is a coverage file (older versions)
+        'coverage': 'הריצה האחרונה של שלב «{stage}» לא קראה את כל הקלט, '
+                    'ולכן התוצרים שלו ושל השלבים שאחריו לא עודכנו.',
+    },
+    'stale_shown': 'הממצאים שמוצגים כאן הם מהסריקה הקודמת שהושלמה '
+                   '({results_at}).',
+    'stale_shown_undated': 'הממצאים שמוצגים כאן הם מסריקה קודמת שהושלמה.',
+    'stale_none': 'עדיין לא הושלמה בתיקייה הזו אף סריקה, ולכן אין ממצאים '
+                  'להצגה.',
+    'stale_keep': 'ההחלטות שלכם נשמרו ואפשר להמשיך לעבוד, אבל ייתכן '
+                  'שהממצאים אינם משקפים את מצב הספרים כעת.',
+    'stale_todo': 'לבדוק את הסיבה (בפרטים), לתקן אותה ולהריץ את הסריקה '
+                  'שוב. ההודעה תיעלם מעצמה כשסריקה תסתיים בהצלחה.',
+    # -- report.db is newer than what was loaded ------------------------------
+    'refresh_title': 'יש תוצאות סריקה חדשות שעדיין לא נטענו',
+    'refresh_text': 'קובץ התוצאות report.db עודכן ב־{report_at}, אחרי '
+                    'שהממצאים המוצגים נטענו ממנו ({results_at}). כדי לראות '
+                    'את התוצאות החדשות יש לרענן את הממצאים — החלטות על '
+                    'ממצאים שעדיין קיימים יישמרו.',
+    # -- the latest single-book scan ------------------------------------------
+    'book_title': 'סריקת הספר הבודד האחרונה לא הושלמה',
+    'book_what': {
+        'failed': 'סריקת «{book}» שהתחילה ב־{started} נכשלה.',
+        'interrupted': 'סריקת «{book}» שהתחילה ב־{started} נקטעה באמצע.',
+    },
+    'book_after': 'הממצאים של הספר הזה נשארו כפי שהיו לפניה, ושאר הממצאים '
+                  'לא הושפעו ממנה.',
+    'book_todo': 'לבדוק את הסיבה (בפרטים) ולסרוק את הספר שוב. ההודעה '
+                 'תיעלם כשסריקת ספר בודד תסתיים בהצלחה.',
+    # -- buttons and other wording --------------------------------------------
+    'action_scan': 'ניהול סריקה',
+    'action_refresh': 'רענון הממצאים',
+    'details': 'פרטים',
+    'hint': 'מה לעשות:',
+    # /api/refresh when the results it loaded are not the latest scan's
+    'refresh_stale': 'הממצאים נטענו מחדש, אבל הם מהסריקה הקודמת שהושלמה — '
+                     'הסריקה האחרונה לא הושלמה (הפרטים בהודעה שבראש '
+                     'המסך). {counts}',
+}
+
+
+# ---------------------------------------------------------------------------
 # מצב מתקן — כתיבת תיקונים לקובץ הספר
 # ---------------------------------------------------------------------------
 # Every refusal the file patcher can produce. The wording matters: the whole
