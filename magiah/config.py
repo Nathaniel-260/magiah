@@ -25,6 +25,8 @@ class Config:
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
                              # flagged (suppression only — never creates flags)
+    allow_unread: int = 0    # unreadable input rows a run may skip; the output
+                             # is then marked partial (0: none — stop instead)
 
     def to_dict(self):
         return asdict(self)

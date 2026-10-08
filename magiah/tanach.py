@@ -527,10 +527,9 @@ class TanachIndex:
                         try:
                             text = odb.decode(raw)
                         except Exception as e:      # noqa: BLE001
-                            self.stats.decode_errors += 1
-                            if len(self.stats.error_samples) < 20:
-                                self.stats.error_samples.append(
-                                    (f'ver:{vid}:{lid}', repr(e)[:200]))
+                            self.stats.unread_row(f'ver:{vid}:{lid}',
+                                                  'decode_errors',
+                                                  repr(e)[:200])
                             continue
                         self.stats.version_lines += 1
                         toks = verse_tokens(text)
