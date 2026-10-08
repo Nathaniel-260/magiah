@@ -630,6 +630,37 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(self._ui_state()[:2], (expect_st, expect_dec))
 
 
+class BibleBookShareTest(unittest.TestCase):
+    """The 90% heRef threshold is exact: 90% passes at every book size."""
+
+    def _books(self, parsed, total):
+        from magiah import tanach
+        con = sqlite3.connect(':memory:')
+        con.executescript('''
+            CREATE TABLE category(id INTEGER PRIMARY KEY, parentId INT,
+                                  title TEXT);
+            CREATE TABLE book(id INTEGER PRIMARY KEY, categoryId INT,
+                              sourceId INT, title TEXT);
+            CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INT,
+                              heRef TEXT);''')
+        con.executemany('INSERT INTO category VALUES(?,?,?)',
+                        [(ROOT, None, 'תנ״ך'), (TORAH, ROOT, 'תורה')])
+        con.execute('INSERT INTO book VALUES(1, ?, 1, ?)', (TORAH, TITLE))
+        refs = ([f'{TITLE}, א, א'] * parsed
+                + [f'{TITLE} הקדמה'] * (total - parsed))
+        con.executemany('INSERT INTO line(bookId, heRef) VALUES(1, ?)',
+                        [(r,) for r in refs])
+        books = tanach.find_bible_books(con)[0]
+        con.close()
+        return books
+
+    def test_exactly_ninety_percent_is_enough(self):
+        for total in (10, 30, 70, 130, 1000, 4370):
+            with self.subTest(total=total):
+                self.assertEqual(len(self._books(total * 9 // 10, total)), 1)
+                self.assertEqual(self._books(total * 9 // 10 - 1, total), [])
+
+
 class PartialTanachReadTest(_DBCase):
     """A Tanach index built from a partial read never feeds report.db."""
 

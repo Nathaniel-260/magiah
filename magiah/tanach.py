@@ -42,6 +42,7 @@ import re
 from array import array
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from fractions import Fraction
 from urllib.parse import urlsplit
 
 from .normalize import TOKEN_RE, clean
@@ -58,9 +59,11 @@ COMMON_FREQ = 200
 MIN_DISTINCT = 2
 AMBIGUITY_MARGIN = 2       # the best verse must beat the runner-up by this
 MIN_INDEPENDENT = 2        # independent sources that must agree on a reading
-REF_SHARE = 0.9            # share of a book's referenced lines that must parse
+# Shares are exact fractions: `count < SHARE * total` is then an exact
+# rational comparison, so exactly 90% passes for every size.
+REF_SHARE = Fraction(9, 10)  # a book's referenced lines that must parse
 VERSION_LINE_RATIO = 0.6   # token similarity of a version line to the primary
-VERSION_ACCEPT_SHARE = 0.9  # share of a version's lines that must track it
+VERSION_ACCEPT_SHARE = Fraction(9, 10)  # a version's lines that must track it
 
 # --- evidence kinds ----------------------------------------------------------
 VARIANT = 'tanach_verse_variant'     # verse reading == detector suggestion
