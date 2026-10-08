@@ -64,8 +64,7 @@ from .book_source import load_book
 from .config import Config
 from .textsource import ReadStats
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
-                        SUFFIX_LETTERS, TO_FINAL, TOKEN_RE, clean, is_abbrev,
-                        tokenize)
+                        SUFFIX_LETTERS, TO_FINAL, TOKEN_RE, clean, is_abbrev)
 
 # error types whose suggestion is a single word the book itself may also use
 LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
