@@ -68,6 +68,17 @@ def scan_snippet(line, word, k=0):
     return text[max(0, s - 45):e + 45].strip()
 
 
+def write_doc(doc, outdir):
+    """Test helper: the fixer's two write steps, backup first and then an
+    atomic replace, without the lock and journal fixer_api wraps them in
+    (tested in test_anchor_write). Production code has no such shortcut."""
+    with open(doc.path, 'rb') as f:
+        before = f.read()
+    backup, sha = patcher.write_backup(outdir, doc.path, before)
+    return {'backup': backup, 'backup_sha': sha,
+            'fingerprint': patcher.atomic_write(doc.path, doc.encode())}
+
+
 def plan_all(doc, findings, *a, **kw):
     """patcher.plan_all with the scan-time snippet every real finding has."""
     for f in findings:
@@ -617,7 +628,7 @@ class TestWriteAndRestore(TempCase):
             doc, [{'id': 1, 'lineno': 0, 'word': 'יותבת',
                    'correction': 'יושבת'}])
         patcher.apply_edits(doc, plans)
-        return patcher.write_doc(doc, self.outdir)
+        return write_doc(doc, self.outdir)
 
     def test_backup_holds_the_original(self):
         res = self._apply()
@@ -633,22 +644,12 @@ class TestWriteAndRestore(TempCase):
         leftovers = [x for x in os.listdir(self.lib) if x.endswith('.tmp')]
         self.assertEqual(leftovers, [])
 
-    def test_restore_brings_back_the_original(self):
+    def test_backup_restores_the_original_bytes(self):
         res = self._apply()
-        patcher.restore_backup(self.outdir, res['backup'], self.path,
-                               res['fingerprint'])
+        data = patcher.read_backup(self.outdir, res['backup'],
+                                   res['backup_sha'])
+        patcher.atomic_write(self.path, data)
         self.assertEqual(raw(self.path), self.orig.encode('utf-8'))
-
-    def test_restore_refuses_after_a_manual_edit(self):
-        """Restoring would silently destroy work the corrector did by hand in
-        another editor, so a changed file refuses instead."""
-        res = self._apply()
-        with open(self.path, 'a', encoding='utf-8') as f:
-            f.write('עריכה ידנית\n')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.restore_backup(self.outdir, res['backup'], self.path,
-                                   res['fingerprint'])
-        self.assertEqual(cm.exception.code, 'file_changed_since_edit')
 
     def test_backup_name_separates_same_named_books(self):
         other = write(os.path.join(self.lib, 'sub', 'ספר.txt'), 'טקסט')
@@ -658,12 +659,10 @@ class TestWriteAndRestore(TempCase):
 
     def test_fingerprint_detects_change(self):
         fp = patcher.fingerprint(self.path)
-        patcher.check_fingerprint(self.path, fp)          # no raise
+        self.assertEqual(patcher.fingerprint(self.path), fp)
         with open(self.path, 'a', encoding='utf-8') as f:
             f.write('x')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.check_fingerprint(self.path, fp)
-        self.assertEqual(cm.exception.code, 'file_changed')
+        self.assertNotEqual(patcher.fingerprint(self.path), fp)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +701,7 @@ class TestNeverTouchesAnotherBook(TempCase):
                    'correction': 'יושבת'}])
         self.assertEqual(failures, [])
         patcher.apply_edits(doc, plans)
-        patcher.write_doc(doc, self.outdir)
+        write_doc(doc, self.outdir)
 
         after = [raw(p) for p in self.paths]
         self.assertEqual(after[0], before[0], 'ספר ראשון was modified!')
@@ -867,6 +866,47 @@ class TestApi(TempCase):
                                {'edit_id': res['edit_id']})
         self.assertEqual(code, 200, res2)
         self.assertEqual(raw(self.paths[1]), before)
+
+    def test_a_locked_or_read_only_book_is_refused_in_hebrew(self):
+        """os.replace onto a read-only or locked book fails with
+        "[WinError 5] Access is denied: '<temp>' -> '<book>'"; the user is
+        told, in Hebrew, which book and why, and nothing is written."""
+        key = 'file:ספר שני/פרק א.txt'
+        _c, doc = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
+        before = raw(self.paths[1])
+        real = patcher.os.replace
+
+        def denied(src, dst):
+            raise PermissionError(13, 'Access is denied', src, None, dst)
+        patcher.os.replace = denied
+        try:
+            code, res = self.call('/api/fixer/apply', {
+                'key': key, 'fingerprint': doc['fingerprint'],
+                'items': [{'id': 1}]})
+        finally:
+            patcher.os.replace = real
+        self.assertEqual(code, 423, res)
+        self.assertEqual(res['code'], 'access_denied')
+        self.assertIn(self.paths[1], res['error'])
+        self.assertNotIn('Access is denied', res['error'])
+        self.assertNotIn('.tmp', res['error'])
+        self.assertEqual(raw(self.paths[1]), before)
+
+    def test_any_permission_error_is_reported_in_hebrew(self):
+        from magiah.webui import fixer_api
+        real = fixer_api.doc
+
+        def denied(*a, **kw):
+            raise PermissionError(13, 'Access is denied', r'C:\x\book.txt')
+        fixer_api.doc = denied
+        try:
+            code, res = self.call('/api/fixer/doc?key=' +
+                                  urllib.request.quote('file:x.txt'))
+        finally:
+            fixer_api.doc = real
+        self.assertEqual(code, 423, res)
+        self.assertIn(r'C:\x\book.txt', res['error'])
+        self.assertNotIn('Access is denied', res['error'])
 
     def test_mode_is_remembered_per_book(self):
         key = 'file:ספר שני/פרק א.txt'

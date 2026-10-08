@@ -9,6 +9,7 @@ from . import core
 from .config import Config
 from .corpus import OTZARIA_DB
 from .corpus_hybrid import DEFAULT_LIBRARY
+from .textsource import TextSourceError
 
 RUN_CONFIG = 'run_config.json'
 
@@ -44,10 +45,16 @@ def _load_run_config(out_dir):
     return None
 
 
-def _save_run_config(out_dir, spec, cfg):
+def _save_run_config(out_dir, spec, cfg, prev=None):
+    new = {'corpus': spec, 'config': cfg.to_dict()}
+    # an unchanged setting is not rewritten: the file's age tells the review
+    # UI whether a scan was started after report.db (webui.db
+    # .config_root_for_report), and `magiah book` or `report` start none
+    if prev is not None and json.dumps(prev, sort_keys=True) == json.dumps(
+            new, sort_keys=True):
+        return
     with open(os.path.join(out_dir, RUN_CONFIG), 'w', encoding='utf-8') as f:
-        json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                  ensure_ascii=False, indent=2)
+        json.dump(new, f, ensure_ascii=False, indent=2)
 
 
 def _guess_book_source(key):
@@ -100,7 +107,11 @@ def _run_book_cmd(args, spec, cfg, out_dir):
         print(str(e), file=sys.stderr, flush=True)
         return 1
     from .webui import db as uidb
-    counts = uidb.merge_book_scan(out_dir, result)
+    try:
+        counts = uidb.merge_book_scan(out_dir, result)
+    except uidb.DecisionsLocked as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
     print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
           f"הוחלפו {counts['replaced']:,}, "
           f"נשמרו {counts['preserved']:,} החלטות", flush=True)
@@ -192,7 +203,7 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
-    _save_run_config(out_dir, spec, cfg)
+    _save_run_config(out_dir, spec, cfg, prev)
 
     try:
         if args.command == 'book':
@@ -211,9 +222,10 @@ def main(argv=None):
             core.locate(spec, cfg, out_dir)
         if args.command in ('report', 'all'):
             core.report(cfg, out_dir, top=args.top)
-    except core.StageError as e:
-        # a stage was run before its prerequisite: print the Hebrew guidance
-        # (no traceback — this is a user error, not a crash)
+    except (core.StageError, TextSourceError) as e:
+        # a stage was run before its prerequisite, or the database cannot be
+        # read (missing, not Otzaria's, no zstd decoder): print the Hebrew
+        # guidance (no traceback — this is a user error, not a crash)
         print(str(e), file=sys.stderr, flush=True)
         return 1
 

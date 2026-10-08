@@ -55,6 +55,39 @@ def finding(line, word, correction, lineno=0, fid=1, k=0, **kw):
     return d
 
 
+def make_report(outdir, lib, rows, scan_meta=True):
+    """A report.db the way `magiah locate` writes it: scan_meta naming the
+    library it read (unless `scan_meta` is False: a pre-scan_meta report),
+    and one occurrences_full row per ``(word, suggestion, unit, snippet)``."""
+    from magiah import core
+    p = os.path.join(outdir, db.REPORT_DB_F)
+    if os.path.exists(p):
+        os.remove(p)
+    con = sqlite3.connect(p)
+    con.executescript('''
+        CREATE TABLE occurrences_full(errtype TEXT, word TEXT,
+            suggestion TEXT, score REAL, ctx_hits INT, sugg_local INT,
+            book_repeat INT, tanach INT, origin TEXT, source TEXT, ref TEXT,
+            unit TEXT, doc TEXT, snippet TEXT);
+        CREATE TABLE space_errors_full(part1 TEXT, part2 TEXT, joined TEXT,
+            join_freq INT, source TEXT, ref TEXT, unit TEXT, snippet TEXT,
+            origin TEXT);
+        CREATE TABLE tanach_errors_full(word TEXT, canonical TEXT,
+            source TEXT, ref TEXT, unit TEXT, snippet TEXT, origin TEXT);
+        CREATE TABLE tanach_matches_full(word TEXT, source TEXT, ref TEXT,
+            unit TEXT, snippet TEXT, origin TEXT);''')
+    if scan_meta:
+        core.write_scan_meta(con, {'type': 'library', 'path': lib})
+    con.executemany(
+        'INSERT INTO occurrences_full VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [('edit1_sub', w, s, 5.0, 1, 3, 0, 0, 'o', 't', 'r', u,
+          patcher.book_key_of(u).split(':', 1)[1], snip)
+         for w, s, u, snip in rows])
+    con.commit()
+    con.close()
+    return p
+
+
 class TempCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='magiah_anchor_')
@@ -220,6 +253,173 @@ class TestSourceIdentity(Env):
         self.assertEqual(raw(other), before)
 
 
+class TestImportSource(Env):
+    """The root of a full import is recorded BY the import, with the rows.
+
+    It used to be inferred from report.db's scan time against last_import —
+    and a single-book merge also moves last_import, so a scan of another
+    library written into the same folder (not imported) became 'imported'.
+    """
+    LINE = 'אמר רבי יותבת בן זומא'
+
+    def setUp(self):
+        super().setUp()
+        self.libB = os.path.join(self.tmp, 'libB')
+        self.pa = write(os.path.join(self.lib, 'ספר', 'פרק.txt'),
+                        self.LINE + '\n')
+        self.pb = write(os.path.join(self.libB, 'ספר', 'פרק.txt'),
+                        self.LINE + '\n')
+        self.key = 'file:ספר/פרק.txt'
+        self.rows = [('יותבת', 'יושבת', self.key + ':0',
+                      scan_snippet(self.LINE, 'יותבת'))]
+
+    def import_and_approve(self):
+        db.import_all(self.outdir)
+        con = self.con()
+        try:
+            fid = con.execute('SELECT id FROM findings').fetchone()[0]
+            con.execute("INSERT OR REPLACE INTO review "
+                        "VALUES(?,'approved',NULL,NULL,'t')", (fid,))
+            con.commit()
+        finally:
+            con.close()
+        return fid
+
+    def source(self):
+        con = self.con()
+        try:
+            return db.get_import_source(con)
+        finally:
+            con.close()
+
+    def test_import_records_root_and_scan_time(self):
+        rep = make_report(self.outdir, self.lib, self.rows)
+        db.import_all(self.outdir)
+        con = sqlite3.connect(rep)
+        meta = dict(con.execute('SELECT key, value FROM scan_meta'))
+        con.close()
+        self.assertEqual(self.source(), {
+            'root': os.path.abspath(self.lib),
+            'scanned_at': meta['scanned_at'], 'basis': 'scan_meta'})
+
+    def test_book_merge_after_an_unimported_scan_keeps_the_import_root(self):
+        """QA's reproduction: scan A + refresh; a full scan of a copy B into
+        the same folder, NOT imported; then any single-book merge. The rows
+        are still A's, so writing them into B must be refused."""
+        make_report(self.outdir, self.lib, self.rows)
+        fid = self.import_and_approve()
+        self.assertTrue(self.open_doc(self.key)['editable'])
+        # a full scan of B into the same folder: report.db and run_config.json
+        # are B's now, the database still holds A's rows
+        make_report(self.outdir, self.libB, self.rows)
+        self.set_config(self.libB)
+        other = write(os.path.join(self.libB, 'ספר', 'אחר.txt'), 'שורה\n')
+        db.merge_book_scan(self.outdir, {
+            'doc': 'ספר/אחר.txt', 'title': 'אחר', 'kind': 'library',
+            'path': other, 'findings': [], 'space_errors': []})
+        self.assertEqual(self.source()['root'], os.path.abspath(self.lib))
+        before = (raw(self.pa), raw(self.pb))
+        with self.assertRaises(patcher.PatchError) as cm:
+            self.open_doc(self.key)
+        self.assertEqual(cm.exception.code, 'source_mismatch')
+        res, code = self.apply(self.key, [{'id': fid}],
+                               fingerprint=patcher.fingerprint(self.pb))
+        self.assertEqual(code, 409, res)
+        self.assertEqual(res['code'], 'source_mismatch')
+        self.assertEqual(res['recorded'], os.path.abspath(self.lib))
+        self.assertEqual((raw(self.pa), raw(self.pb)), before)
+        # importing B's report makes B the source, and the fix lands there
+        db.import_all(self.outdir)
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(raw(self.pa), before[0])
+        self.assertIn('יושבת', raw(self.pb).decode('utf-8'))
+
+    def test_older_import_and_a_newer_report_is_unknown(self):
+        """No recorded source (imported by an older version) while report.db
+        names a root: report.db was written after that import."""
+        make_report(self.outdir, self.lib, self.rows)
+        self.add(1, 'יותבת', 'יושבת', self.key + ':0', self.rows[0][3])
+        before = raw(self.pa)
+        res, code = self.apply(self.key, [{'id': 1}],
+                               fingerprint=patcher.fingerprint(self.pa))
+        self.assertEqual(code, 409, res)
+        self.assertEqual(res['code'], 'source_unknown')
+        self.assertEqual(raw(self.pa), before)
+
+    def test_report_without_scan_meta_uses_the_configured_root(self):
+        rep = make_report(self.outdir, self.lib, self.rows, scan_meta=False)
+        old = time.time() - 3600
+        os.utime(os.path.join(self.outdir, 'run_config.json'), (old, old))
+        fid = self.import_and_approve()
+        self.assertEqual(self.source()['root'], os.path.abspath(self.lib))
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        # a scan started after report.db rewrote run_config.json: the setting
+        # may describe that scan, so it is not taken as this report's root
+        os.utime(rep, (old, old))
+        self.set_config(self.lib)
+        db.import_all(self.outdir)
+        self.assertIsNone(self.source()['root'])
+
+    def test_each_root_is_looked_up_and_compared_once(self):
+        """Every row of a book is resolved on each page load; comparing
+        paths touches the disk (slowly over a share), so it must not happen
+        per row: 2,000 rows took 2 s locally and 6.5 s over UNC."""
+        make_report(self.outdir, self.lib, self.rows)
+        db.import_all(self.outdir)
+        db.record_book_scan_source(self.outdir, {
+            'doc': 'ספר/פרק.txt', 'kind': 'library', 'path': self.pa})
+        rows = [{'id': i, 'unit': self.key + ':0', 'extra': None}
+                for i in range(500)]
+        rows += [{'id': 1000 + i, 'unit': self.key + ':0',
+                  'doc': 'ספר/פרק.txt', 'extra': {'book_scan': True}}
+                 for i in range(500)]
+        calls = {'same': 0, 'lookup': 0}
+        real_same, real_get = fixer_api._same_root, db.get_source_root
+
+        def same(a, b):
+            calls['same'] += 1
+            return real_same(a, b)
+
+        def lookup(con, scope):
+            calls['lookup'] += 1
+            return real_get(con, scope)
+        fixer_api._same_root, db.get_source_root = same, lookup
+        con = self.con()
+        try:
+            _kind, path, root = fixer_api._resolve_book(
+                con, self.outdir, self.key, rows)
+        finally:
+            con.close()
+            fixer_api._same_root, db.get_source_root = real_same, real_get
+        self.assertEqual(os.path.normcase(path), os.path.normcase(self.pa))
+        self.assertLessEqual(calls['same'], 3)
+        self.assertLessEqual(calls['lookup'], 2)
+
+    @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
+                         'needs the \\\\localhost\\C$ admin share')
+    def test_unc_and_drive_spellings_name_one_root(self):
+        from magiah.webui import journal
+        drive, rest = os.path.splitdrive(os.path.abspath(self.lib))
+        if len(drive) != 2:
+            self.skipTest('temp dir is not on a drive letter')
+        unc = '\\\\localhost\\' + drive[0] + '$' + rest
+        if not os.path.isdir(unc):
+            self.skipTest('no admin share for drive ' + drive)
+        self.assertTrue(fixer_api._same_root(unc, self.lib))
+        self.assertFalse(fixer_api._same_root(unc, self.libB))
+        unc_book = os.path.join(unc, 'ספר', 'פרק.txt')
+        self.assertEqual(journal._key(unc_book), journal._key(self.pa))
+        self.assertNotEqual(journal._key(unc_book), journal._key(self.pb))
+        make_report(self.outdir, unc, self.rows)     # scanned over the share
+        fid = self.import_and_approve()               # configured: drive path
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        self.assertIn('יושבת', raw(self.pa).decode('utf-8'))
+        self.assertNotIn('יושבת', raw(self.pb).decode('utf-8'))
+
+
 # ---------------------------------------------------------------------------
 # C2 - an occurrence at the old line number is not proof of identity
 # ---------------------------------------------------------------------------
@@ -279,6 +479,30 @@ class TestLineIdentity(TempCase):
         line = d.lines[0]
         self.assertEqual(plan.start, line.rindex('שלם'))
 
+    def test_a_clipped_window_never_pins_another_copy(self):
+        """A short line with the word three times: every scan window is the
+        whole line. A word typed at the start makes the LAST copy's window
+        (clipped 45 characters back) equal that old line, so each finding
+        used to pin the last copy as 'exact'."""
+        w = 'לשמיס'
+        scanned = 'האומר והלכה רבו ולכן %s האומר %s צריך %s לפני' % (w, w, w)
+        now = 'והלכה ' + scanned
+        d = self.doc(now + '\n')
+        copies = [s[1] for s in normalize.token_spans(now) if s[0] == w]
+        for k in range(3):
+            with self.subTest(copy=k):
+                f = finding(scanned, w, 'לשמים', k=k, occurrence=k,
+                            expected_count=3)
+                if k < 2:
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, f)
+                    self.assertEqual(cm.exception.code,
+                                     'ambiguous_occurrence')
+                else:
+                    plan = patcher.plan_edit(d, f)
+                    self.assertEqual((plan.start, plan.confidence),
+                                     (copies[2], 'indexed'))
+
     def test_repeated_word_on_a_short_line_uses_the_original_order(self):
         line = 'שלם אמר שלם'
         f = finding(line, 'שלם', 'שלום', occurrence=1, expected_count=2)
@@ -325,6 +549,45 @@ class TestUnicodeSpans(TempCase):
         with self.assertRaises(patcher.PatchError) as cm:
             patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
         self.assertEqual(cm.exception.code, 'needs_vocalization')
+
+    def test_a_mark_written_as_an_entity_belongs_to_the_word(self):
+        line = 'ויאמר אמרו&#1468; דבר אל העם'
+        tok = [s for s in normalize.token_spans(line) if s[0] == 'אמרו'][0]
+        self.assertEqual(line[tok[1]:tok[2]], 'אמרו&#1468;')
+        self.assertTrue(normalize.has_marks('אמרו&#1468;'))
+        d = self.doc(line)
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
+        self.assertEqual(cm.exception.code, 'needs_vocalization')
+        for mode, corr, want in (
+                (patcher.MODE_BRACKET, 'אמר',
+                 'ויאמר (אמר) [אמרו&#1468;] דבר אל העם'),
+                (patcher.MODE_REPLACE, 'אָמַר', 'ויאמר אָמַר דבר אל העם')):
+            with self.subTest(mode=mode):
+                d = self.doc(line)
+                plan = patcher.plan_edit(d, finding(line, 'אמרו', corr),
+                                         mode=mode)
+                patcher.apply_edits(d, [plan])
+                self.assertEqual(d.lines[0], want)
+
+    def test_a_mark_behind_an_inline_tag_is_never_orphaned(self):
+        for line in ('ויאמר אמרו<b>ּ</b> דבר אל העם',
+                     'ויאמר <b>אמרו</b>ּ דבר אל העם',
+                     'ויאמר <span>אמרו</span>ּ דבר אל העם'):
+            d = self.doc(line)
+            for mode in patcher.MODES:
+                with self.subTest(line=line, mode=mode):
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'),
+                                          mode=mode, check_vocalization=False)
+                    self.assertEqual(cm.exception.code, 'word_spans_markup')
+
+    def test_a_tag_with_no_mark_after_it_stays_outside(self):
+        line = 'ויאמר <b>אמרו</b> דבר&nbsp;ּ אל'
+        d = self.doc(line)
+        plan = patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
+        patcher.apply_edits(d, [plan])
+        self.assertEqual(d.lines[0], 'ויאמר <b>אמר</b> דבר&nbsp;ּ אל')
 
     def test_span_tag_does_not_split_a_word(self):
         line = 'ה<span class="x">ע</span>ולם הזה'
@@ -397,6 +660,102 @@ class TestGeresh(TempCase):
         line = 'כתב רמב"ן כאן'
         self.assertEqual(self.run_one(line, 'רמב"ן', 'רמב"ם'),
                          'כתב רמב"ם כאן')
+
+
+class TestKetivQere(TempCase):
+    """'(x) [word]' is the layout of the fixer's bracket mode AND of a plain
+    ketiv/qere pair, and the text cannot tell them apart (a ketiv may even be
+    the very correction). History does: a record of the fixer's edit, or the
+    layout already being in the scan's snippet."""
+    LINE = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
+
+    def bracketed(self, orig, word, corr, lineno=0):
+        """The fixer's own bracket output for a word the scan saw plainly:
+        ``(doc, finding as scanned, the edit's record)``."""
+        d = self.doc(orig)
+        f = finding(orig, word, corr, lineno=lineno)
+        plan = patcher.plan_edit(d, f, mode=patcher.MODE_BRACKET)
+        patcher.apply_edits(d, [plan])
+        return d, f, plan.to_dict()
+
+    def test_a_typo_in_the_qere_is_corrected(self):
+        d = self.doc(self.LINE)
+        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנערה'))
+        patcher.apply_edits(d, [plan])
+        self.assertEqual(d.lines[0],
+                         'ויצא (הנער) [הנערה] אל השדה ותקח את הכד')
+
+    def test_a_manual_pick_in_the_qere_is_corrected(self):
+        d = self.doc(self.LINE)
+        a, b = normalize.phrase_spans(self.LINE, 'הנערח')[0][1:]
+        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנערה'),
+                                 explicit=(a, b))
+        self.assertEqual((plan.start, plan.end, plan.confidence),
+                         (a, b, 'manual'))
+
+    def test_a_correction_equal_to_the_ketiv_is_refused(self):
+        """The accepted trade-off. "(הנער) [הנערח]" corrected to הנער is
+        letter for letter the fixer's own bracket output, re-scanned (bracket
+        output keeps the typo inside "[...]", so later scans flag it again).
+        Refusing a real ketiv/qere costs a manual edit; nesting into the
+        fixer's brackets would lose the original."""
+        d = self.doc(self.LINE)
+        for corr, sugg in (('הנער', None), ('הנערה', 'הנער')):
+            with self.subTest(correction=corr, suggestion=sugg):
+                f = finding(self.LINE, 'הנערח', corr, suggestion=sugg)
+                with self.assertRaises(patcher.PatchError) as cm:
+                    patcher.plan_edit(d, f)
+                self.assertEqual(cm.exception.code, 'already_applied')
+
+    def test_the_fixers_recorded_output_is_already_applied(self):
+        for orig, word, corr in (
+                ('אמר רבי יותבת בן זומא', 'יותבת', 'יושבת'),
+                # bracket mode carries the original's geresh onto the fix
+                ('אמר רבך׳ שלום', 'רבך', 'רבי')):
+            with self.subTest(orig=orig):
+                d, f, rec = self.bracketed(orig, word, corr)
+                for mode in patcher.MODES:
+                    for other in (corr, 'ישבת'):
+                        with self.assertRaises(patcher.PatchError) as cm:
+                            patcher.plan_edit(d, dict(f, correction=other),
+                                              mode=mode, own_edits=[rec])
+                        self.assertEqual(cm.exception.code,
+                                         'already_applied')
+
+    def test_brackets_added_after_the_scan_are_never_nested_into(self):
+        """The record is gone (ids changed, database rebuilt): the scan saw
+        the plain word, so these brackets came later. Correcting inside them
+        would nest or overwrite the original, with the same correction (the
+        fixer's own output: already applied) or a new one alike."""
+        d, f, _rec = self.bracketed('אמר רבי יותבת בן זומא', 'יותבת',
+                                    'יושבת')
+        before = d.lines[0]
+        for mode in patcher.MODES:
+            for other, code in (('יושבת', 'already_applied'),
+                                ('ישבת', 'already_bracketed')):
+                with self.subTest(mode=mode, correction=other):
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, dict(f, correction=other),
+                                          mode=mode)
+                    self.assertEqual(cm.exception.code, code)
+        self.assertEqual(d.lines[0], before)
+
+    def test_a_record_matches_its_text_on_any_line(self):
+        """Lines move (a line inserted above): the record is matched by its
+        text and context wherever it is. A twin line that happens to carry
+        the very same text is refused too — a refusal is the safe mistake."""
+        out = 'אמר רבי (יושבת) [יותבת] בן זומא'
+        d = self.doc('שורה חדשה\n' + out + '\n' + out + '\n')
+        rec = {'id': 9, 'lineno': 0, 'old': 'יותבת', 'new': '(יושבת) [יותבת]',
+               'post_start': 8, 'ctx_l': 'אמר רבי ', 'ctx_r': ' בן זומא'}
+        for n in (1, 2):
+            with self.subTest(line=n):
+                # trusted: the line number decides between the twins, so
+                # only the record is under test; a new custom correction
+                f = finding(out, 'יותבת', 'ישבת', lineno=n, trusted=True)
+                with self.assertRaises(patcher.PatchError) as cm:
+                    patcher.plan_edit(d, f, own_edits=[rec])
+                self.assertEqual(cm.exception.code, 'already_applied')
 
 
 class TestOutsideTheSpanIsUntouched(TempCase):
@@ -514,14 +873,10 @@ class TestBackups(FixerEnv):
 
     def test_two_writes_in_one_second_keep_both_backups(self):
         contents = []
-        for word, corr in (('יותבת', 'יושבת'), ('מחורז', 'מחוז')):
-            d = patcher.read_doc(self.path)
-            contents.append(d.encode())
-            ln = 1 if word == 'יותבת' else 2
-            plan = patcher.plan_edit(d, finding(d.lines[ln], word, corr,
-                                                lineno=ln))
-            patcher.apply_edits(d, [plan])
-            patcher.write_doc(d, self.outdir)
+        for fid in (1, 2):
+            contents.append(raw(self.path))
+            res, code = self.apply(self.key, [{'id': fid}])
+            self.assertEqual(code, 200, res)
         bdir = os.path.join(self.outdir, patcher.FIXER_BACKUP_DIR)
         baks = sorted(raw(os.path.join(bdir, n)) for n in os.listdir(bdir)
                       if n.endswith('.bak'))
@@ -538,20 +893,18 @@ class TestBackups(FixerEnv):
         self.assertEqual(os.path.dirname(a), os.path.dirname(self.path))
 
     def test_corrupt_backup_is_not_restored(self):
-        d = patcher.read_doc(self.path)
-        plan = patcher.plan_edit(d, finding(d.lines[1], 'יותבת', 'יושבת',
-                                            lineno=1))
-        patcher.apply_edits(d, [plan])
-        res = patcher.write_doc(d, self.outdir)
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        con = self.con()
+        try:
+            rec = db.get_file_edit(con, res['edit_id'])
+        finally:
+            con.close()
         with open(res['backup'], 'ab') as f:
             f.write(b'garbage')
-        after = raw(self.path)
         with self.assertRaises(patcher.PatchError) as cm:
-            patcher.restore_backup(self.outdir, res['backup'], self.path,
-                                   res['fingerprint'],
-                                   backup_fingerprint=res['backup_sha'])
+            patcher.read_backup(self.outdir, res['backup'], rec['backup_sha'])
         self.assertEqual(cm.exception.code, 'backup_corrupt')
-        self.assertEqual(raw(self.path), after)
 
     def test_edit_record_carries_hashes(self):
         res, code = self.apply(self.key, [{'id': 1}])
@@ -695,6 +1048,44 @@ class TestIdempotency(FixerEnv):
         self.assertEqual(res.get('already_applied'), [1])
         self.assertEqual(raw(self.path), once)
 
+    def test_reapplying_after_the_record_is_lost_does_not_nest(self):
+        """The scan saw the plain word; the brackets around it came later and
+        nothing records them. Re-applied — with the same correction, or a
+        new custom one — it must neither nest nor overwrite the original.
+        The parenthesized text is the detector's suggestion for this very
+        finding: the fixer's own output."""
+        res, code = self.apply(self.key, [{'id': 1}], default_mode='bracket')
+        self.assertEqual(code, 200, res)
+        once = raw(self.path)
+        con = self.con()
+        con.execute('DELETE FROM file_edits')
+        con.commit()
+        con.close()
+        for corr in (None, 'ישבה'):
+            for mode in patcher.MODES:
+                with self.subTest(correction=corr, mode=mode):
+                    self._reapprove(1)
+                    item = {'id': 1}
+                    if corr:
+                        item['correction'] = corr
+                    res, code = self.apply(self.key, [item],
+                                           default_mode=mode)
+                    self.assertEqual(code, 409, res)
+                    self.assertEqual([f['code'] for f in res['failed']],
+                                     ['already_applied'])
+                    self.assertEqual(raw(self.path), once)
+
+    def test_ketiv_qere_is_written_through_the_api(self):
+        line = 'ויצא (הנער) [הנערח] אל השדה'
+        write(self.path, self.TEXT + line + '\n')
+        self.add(3, 'הנערח', 'הנערה', self.key + ':3',
+                 scan_snippet(line, 'הנערח'))
+        res, code = self.apply(self.key, [{'id': 3}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res['applied'][0]['confidence'], 'exact')
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines()[3],
+                         'ויצא (הנער) [הנערה] אל השדה')
+
     def test_reapplying_in_replace_mode_reports_already_applied(self):
         res, code = self.apply(self.key, [{'id': 1}])
         self.assertEqual(code, 200, res)
@@ -753,6 +1144,313 @@ class TestSpanUndo(FixerEnv):
 # review round: manual picks, open intents, lock robustness
 # ---------------------------------------------------------------------------
 
+class TestRepeatedWordInSeparateBatches(Env):
+    """The same word twice on a short line, fixed one batch at a time.
+
+    The second apply used to be refused as occurrence_count_changed forever:
+    one copy is gone, and "only one is left" does not say which finding it
+    is. When the missing copy is provably the fixer's own recorded edit on
+    that line, the scan's order still holds over it.
+    """
+    LINE = 'כעבד לפני רבו לשמיס כעבד לפני רבו לשמיס'
+
+    def setUp(self):
+        super().setUp()
+        self.path = write(os.path.join(self.lib, 'כפול.txt'),
+                          'פתיחה\n%s\nסוף\n' % self.LINE)
+        self.key = 'file:כפול.txt'
+        for fid, k in ((1, 0), (2, 1)):
+            self.add(fid, 'לשמיס', 'לשמים', self.key + ':1',
+                     scan_snippet(self.LINE, 'לשמיס', k))
+
+    def test_plan_counts_the_fixers_own_rewrite(self):
+        line = 'שלם אמר שלם'
+        d = self.doc(line + '\n')
+        f1 = finding(line, 'שלם', 'שלום', fid=1, occurrence=0,
+                     expected_count=2)
+        f2 = finding(line, 'שלם', 'שלום', fid=2, k=1, occurrence=1,
+                     expected_count=2)
+        p1 = patcher.plan_edit(d, f1)
+        patcher.apply_edits(d, [p1])
+        own = [p1.to_dict()]
+        # without the record, the vanished copy is unexplained
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f2)
+        self.assertEqual(cm.exception.code, 'occurrence_count_changed')
+        # a finding that meant the rewritten copy is already applied
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, dict(f1, id=3), own_edits=own)
+        self.assertEqual(cm.exception.code, 'already_applied')
+        p2 = patcher.plan_edit(d, f2, own_edits=own)
+        patcher.apply_edits(d, [p2])
+        self.assertEqual(d.lines[0], 'שלום אמר שלום')
+
+    def test_second_copy_applies_in_its_own_batch(self):
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        d = self.open_doc(self.key)
+        two = [i for i in d['items'] if i['id'] == 2][0]
+        self.assertTrue(two['anchor']['ok'], two['anchor'])
+        res, code = self.apply(self.key, [{'id': 2}],
+                               fingerprint=d['fingerprint'])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines(),
+                         ['פתיחה', self.LINE.replace('לשמיס', 'לשמים'),
+                          'סוף'])
+        self.assertEqual((self.status_of(1), self.status_of(2)),
+                         ('fixed', 'fixed'))
+
+    def test_the_page_numbers_copies_like_apply_does(self):
+        """A sibling judged not_error is not shown, but it still holds its
+        place among the copies. Numbered among the shown rows only, copy 1
+        looked "count changed" on the page while apply accepted it."""
+        con = self.con()
+        try:
+            db.set_status(con, self.outdir, [1], 'not_error')
+        finally:
+            con.close()
+        d = self.open_doc(self.key)
+        [two] = d['items']
+        self.assertEqual((two['id'], two['occurrence'],
+                          two['expected_count']), (2, 1, 2))
+        self.assertTrue(two['anchor']['ok'], two['anchor'])
+        res, code = self.apply(self.key, [{'id': 2}],
+                               fingerprint=d['fingerprint'])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res['applied'][0]['start'], two['anchor']['start'])
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines()[1],
+                         'כעבד לפני רבו לשמיס כעבד לפני רבו לשמים')
+
+    def test_a_copy_fixed_by_hand_is_still_refused(self):
+        write(self.path, 'פתיחה\n%s\nסוף\n'
+              % self.LINE.replace('לשמיס', 'לשמים', 1))
+        before = raw(self.path)
+        res, code = self.apply(self.key, [{'id': 2}])
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['occurrence_count_changed'])
+        self.assertEqual(raw(self.path), before)
+
+
+class TestBracketHistory(Env):
+    """Through the real book-scan -> apply path.
+
+    Bracket mode keeps the original typo inside "[...]", so every later scan
+    flags it again. That re-flagged word must never be corrected inside the
+    fixer's brackets — neither while the record of the write is live (its
+    line may have moved since) nor when there is no record at all (a scan in
+    another folder). A ketiv/qere pair the book had is corrected normally.
+    """
+    KQ = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
+    PLAIN = 'וישב משה הנערח בבית אביו'
+    TOP = 'שורה חדשה בראש הספר'
+    REL = 'מקור/כתיב.txt'
+
+    def setUp(self):
+        super().setUp()
+        import pickle
+        from collections import Counter
+        words = set(normalize.tokenize(' '.join(
+            (self.KQ, self.PLAIN, self.TOP, 'פתיחה סוף הנערה'))))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq['הנערח'] = 2            # suggested: הנערה, not the ketiv הנער
+        self.lexicon = pickle.dumps(freq)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'פתיחה\n%s\n%s\nסוף\n' % (self.KQ, self.PLAIN))
+        self.key = 'file:' + self.REL
+
+    def scan(self):
+        """A single-book scan into the current scan folder; the 'הנערח'
+        rows it flags are approved. Returns ``{line: finding id}``."""
+        from magiah import book_scan, core
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            f.write(self.lexicon)
+        db.merge_book_scan(self.outdir, book_scan.scan_book(
+            self.outdir, 'library', self.REL, library_dir=self.lib))
+        con = self.con()
+        try:
+            ids = {int(u.rsplit(':', 1)[1]): fid for fid, u in con.execute(
+                "SELECT id, unit FROM findings WHERE word = 'הנערח'")}
+            db.set_status(con, self.outdir, list(ids.values()), 'approved')
+        finally:
+            con.close()
+        return ids
+
+    def lines(self):
+        return raw(self.path).decode('utf-8').splitlines()
+
+    def bracket_the_plain_line(self):
+        ids = self.scan()
+        self.assertEqual(sorted(ids), [1, 2])
+        # the book's own ketiv/qere: corrected like any word
+        res, code = self.apply(self.key, [{'id': ids[1]}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.lines()[1],
+                         'ויצא (הנער) [הנערה] אל השדה ותקח את הכד')
+        res, code = self.apply(self.key, [{'id': ids[2]}],
+                               default_mode='bracket')
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.lines()[2], 'וישב משה (הנערה) [הנערח] בבית אביו')
+
+    def refused_in_both_modes(self, fid):
+        once = raw(self.path)
+        for mode in patcher.MODES:
+            with self.subTest(mode=mode):
+                res, code = self.apply(self.key, [{'id': fid}],
+                                       default_mode=mode)
+                self.assertEqual(code, 409, res)
+                self.assertEqual([f['code'] for f in res['failed']],
+                                 ['already_applied'])
+                self.assertEqual(raw(self.path), once)
+
+    def test_rescan_after_a_line_was_inserted_above(self):
+        """(a) Same scan folder: the record is live, but its line moved."""
+        self.bracket_the_plain_line()
+        write(self.path, self.TOP + '\n' + raw(self.path).decode('utf-8'))
+        ids = self.scan()
+        self.assertEqual(sorted(ids), [3])   # flagged again, in the brackets
+        self.refused_in_both_modes(ids[3])
+
+    def test_rescan_in_a_new_scan_folder(self):
+        """(c) No record at all: the bracketed text is this very finding's
+        correction, which is how the fixer's output reads."""
+        self.bracket_the_plain_line()
+        first, self.outdir = self.outdir, os.path.join(self.tmp, 'scan2')
+        try:
+            os.makedirs(self.outdir)
+            self.set_config(self.lib)
+            db.connect(self.outdir).close()
+            ids = self.scan()
+            self.assertEqual(sorted(ids), [2])
+            self.refused_in_both_modes(ids[2])
+        finally:
+            self.outdir = first
+
+
+class TestRepeatedWordNeedsProof(Env):
+    """A copy of a repeated word is written only when it is proven to be the
+    copy the scan meant — through the real book-scan -> apply path.
+
+    Counting the copies left is no proof: a copy fixed by hand plus a new one
+    typed in keeps the count, and every copy after them moves up one place.
+    """
+    W, FIX = 'לשמיס', 'לשמים'
+    REL = 'מקור/חוזר.txt'
+    # far enough apart that the fixer's recorded context (24 characters)
+    # around its own edit does not reach the next copy
+    THREE = ('רבו {w} כעבד לפני רבו והלכה כדברי {w} כעבד לפני רבו והלכה כדברי '
+             '{w} סוף')
+    TWO = 'כעבד לפני רבו {w} כעבד לפני רבו {w}'
+
+    def scan(self, line):
+        import pickle
+        from collections import Counter
+        from magiah import book_scan, core
+        words = set(normalize.tokenize(' '.join(
+            (self.THREE, self.TWO, line, 'פתיחה סוף הקובץ', self.FIX))))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq[self.W] = 2
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            pickle.dump(freq, f)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'פתיחה\n%s\nסוף הקובץ\n' % line.format(w=self.W))
+        self.key = 'file:' + self.REL
+        db.merge_book_scan(self.outdir, book_scan.scan_book(
+            self.outdir, 'library', self.REL, library_dir=self.lib))
+        con = self.con()
+        try:
+            ids = [r[0] for r in con.execute(
+                'SELECT id FROM findings WHERE word = ? AND unit = ? '
+                'ORDER BY id', (self.W, self.key + ':1'))]
+            db.set_status(con, self.outdir, ids, 'approved')
+        finally:
+            con.close()
+        return ids
+
+    def line(self):
+        return raw(self.path).decode('utf-8').split('\n')[1]
+
+    def by_hand(self, text):
+        write(self.path, 'פתיחה\n%s\nסוף הקובץ\n' % text)
+
+    def refused(self, fid, code='ambiguous_occurrence'):
+        before = raw(self.path)
+        res, status = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(status, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']], [code])
+        # a click on the right copy is still offered
+        self.assertEqual(res['failed'][0]['located_line'], 1)
+        self.assertEqual(raw(self.path), before)
+
+    def test_three_copies_one_fixed_by_hand_and_one_typed(self):
+        """QA's case: the fixer writes copy 0; by hand copy 1 is fixed and a
+        new copy typed at the end; copy 1's finding used to be written onto
+        copy 2 (the count was 3 again)."""
+        ids = self.scan(self.THREE)
+        self.assertEqual(len(ids), 3)
+        res, code = self.apply(self.key, [{'id': ids[0]}])
+        self.assertEqual(code, 200, res)
+        t = self.line()
+        i = t.index(self.W)                  # copy 1: copy 0 is fixed now
+        self.by_hand(t[:i] + self.FIX + t[i + len(self.W):] + ' ' + self.W)
+        for fid in ids[1:]:
+            with self.subTest(fid=fid):
+                self.refused(fid)
+
+    def test_fixer_wrote_copy_0_then_a_copy_typed_at_the_end(self):
+        """With the fixer's edit undone the line has three copies, not the
+        scan's two: copy 1's finding used to land on the typed copy."""
+        ids = self.scan(self.TWO)
+        res, code = self.apply(self.key, [{'id': ids[0]}])
+        self.assertEqual(code, 200, res)
+        self.by_hand(self.line() + ' ' + self.W)
+        self.refused(ids[1], 'occurrence_count_changed')
+
+    def test_copy_0_fixed_by_hand_and_a_copy_typed_at_the_end(self):
+        """Pre-existing: two copies again, but the second is the typed one."""
+        ids = self.scan(self.TWO)
+        self.by_hand(self.TWO.format(w=self.W).replace(self.W, self.FIX, 1)
+                     + ' ' + self.W)
+        self.refused(ids[1])
+
+    def _one_batch_each(self, line, order):
+        ids = self.scan(line)
+        for k in order:
+            res, code = self.apply(self.key, [{'id': ids[k]}])
+            self.assertEqual(code, 200, res)
+            self.assertIn(res['applied'][0]['confidence'],
+                          ('exact', 'indexed'))
+        self.assertEqual(self.line(), line.format(w=self.FIX))
+
+    def test_separate_batches_still_apply_two_copies(self):
+        self._one_batch_each(self.TWO, (0, 1))
+
+    def test_separate_batches_still_apply_three_copies(self):
+        self._one_batch_each(self.THREE, (1, 2, 0))
+
+    def test_a_word_typed_at_the_start_of_a_short_line(self):
+        """Window clipping, end to end: the last copy sits 45 characters in,
+        so once a word is typed at the start its window equals the old whole
+        line — the snippet of EVERY copy. Copy 0's finding was written onto
+        the last copy as 'exact'; main got this right."""
+        w, fix = 'כעבר', 'כעבד'
+        scanned = 'האומר והלכה רבו ולכן {w} האומר {w} צריך צר {w} לפני'
+        self.assertEqual(scanned.format(w=w).rindex(w), 45)
+        self.W, self.FIX = w, fix
+        ids = self.scan(scanned)
+        self.assertEqual(len(ids), 3)
+        self.by_hand('והלכה ' + scanned.format(w=w))
+        d = self.open_doc(self.key)
+        ok = {i['id']: i['anchor'].get('ok') for i in d['items']}
+        self.assertEqual([ok[i] for i in ids], [False, False, True])
+        for fid in ids[:2]:
+            self.refused(fid)
+        res, code = self.apply(self.key, [{'id': ids[2]}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.line(), 'והלכה ' + scanned.format(w=w)[:45]
+                         + fix + ' לפני')
+
+
 class TestManualPickNeedsIdentity(Env):
     """A refused anchor must never turn an unidentified line into a click
     target: the human may only choose among snippet-identified lines."""
@@ -810,6 +1508,9 @@ class TestManualPickNeedsIdentity(Env):
         self.assertEqual(it['anchor']['code'], 'line_mismatch')
         self.assertEqual(it['anchor'].get('manual_lines'), [])
         self.assertFalse(any('tokens' in ln for ln in d['lines']))
+        # ...and its message does not send the corrector to click anyway
+        self.assertNotIn('ידנית', it['anchor']['message'])
+        self.assertIn('לסרוק את הספר מחדש', it['anchor']['message'])
 
 
 class TestOpenIntents(FixerEnv):
@@ -919,6 +1620,8 @@ class TestLockRobustness(FixerEnv):
 
     def test_delete_pending_lock_is_busy_not_an_error(self):
         from magiah.webui import journal
+        # a lock file being deleted still has its name in the folder
+        write(self.path + journal.LOCK_SUFFIX, '{}')
         real_open = journal.os.open
 
         def pending(path, *a, **kw):
@@ -933,6 +1636,49 @@ class TestLockRobustness(FixerEnv):
         finally:
             journal.os.open = real_open
         self.assertEqual(r, 'file_busy')
+
+    def _folder_refuses_new_files(self):
+        from magiah.webui import journal
+        real_open = journal.os.open
+
+        def denied(path, *a, **kw):
+            if path.endswith(journal.LOCK_SUFFIX):
+                raise PermissionError(13, 'Access is denied', path)
+            return real_open(path, *a, **kw)
+        journal.os.open = denied
+        return real_open
+
+    def test_a_folder_that_refuses_new_files_fails_at_once(self):
+        """No lock file, yet it cannot be created: a permission problem,
+        not contention. It used to wait 15 s and then say "busy"."""
+        from magiah.webui import journal
+        real_open = self._folder_refuses_new_files()
+        t0 = time.time()
+        try:
+            with self.assertRaises(patcher.AccessDenied) as cm:
+                with journal.file_lock(self.path):
+                    pass
+        finally:
+            journal.os.open = real_open
+        self.assertLess(time.time() - t0, 2)
+        self.assertEqual(cm.exception.code, 'folder_not_writable')
+        self.assertIn(os.path.dirname(self.path), str(cm.exception))
+        self.assertTrue(any('א' <= c <= 'ת'
+                            for c in str(cm.exception)))
+
+    def test_apply_in_a_folder_that_refuses_new_files(self):
+        from magiah.webui import journal
+        fp = self.open_doc(self.key)['fingerprint']
+        real_open = self._folder_refuses_new_files()
+        t0 = time.time()
+        try:
+            with self.assertRaises(patcher.AccessDenied):
+                self.apply(self.key, [{'id': 1}], fingerprint=fp)
+        finally:
+            journal.os.open = real_open
+        self.assertLess(time.time() - t0, 2)
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+        self.assertEqual(journal.read_records(self.outdir), [])
 
     def test_held_lock_is_kept_fresh(self):
         from magiah.webui import journal
@@ -975,6 +1721,71 @@ class TestLockRobustness(FixerEnv):
         finally:
             release.set()
             t.join(5)
+
+    def _crashed_write(self, landed=True):
+        """What a process killed mid-write leaves: an open intent, its lock
+        file (stale by now) and a partial temp file next to the book."""
+        from magiah.webui import journal
+        d = patcher.read_doc(self.path)
+        before = d.encode()
+        plans, failures = patcher.plan_all(d, [finding(
+            d.lines[1], 'יותבת', 'יושבת', lineno=1)])
+        self.assertEqual(failures, [])
+        patcher.apply_edits(d, plans)
+        after = d.encode()
+        journal.begin(self.outdir, {
+            'kind': 'apply', 'path': self.path, 'book_key': self.key,
+            'mode': 'replace', 'finding_ids': [1], 'mark_fixed': True,
+            'detail': patcher.detail_json(plans), 'backup': '',
+            'fp_before': patcher.fingerprint_bytes(before),
+            'fp_after': patcher.fingerprint_bytes(after)})
+        if landed:
+            write(self.path, after.decode('utf-8'))
+        lf = write(self.path + journal.LOCK_SUFFIX, '{"pid": 1}')
+        old = time.time() - journal.STALE_LOCK_SECONDS - 80
+        os.utime(lf, (old, old))
+        tmp = write(self.path + '.' + 'b' * 32 + '.tmp', 'חלקי')
+        return lf, tmp
+
+    def test_first_page_load_after_a_crash_settles_it(self):
+        """The page load used to break the dead holder's lock and still
+        report the book busy (it has no time to wait), leaving the intent,
+        the partial temp file and the bookkeeping for a later write."""
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        d = self.open_doc(self.key)
+        self.assertEqual(journal.pending(self.outdir), [])
+        self.assertEqual(len(d['edits']), 1)
+        self.assertEqual(self.status_of(1), 'fixed')
+        self.assertFalse(os.path.exists(lf))
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(sorted(os.listdir(self.lib)), ['ספר.txt'])
+
+    def test_crash_then_hand_edit_reaches_the_page_as_a_conflict(self):
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        write(self.path, raw(self.path).decode('utf-8') + 'שורה ביד\n')
+        d = self.open_doc(self.key)
+        self.assertEqual(journal.pending(self.outdir), [])
+        [c] = d['journal_conflicts']
+        self.assertEqual((c['kind'], c['finding_ids']), ('apply', [1]))
+        self.assertEqual(c['message'],
+                         patcher._msg('journal_conflict'))
+        self.assertFalse(os.path.exists(lf) or os.path.exists(tmp))
+        con = self.con()
+        try:
+            fixer_api.resolve_conflict(con, self.outdir, {'jid': c['jid']})
+        finally:
+            con.close()
+        self.assertEqual(self.open_doc(self.key)['journal_conflicts'], [])
+
+    def test_a_live_holders_lock_is_not_broken(self):
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        os.utime(lf, None)                     # refreshed: its holder lives
+        self.open_doc(self.key)
+        self.assertEqual(len(journal.pending(self.outdir)), 1)
+        self.assertTrue(os.path.exists(lf) and os.path.exists(tmp))
 
     def test_journal_is_compacted(self):
         from magiah.webui import journal
@@ -1027,8 +1838,11 @@ class TestRecordedEvidence(Env):
             self.add(fid, 'יותבת', 'יושבת', '%s:%d' % (key, n),
                      scan_snippet(line, 'יותבת'), doc='מקור/ד.txt',
                      extra=json.dumps({'book_scan': True}))
+        data = raw(path)
         db.record_book_scan_source(self.outdir, {
-            'doc': 'מקור/ד.txt', 'kind': 'library', 'path': path})
+            'doc': 'מקור/ד.txt', 'kind': 'library', 'path': path,
+            'file_sha': patcher.fingerprint_bytes(data),
+            'file_size': len(data)})
         d = self.open_doc(key)
         self.assertEqual([i['anchor'].get('ok') for i in d['items']],
                          [True, True])
@@ -1045,27 +1859,142 @@ class TestRecordedEvidence(Env):
         self.assertEqual(two['anchor'].get('code'), 'ambiguous_line')
 
     def test_report_root_comes_from_report_db(self):
-        from magiah import core
         libB = os.path.join(self.tmp, 'libB')
         os.makedirs(libB)
-        write(os.path.join(self.lib, 'ספר.txt'), 'אמר רבי יותבת בן זומא\n')
-        rep = sqlite3.connect(os.path.join(self.outdir, 'report.db'))
-        core.write_scan_meta(rep, {'type': 'library', 'path': self.lib})
-        rep.commit()
-        rep.close()
+        line = 'אמר רבי יותבת בן זומא'
+        write(os.path.join(self.lib, 'ספר.txt'), line + '\n')
+        make_report(self.outdir, self.lib, [
+            ('יותבת', 'יושבת', 'file:ספר.txt:0',
+             scan_snippet(line, 'יותבת'))])
+        db.import_all(self.outdir)
         con = self.con()
-        con.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
-                    ('2999-01-01T00:00:00',))
+        fid = con.execute('SELECT id FROM findings').fetchone()[0]
+        con.execute("INSERT INTO review VALUES(?,'approved',NULL,NULL,'t')",
+                    (fid,))
         con.commit()
         con.close()
-        self.add(1, 'יותבת', 'יושבת', 'file:ספר.txt:0',
-                 'אמר רבי יותבת בן זומא')
         self.set_config(libB)             # run_config says B, the scan said A
-        res, code = self.apply('file:ספר.txt', [{'id': 1}],
+        res, code = self.apply('file:ספר.txt', [{'id': fid}],
                                fingerprint='sha256:x')
         self.assertEqual(code, 409, res)
         self.assertEqual(res['code'], 'source_mismatch')
         self.assertEqual(res['recorded'], os.path.abspath(self.lib))
+
+
+class TestScanTimeFingerprint(Env):
+    """A book scan records the fingerprint of the bytes it READ.
+
+    It used to hash the file when the result was merged. A book edited while
+    it was being scanned (context verification can take minutes) then looked
+    unchanged, its rows skipped the parallel-verse (twin) check, and a
+    correction landed on the verse the user had judged not_error.
+    """
+    P = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בבקר'    # parallel verse
+    S = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בערב'    # the scanned one
+    REL = 'מקור/מקביל.txt'
+
+    def setUp(self):
+        super().setUp()
+        import pickle
+        from collections import Counter
+        from magiah import core
+        words = set(normalize.tokenize(
+            ' '.join((self.P, self.S, 'ויאמר משה אל העם לאמר',
+                      'ויהי ערב ויהי בקר יום אחד הקדמה חדשה קרבן'))))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq['קדבן'] = 2
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            pickle.dump(freq, f)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'ויאמר משה אל העם לאמר\n%s\n%s\n'
+                          'ויהי ערב ויהי בקר יום אחד\n' % (self.P, self.S))
+        self.key = 'file:' + self.REL
+
+    def scan(self):
+        from magiah import book_scan
+        return book_scan.scan_book(self.outdir, 'library', self.REL,
+                                   library_dir=self.lib)
+
+    def judge_and_apply(self):
+        """P is correct here (not_error); S is the typo (approved)."""
+        con = self.con()
+        try:
+            ids = {r[1].rsplit(':', 1)[1]: r[0] for r in con.execute(
+                "SELECT id, unit FROM findings WHERE word = 'קדבן'")}
+        finally:
+            con.close()
+        self.assertEqual(sorted(ids), ['1', '2'])
+        con = self.con()
+        try:
+            db.set_status(con, self.outdir, [ids['1']], 'not_error')
+            db.set_status(con, self.outdir, [ids['2']], 'approved')
+        finally:
+            con.close()
+        d = self.open_doc(self.key)
+        self.trusted = {i['trusted'] for i in d['items']}
+        return self.apply(self.key, [{'id': ids['2']}],
+                          fingerprint=d['fingerprint'])
+
+    def test_the_book_read_carries_its_fingerprint(self):
+        from magiah import book_source
+        book = book_source.load_book('library', self.REL,
+                                     library_dir=self.lib)
+        self.assertEqual(book.file_sha, patcher.fingerprint(self.path))
+        self.assertEqual(book.file_size, len(raw(self.path)))
+        result = self.scan()
+        self.assertEqual((result['file_sha'], result['file_size']),
+                         (book.file_sha, book.file_size))
+
+    def test_a_book_edited_during_its_scan_is_not_trusted(self):
+        result = self.scan()
+        scanned = raw(self.path)
+        # edited while the scan was still running: a line inserted on top
+        write(self.path, 'הקדמה חדשה\n' + scanned.decode('utf-8'))
+        db.merge_book_scan(self.outdir, result)
+        con = self.con()
+        try:
+            rec = db.get_source_root(con, 'doc:' + self.REL)
+        finally:
+            con.close()
+        self.assertEqual(rec['file_sha'], patcher.fingerprint_bytes(scanned))
+        self.assertEqual(rec['file_size'], len(scanned))
+        before = raw(self.path)
+        res, code = self.judge_and_apply()
+        self.assertEqual(self.trusted, {False})
+        # the scanned line number now holds P: never written there
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['ambiguous_line'])
+        self.assertEqual(raw(self.path), before)
+
+    def test_an_unchanged_book_still_trusts_its_line_numbers(self):
+        db.merge_book_scan(self.outdir, self.scan())
+        res, code = self.judge_and_apply()
+        self.assertEqual(self.trusted, {True})
+        self.assertEqual(code, 200, res)
+        lines = raw(self.path).decode('utf-8').splitlines()
+        self.assertEqual(lines[1], self.P)
+        self.assertEqual(lines[2], self.S.replace('קדבן', 'קרבן'))
+
+    def test_trust_needs_the_exact_window_at_the_line(self):
+        """Even a byte-identical book: a token-level match at the recorded
+        line is no proof, so the twin check still runs."""
+        d = self.doc('פתיחה\n%s\n%s\n' % (self.P, self.S))
+        f = finding(self.S, 'קדבן', 'קרבן', lineno=1, trusted=True)
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'ambiguous_line')
+        self.assertEqual(cm.exception.extra['candidate_lines'], [1, 2])
+
+    def test_a_merge_without_a_read_fingerprint_is_not_trusted(self):
+        db.record_book_scan_source(self.outdir, {
+            'doc': self.REL, 'kind': 'library', 'path': self.path})
+        con = self.con()
+        try:
+            rec = db.get_source_root(con, 'doc:' + self.REL)
+        finally:
+            con.close()
+        self.assertEqual((rec['file_sha'], rec['file_size']), (None, None))
 
 
 class TestCliBookScanRecordsRoot(Env):

@@ -61,16 +61,20 @@ import os
 import re
 import sqlite3
 import time
-import urllib.request
 from datetime import datetime
 
 from . import hebrew
+from ..corpus_hybrid import DEFAULT_LIBRARY
+# one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
+from ..textsource import sqlite_uri as _uri
 
 UI_DB_F = 'ui_review.db'
 REPORT_DB_F = 'report.db'
 DECISIONS_F = 'decisions.db'
 TOKDIAG_GLOB = '*tokdiag_source_he.csv'
 BACKUP_DIR = 'backups'
+# meta key: the library root (and scan time) of the report import_all imported
+IMPORT_SOURCE_KEY = 'import_source'
 
 # --- copied VERBATIM from magiah/core.py (keep in sync) --------------------
 RANK_SQL = '''score
@@ -207,9 +211,22 @@ SCHEMA_REV = 3
 # books share one, so it is used only when a row has no doc at all.
 BOOKKEY = "COALESCE(NULLIF(f.doc, ''), 'src:' || COALESCE(f.source, ''))"
 
+
+def _rule_status(col):
+    """A rule's status as it reaches one finding. An approval made by a rule
+    (word-wide, book or replacement) does not reach a row marked
+    tanach_legacy: such a row needs its own re-check, like a dropped per-row
+    approval. A rule's not_error / ignored judges the word itself and still
+    applies."""
+    return (f"CASE WHEN {col} IN ('approved', 'fixed') AND "
+            f"COALESCE(f.extra, '') LIKE '%tanach_legacy%' THEN NULL "
+            f"ELSE {col} END")
+
+
 # effective status, narrowest decision first: this occurrence, the book's
-# convention, the rejected (word, suggestion) pair, the global word rule
-EFF = "COALESCE(r.status, rb.status, rr.status, w.status, 'pending')"
+# convention, the (word, suggestion) pair, the global word rule, else pending
+EFF = (f"COALESCE(r.status, {_rule_status('rb.status')}, "
+       f"{_rule_status('rr.status')}, {_rule_status('w.status')}, 'pending')")
 JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
          'LEFT JOIN book_rules rb ON rb.word = f.word '
          f'AND rb.doc = {BOOKKEY} '
@@ -265,11 +282,6 @@ FINDING_COLS = ['id', 'family', 'errtype', 'word', 'suggestion', 'score',
 
 def _now():
     return datetime.now().isoformat(timespec='microseconds')
-
-
-def _uri(path, ro=False):
-    u = 'file:' + urllib.request.pathname2url(os.path.abspath(path))
-    return u + '?mode=ro' if ro else u
 
 
 def connect(outdir):
@@ -408,12 +420,16 @@ def _migrate(con):
         con.rollback()                 # locked: the next connection retries
 
 
+DECISIONS_TIMEOUT = 30.0      # seconds to wait for a decisions.db lock
+
+
 def _decisions_con(outdir):
     """decisions.db. Its `decisions` table stays exactly as the legacy tool
     created it; the explicit scope of each row lives in `decision_scope`
     (unit '*' = global, anything else = this occurrence only)."""
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=30.0)
-    con.execute('PRAGMA busy_timeout=30000')
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F),
+                          timeout=DECISIONS_TIMEOUT)
+    con.execute(f'PRAGMA busy_timeout={int(DECISIONS_TIMEOUT * 1000)}')
     have = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if 'decisions' not in have:
@@ -450,6 +466,164 @@ def _tanach_extra(evidence_json, verified):
         return json.loads(evidence_json) if evidence_json else {}
     except ValueError:
         return {}
+
+
+class DecisionsLocked(PermissionError, ValueError):
+    """decisions.db is locked by another program. Carries a Hebrew message;
+    the server answers 423 with it, a book scan reports it as its error."""
+
+
+def _withdraw_todo(con, keys):
+    """Which (word, unit) `keys` have a decisions.db mirror to withdraw after
+    their approval was dropped: keys this UI owns (an unowned row is the old
+    tool's own decision) on which no approved / fixed finding still stands."""
+    keys = {(w or '', u or '') for w, u in keys}
+    return [(word, unit) for word, unit in sorted(keys)
+            if _owns_decision(con, word, unit) and not con.execute(
+                '''SELECT 1 FROM review r
+                   JOIN findings f ON f.id = r.finding_id
+                   WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
+                     AND r.status IN ('approved', 'fixed') LIMIT 1''',
+                (word, unit)).fetchone()]
+
+
+def _withdraw_accepts(dec, todo):
+    """Delete the 'accept' rows of `todo` (see :func:`_withdraw_todo`) on an
+    open decisions.db connection, leaving the commit to the caller. Returns
+    the keys under which nothing is left; their ownership markers go only
+    after decisions.db committed (:func:`_drop_owned`)."""
+    gone = []
+    for word, unit in todo:
+        dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
+                    "AND verdict = 'accept'", (word, unit))
+        # nothing of ours left under this key (also after a retry)
+        if not dec.execute('SELECT 1 FROM decisions '
+                           'WHERE word = ? AND unit = ?',
+                           (word, unit)).fetchone():
+            dec.execute('DELETE FROM decision_scope '
+                        'WHERE word = ? AND unit = ?', (word, unit))
+            gone.append((word, unit))
+    return gone
+
+
+def _drop_owned(con, gone):
+    for word, unit in gone:
+        con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
+                    (word, unit))
+
+
+def _count_keys(gone, keys):
+    """How many of the withdrawn keys `gone` are among `keys`."""
+    return len(set(gone) & {(w or '', u or '') for w, u in keys})
+
+
+def _clear_dropped_decisions(con, outdir, keys):
+    """Withdraw the decisions.db 'accept' rows of dropped approvals: legacy
+    Tanach approvals an import dropped, and approvals that went stale because
+    their finding now proposes another correction.
+
+    The approval is gone from `review`, but its mirror in decisions.db still
+    carries the old suggestion: the old review tool would keep honouring it,
+    and /api/import_legacy would turn it back into an approval. Only rows
+    this UI owns are removed (an unowned row is the old tool's own decision),
+    and only while no other approved / fixed finding still stands on the same
+    (word, unit) key. The `history` record of the drop is kept.
+
+    Order: runs inside the caller's still-open ui_review.db transaction and
+    commits decisions.db FIRST; the ownership markers are deleted (in the
+    caller's transaction) only after that commit. If the caller's commit then
+    fails, the next refresh recomputes the same drop and finds nothing left
+    to withdraw. If decisions.db cannot be written (another program holds a
+    lock on it) nothing is withdrawn and :class:`DecisionsLocked` is raised,
+    so the caller rolls back the drop as well and the next refresh redoes
+    both. Returns the (word, unit) keys withdrawn.
+    """
+    if not keys or not os.path.exists(os.path.join(outdir, DECISIONS_F)):
+        return []
+    todo = _withdraw_todo(con, keys)
+    if not todo:
+        return []
+    dec = None
+    try:
+        dec = _decisions_con(outdir)
+        gone = _withdraw_accepts(dec, todo)
+        dec.commit()
+    except sqlite3.OperationalError as e:
+        raise DecisionsLocked(hebrew.MESSAGES['decisions_locked']) from e
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
+    _drop_owned(con, gone)
+    return gone
+
+
+def _decisions_for_write(outdir):
+    """decisions.db with its write lock already taken, for an action that
+    writes it in one transaction with ui_review.db (undo, restoring a
+    backup). Another program's lock fails the action up front with
+    :class:`DecisionsLocked` (HTTP 423), before anything was changed."""
+    dec = None
+    try:
+        dec = _decisions_con(outdir)
+        dec.execute('BEGIN IMMEDIATE')
+    except sqlite3.OperationalError as e:
+        if dec is not None:
+            dec.close()
+        raise DecisionsLocked(
+            hebrew.MESSAGES['decisions_locked_action']) from e
+    return dec
+
+
+def _commit_decisions_first(con, dec, gone=()):
+    """Commit decisions.db, then ui_review.db (dropping the ownership markers
+    of `gone`, the keys :func:`_withdraw_accepts` emptied, in between). If
+    ui_review.db then fails, nothing there changed and repeating the action
+    rewrites the same decisions.db rows; the other way round a failure would
+    leave decisions.db behind for good."""
+    try:
+        dec.commit()
+    except sqlite3.OperationalError as e:
+        raise DecisionsLocked(
+            hebrew.MESSAGES['decisions_locked_action']) from e
+    _drop_owned(con, gone)
+    con.commit()
+
+
+def config_root_for_report(outdir):
+    """The configured library (run_config.json), standing in as the root of
+    a report.db that does not name its own (one written before scan_meta).
+
+    None when run_config.json was rewritten after report.db: a later scan
+    has been started since, so the setting may describe that scan instead.
+    """
+    from . import scanner
+    rc = os.path.join(outdir, scanner.RUN_CONFIG)
+    rep = os.path.join(outdir, REPORT_DB_F)
+    try:
+        if os.path.isfile(rc) and os.path.isfile(rep) \
+                and os.path.getmtime(rc) > os.path.getmtime(rep):
+            return None
+    except OSError:
+        return None
+    try:
+        lib = scanner.scan_config(outdir)['corpus'].get('library_dir')
+    except Exception:                       # config unreadable -> the default
+        lib = None
+    return os.path.abspath(lib or DEFAULT_LIBRARY)
+
+
+def _report_source(cur, outdir):
+    """The identity of the report.db attached as ``rep``: the library root
+    its scan read and when it was written, from its own scan_meta table."""
+    if cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                   "AND name='scan_meta'").fetchone():
+        meta = dict(cur.execute('SELECT key, value FROM rep.scan_meta'))
+        return {'root': meta.get('library_root') or None,
+                'scanned_at': meta.get('scanned_at') or None,
+                'basis': 'scan_meta'}
+    root = config_root_for_report(outdir)
+    return {'root': root, 'scanned_at': None,
+            'basis': 'run_config' if root else 'unknown'}
 
 
 def import_all(outdir, migrate_legacy=False):
@@ -697,28 +871,34 @@ def import_all(outdir, migrate_legacy=False):
                     (str(max(max_id, new_max)),))
 
         # approvals that may rest on legacy Tanach evidence: re-check
-        stale = cur.execute('''
-            SELECT r.finding_id, f.word FROM review r
+        legacy = cur.execute('''
+            SELECT r.finding_id, f.word, f.unit FROM review r
             JOIN assign a ON a.old_id = r.finding_id AND a.lg_changed
             JOIN findings f ON f.id = r.finding_id
             WHERE r.status = 'approved' ''').fetchall()
         ts = _now()
-        for fid, word in stale:
+        for fid, word, _unit in legacy:
             cur.execute('INSERT INTO history(ts, action, finding_id, word, '
                         'old_status, new_status, note) '
                         'VALUES(?,?,?,?,?,?,?)',
                         (ts, 'legacy_recheck', fid, word, 'approved', None,
                          'tanach_legacy'))
             cur.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
-        counts['legacy_approvals_dropped'] = len(stale)
+        counts['legacy_approvals_dropped'] = len(legacy)
 
         # drop review rows of vanished findings; count what survived
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
                        (SELECT id FROM findings)''')
         cur.execute('''DELETE FROM review_ext WHERE finding_id NOT IN
                        (SELECT finding_id FROM review)''')
+        # approvals whose finding now proposes another correction
         stale = _mark_stale_approvals(cur)
         preserved = cur.execute('SELECT COUNT(*) FROM review').fetchone()[0]
+        # withdraw the decisions.db mirror of both kinds of dropped approval,
+        # decisions.db first (raises DecisionsLocked: all rolled back, the
+        # next refresh redoes it)
+        legacy_keys = [(w, u) for _, w, u in legacy]
+        gone = _clear_dropped_decisions(con, outdir, legacy_keys + stale)
 
         counts.update({
             'total': total,
@@ -727,6 +907,8 @@ def import_all(outdir, migrate_legacy=False):
             'added': total - matched - kept,
             'removed': old_total - matched - kept,
             'preserved': preserved,
+            'legacy_decisions_withdrawn': _count_keys(gone, legacy_keys),
+            'decisions_withdrawn': len(gone),
             'book_scan_kept': kept,
             'stale_approvals': len(stale),
         })
@@ -734,6 +916,13 @@ def import_all(outdir, migrate_legacy=False):
                     (_now(),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
+        # which library these rows were scanned from, committed with the rows
+        # themselves: the fixer reads it from here and never infers it from
+        # timestamps (a book-scan merge also moves last_import)
+        cur.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (IMPORT_SOURCE_KEY,
+                     json.dumps(_report_source(cur, outdir),
+                                ensure_ascii=False)))
         cur.execute('DROP TABLE imp')
         cur.execute('DROP TABLE imp2')
         cur.execute('DROP TABLE oldmap')
@@ -742,7 +931,6 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('DROP TABLE keep_docs')
         con.commit()
         con.execute('DETACH DATABASE rep')
-        _unsync_stale(con, outdir, stale)
 
         if migrate_legacy:
             counts['migrated'] = migrate_legacy_decisions(con, outdir)
@@ -826,6 +1014,11 @@ def import_book_scan(outdir, result):
             FROM oldbook o JOIN review r ON r.finding_id = o.id
             LEFT JOIN review_ext x ON x.finding_id = o.id
             WHERE o.lg = 0 OR r.status != 'approved' ''')
+        # ...and the legacy approvals it leaves behind (as in import_all)
+        cur.execute('''CREATE TEMP TABLE dropped AS
+            SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq
+            FROM oldbook o JOIN review r ON r.finding_id = o.id
+            WHERE o.lg != 0 AND r.status = 'approved' ''')
 
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
@@ -932,18 +1125,42 @@ def import_book_scan(outdir, result):
             FROM newbook n JOIN oldrev o
               ON o.family = n.family AND o.w = n.w AND o.u = n.u
              AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
+        # approvals whose re-scanned row proposes another correction
         stale = _mark_stale_approvals(
             cur, 'f.doc = ? AND f.id > ?', (doc, max_id))
 
+        # -- log the dropped legacy approvals --------------------------------
+        # The old ids are gone with their history; the entry points at the
+        # new row of the same identity when the re-scan still has one.
+        legacy = cur.execute('''
+            SELECT n.id, d.w, d.u FROM dropped d LEFT JOIN newbook n
+              ON n.family = d.family AND n.w = d.w AND n.u = d.u
+             AND n.errtype = d.errtype AND n.r = d.r AND n.seq = d.seq
+            ''').fetchall()
+        ts = _now()
+        for fid, word, _unit in legacy:
+            cur.execute('INSERT INTO history(ts, action, finding_id, word, '
+                        'old_status, new_status, note) '
+                        'VALUES(?,?,?,?,?,?,?)',
+                        (ts, 'legacy_recheck', fid, word, 'approved', None,
+                         'tanach_legacy'))
+        # ...and withdraw the decisions.db mirror of both kinds of dropped
+        # approval, decisions.db first (raises DecisionsLocked: all rolled
+        # back, the next re-scan redoes it)
+        legacy_keys = [(w, u) for _, w, u in legacy]
+        gone = _clear_dropped_decisions(con, outdir, legacy_keys + stale)
+
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
-        for t in ('oldbook', 'oldrev', 'newbook'):
+        for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
-        _unsync_stale(con, outdir, stale)
         return {'doc': doc, 'title': result.get('title'),
                 'added': added, 'replaced': old_total,
                 'preserved': preserved, 'stale_approvals': len(stale),
+                'legacy_approvals_dropped': len(legacy),
+                'legacy_decisions_withdrawn': _count_keys(gone, legacy_keys),
+                'decisions_withdrawn': len(gone),
                 'findings': len(result.get('findings') or []),
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
@@ -995,32 +1212,32 @@ def _ids_of(con, stale, candidates):
         (json.dumps(list(candidates)),))]
 
 
-def _unsync_stale(con, outdir, stale):
-    """Withdraw the decisions.db 'accept' of approvals that went stale."""
-    if not stale:
-        return
-    dec = _decisions_con(outdir)
-    try:
-        for word, unit in stale:
-            _sync_decision(con, dec, {'word': word, 'unit': unit}, 'pending')
-        con.commit()
-        dec.commit()
-    finally:
-        dec.close()
-
-
 def migrate_legacy_decisions(con, outdir):
     """OPT-IN migration of the old decisions.db into review / word_rules.
 
     accept -> approved (decision suggestion kept as custom_suggestion when it
-    differs from the finding's own suggestion); reject with unit='*' -> a
-    word_rules 'not_error' row (the only global scope); per-unit reject ->
-    not_error on that occurrence only; ignore -> ignored. Matching is on
-    (word, unit); existing review rows are never overwritten. The decider of
-    a legacy row is unknown, so decided_by stays empty. Returns counts.
+    differs from the finding's own suggestion); reject -> not_error; ignore
+    -> ignored. A per-unit row is a decision on that occurrence only (scope
+    'occurrence'); a unit='*' row becomes a word_rules row of the same status
+    (the old tool's "reject everywhere" -> 'not_error', the only global
+    scope; this UI's earlier versions also mirrored word-wide approvals
+    there). Matching is on (word, unit); existing review rows are never
+    overwritten. The decider of a legacy row is unknown, so decided_by stays
+    empty. Returns counts.
+
+    Exception: an accept on a Tanach-backed finding (a tanach_legacy row, a
+    row with tanach != 0, or a tanach_* family row) is imported as 'unsure',
+    without a custom suggestion, its old suggestion kept only in the note
+    (counted in ``recheck``). Such an accept was given while the old trigram
+    heuristic replaced the suggestion and boosted the rank, so it may approve
+    a correction nobody would approve today. 'unsure' rather than skipping:
+    the user still sees that an old decision exists, and nothing is approved
+    or exported until they decide again. A differing suggestion alone is not
+    enough to demote: the old tool's "accept with my correction" writes one.
     """
     dec_path = os.path.join(outdir, DECISIONS_F)
-    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0}
+    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'decisions': 0,
+           'recheck': 0}
     if not os.path.exists(dec_path):
         return out
     dec = _decisions_con(outdir)
@@ -1042,32 +1259,42 @@ def migrate_legacy_decisions(con, outdir):
         # owns them and may delete them again on a later pending/unsure write
         _own_decision(con, word, unit)
         if unit == '*':
+            # the old tool writes '*' only for "reject everywhere"; this UI
+            # mirrors every word-wide status there, an approval included
             con.execute('INSERT OR REPLACE INTO word_rules(word, status, '
-                        'updated_at) VALUES(?,?,?)', (word, 'not_error', ts))
+                        'updated_at) VALUES(?,?,?)', (word, status, ts))
             out['word_rules'] += 1
             continue
         fids = con.execute(
-            'SELECT id, suggestion FROM findings WHERE word = ? AND unit = ?',
+            "SELECT id, suggestion, (COALESCE(tanach, 0) != 0 OR family IN "
+            "('tanach_error', 'tanach_match') OR COALESCE(extra, '') LIKE "
+            "'%tanach_legacy%') FROM findings WHERE word = ? AND unit = ?",
             (word, unit)).fetchall()
         if not fids:
             out['unmatched'] += 1
             continue
-        for fid, fsugg in fids:
-            custom = None
-            if (verdict == 'accept' and sugg and sugg != (fsugg or '')):
+        for fid, fsugg, tanach_backed in fids:
+            st, note, custom = status, None, None
+            if verdict == 'accept' and tanach_backed:
+                st = 'unsure'
+                note = hebrew.MESSAGES['legacy_accept_recheck'].format(
+                    sugg=sugg or '—')
+            elif (verdict == 'accept' and sugg and sugg != (fsugg or '')):
                 custom = sugg
             n = con.execute(
                 'INSERT OR IGNORE INTO review(finding_id, status, note, '
                 'custom_suggestion, updated_at) VALUES(?,?,?,?,?)',
-                (fid, status, None, custom, ts)).rowcount
+                (fid, st, note, custom, ts)).rowcount
             if n:
+                # bound to what was approved, like an approval made here
                 con.execute(
                     'INSERT OR REPLACE INTO review_ext(finding_id, scope, '
                     'approved_suggestion) VALUES(?,?,?)',
                     (fid, 'occurrence',
-                     (custom or fsugg or '') if status == 'approved'
-                     else None))
+                     (custom or fsugg or '') if st == 'approved' else None))
             out['review'] += n
+            if st == 'unsure':
+                out['recheck'] += n
     con.commit()
     return out
 
@@ -1128,6 +1355,8 @@ def get_meta(con):
     total = sum(o['count'] for o in origins)
     return {'origins': origins, 'errtypes': errtypes, 'statuses': statuses,
             'columns': columns, 'total': total,
+            'evidence_labels': hebrew.EVIDENCE_LABELS,
+            'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
             'last_import': last_import[0] if last_import else None}
@@ -1186,7 +1415,8 @@ def _findings_where(filters):
         sts = filters['status']
         if isinstance(sts, str):
             sts = [s for s in sts.split(',') if s]
-        where.append(f'{EFF} IN (%s)' % ','.join('?' * len(sts)))
+        # not %-formatting: EFF itself holds LIKE '%...%' patterns
+        where.append(f"{EFF} IN ({','.join('?' * len(sts))})")
         params.extend(sts)
     if filters.get('verified') not in (None, '', '0'):
         where.append('f.verified = 1')
@@ -1687,17 +1917,39 @@ def _set_status_locked(con, outdir, ids, found, status, note,
     return out
 
 
+# history actions undo skips: its own entries, and imports' legacy drops
+NOT_UNDOABLE = "('undo', 'legacy_recheck')"
+
+
+def _legacy_dropped_after(con, fid, hid):
+    """An import dropped this finding's approval (``legacy_recheck``) after
+    history entry `hid`: undoing that entry must not approve it again."""
+    return con.execute("SELECT 1 FROM history WHERE action = 'legacy_recheck' "
+                       'AND finding_id = ? AND id > ? LIMIT 1',
+                       (fid, hid)).fetchone() is not None
+
+
 def undo(con, outdir):
     """Revert the most recent not-yet-undone history group (one API call =
     one ts = one undo step, bulk included). Returns what was reverted.
 
     Entries carrying prev_state are restored exactly (review row, note,
     custom suggestion, scope, rule rows — or their absence); older entries
-    written before prev_state existed fall back to restoring the status."""
+    written before prev_state existed fall back to restoring the status.
+
+    A ``legacy_recheck`` entry is not a user action but an import dropping an
+    approval that rested on the old Tanach heuristic; undo never restores it
+    and reverts the user's last own action instead. Nor does reverting an
+    earlier entry bring such an approval back: an approval an import dropped
+    after that entry is restored as pending.
+
+    decisions.db is written in the same step and committed first (see
+    :func:`_commit_decisions_first`); a lock on it fails the undo with
+    :class:`DecisionsLocked` and changes nothing."""
     undone = {r[0] for r in con.execute(
         "SELECT note FROM history WHERE action = 'undo'")}
     row = con.execute(
-        "SELECT ts FROM history WHERE action != 'undo' "
+        f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
         + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
            if undone else '')
         + 'ORDER BY id DESC LIMIT 1',
@@ -1706,9 +1958,9 @@ def undo(con, outdir):
         return None
     group_ts = row[0]
     entries = con.execute(
-        "SELECT * FROM history WHERE ts = ? AND action != 'undo' "
+        f"SELECT * FROM history WHERE ts = ? AND action NOT IN {NOT_UNDOABLE} "
         'ORDER BY id DESC', (group_ts,)).fetchall()
-    dec = _decisions_con(outdir)
+    dec = _decisions_for_write(outdir)
     reverted, restored = [], []
     warnings = []
 
@@ -1725,6 +1977,7 @@ def undo(con, outdir):
                     prev = json.loads(e['prev_state'])
                 except ValueError:
                     prev = None
+            relegacy = False
             if prev is not None and 'kind' in prev:
                 kind, key, rrow = prev['kind'], prev['key'], prev['row']
                 _put_rule(con, kind, key, rrow)
@@ -1733,6 +1986,9 @@ def undo(con, outdir):
                                 rrow and rrow.get('decided_by')))
             elif prev is not None and e['finding_id'] is not None:
                 rv = prev.get('review')
+                if rv and rv.get('status') == 'approved' and \
+                        _legacy_dropped_after(con, e['finding_id'], e['id']):
+                    rv, relegacy = None, True
                 _put_review(con, e['finding_id'], rv)
                 restored.append(e['finding_id'])
                 f = con.execute('SELECT * FROM findings WHERE id = ?',
@@ -1757,6 +2013,9 @@ def undo(con, outdir):
             elif e['finding_id'] is not None:
                 f = con.execute('SELECT * FROM findings WHERE id = ?',
                                 (e['finding_id'],)).fetchone()
+                if old == 'approved' and \
+                        _legacy_dropped_after(con, e['finding_id'], e['id']):
+                    old, relegacy = None, True
                 if old is None or old == 'pending':
                     _put_review(con, e['finding_id'], None)
                 else:
@@ -1770,24 +2029,30 @@ def undo(con, outdir):
                         (e['finding_id'], old, _now()))
                 if f is not None:
                     warn(_sync_decision(con, dec, f, old or 'pending'))
-            reverted.append({'finding_id': e['finding_id'], 'word': e['word'],
-                             'restored': old or 'pending',
-                             'was': e['new_status']})
+            entry = {'finding_id': e['finding_id'], 'word': e['word'],
+                     'restored': 'pending' if relegacy else (old or 'pending'),
+                     'was': e['new_status']}
+            if relegacy:
+                entry['legacy_recheck'] = True
+            reverted.append(entry)
         con.execute('INSERT INTO history(ts, action, note) VALUES(?,?,?)',
                     (_now(), 'undo', group_ts))
         # an approval brought back onto a finding whose suggestion has since
-        # changed must not come back as approved
+        # changed must not come back as approved...
         stale = _mark_stale_ids(con, restored)
         stale_ids = set(_ids_of(con, stale, restored))
         for e in reverted:
             if e['finding_id'] in stale_ids:
                 e['restored'] = 'pending'
                 e['stale_approval'] = True
-        con.commit()
-        dec.commit()
+        # ...nor stay in decisions.db, which the loop above just wrote
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, stale))
+        _commit_decisions_first(con, dec, gone)
+    except BaseException:
+        con.rollback()
+        raise
     finally:
-        dec.close()
-    _unsync_stale(con, outdir, stale)
+        dec.close()                     # without a commit: rolled back
     out = {'reverted': len(reverted), 'group_ts': group_ts,
            'entries': reverted, 'stale_approvals': len(stale)}
     if warnings:
@@ -1976,29 +2241,27 @@ def get_fixer_items(con, key, statuses=None, origin=None):
 
     Rows are matched by the file part of `unit` (see the module note above),
     so two books sharing a filename never share a worklist.
+
+    Occurrence numbers are assigned over EVERY finding of the file, whatever
+    its status or origin, and only then is the list filtered. The writer
+    (fixer_api.apply) numbers them that way, and the page must agree with it:
+    numbered among the shown statuses only, a repeated word whose sibling is
+    'not_error' looked "count changed" on the page while apply accepted it.
     """
     from . import patcher
     if not statuses:
         statuses = ['approved']
     if isinstance(statuses, str):
         statuses = [s for s in statuses.split(',') if s]
-    sph = ','.join('?' * len(statuses))
-    params = list(statuses)
-    where = ''
-    if origin:
-        where = ' AND f.origin = ?'
-        params.append(origin)
     # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
     # each row by parsing its unit — LIKE alone could match a longer path
-    params.append(key + ':%')
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion
         FROM findings f {JOINS}
-        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
-          AND f.unit LIKE ?
+        WHERE f.unit LIKE ?
         ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
-        params).fetchall()
+        (key + ':%',)).fetchall()
     items = []
     for r in rows:
         d = _rowdict(r)
@@ -2011,7 +2274,9 @@ def get_fixer_items(con, key, statuses=None, origin=None):
         d['correction'] = d.get('custom_suggestion') or d.get('suggestion') or ''
         items.append(d)
     patcher.assign_occurrences(items)
-    return items
+    keep = set(statuses) | {'fixed'}
+    return [d for d in items if d['effective_status'] in keep
+            and (not origin or d.get('origin') == origin)]
 
 
 def get_fixer_mode(con, key, default='replace'):
@@ -2033,15 +2298,17 @@ def set_fixer_mode(con, key, mode):
 # file_edits gains journal_id (ties a row to its write-journal intent, which
 # makes recovery idempotent), backup_sha and source_root; fixer_sources holds
 # the library root each scan was made against ('report' or 'doc:<doc>') and,
-# for book scans, the hash of the file as scanned (file_sha).
+# for book scans, the fingerprint of the bytes the scan read (file_sha and
+# file_size, taken when the file was read — not when the result was merged).
 _FILE_EDIT_COLS = ('journal_id', 'backup_sha', 'source_root')
+_SOURCE_COLS = (('file_sha', 'TEXT'), ('file_size', 'INTEGER'))
 
 
 def _ensure_fixer_schema(con):
     have = {r[1] for r in con.execute('PRAGMA table_info(file_edits)')}
     missing = [c for c in _FILE_EDIT_COLS if c not in have]
     src = {r[1] for r in con.execute('PRAGMA table_info(fixer_sources)')}
-    if not missing and 'file_sha' in src:
+    if not missing and all(c in src for c, _t in _SOURCE_COLS):
         return
     for col in missing:
         try:
@@ -2050,12 +2317,13 @@ def _ensure_fixer_schema(con):
             pass                       # another connection added it first
     con.execute('''CREATE TABLE IF NOT EXISTS fixer_sources(
         scope TEXT PRIMARY KEY, root TEXT NOT NULL, stamp TEXT,
-        recorded_at TEXT NOT NULL, file_sha TEXT)''')
-    if src and 'file_sha' not in src:
-        try:
-            con.execute('ALTER TABLE fixer_sources ADD COLUMN file_sha TEXT')
-        except sqlite3.OperationalError:
-            pass
+        recorded_at TEXT NOT NULL, file_sha TEXT, file_size INTEGER)''')
+    for col, typ in _SOURCE_COLS:
+        if src and col not in src:
+            try:
+                con.execute(f'ALTER TABLE fixer_sources ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
     con.commit()
 
 
@@ -2097,49 +2365,72 @@ def get_live_edit_entries(con, key):
     return out
 
 
-def record_source_root(con, scope, root, stamp=None, file_sha=None):
+def record_source_root(con, scope, root, stamp=None, file_sha=None,
+                       file_size=None):
     _ensure_fixer_schema(con)
     con.execute('INSERT OR REPLACE INTO fixer_sources(scope, root, stamp, '
-                'recorded_at, file_sha) VALUES(?,?,?,?,?)',
+                'recorded_at, file_sha, file_size) VALUES(?,?,?,?,?,?)',
                 (scope, os.path.abspath(root) if root else '', stamp, _now(),
-                 file_sha))
+                 file_sha, file_size))
     con.commit()
 
 
 def get_source_root(con, scope):
     _ensure_fixer_schema(con)
-    row = con.execute('SELECT root, stamp, file_sha FROM fixer_sources '
-                      'WHERE scope = ?', (scope,)).fetchone()
-    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2]}
-            if row else None)
+    row = con.execute('SELECT root, stamp, file_sha, file_size '
+                      'FROM fixer_sources WHERE scope = ?',
+                      (scope,)).fetchone()
+    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2],
+             'file_size': row[3]} if row else None)
 
 
-def advance_scan_file_sha(con, scope, old, new):
+def advance_scan_file_sha(con, scope, old, new, new_size):
     """The fixer's own write moved the file from `old` to `new` without
-    moving any line, so line numbers recorded at scan time stay valid."""
+    moving any line, so line numbers recorded at scan time stay valid.
+
+    Only a fingerprint taken when the scan READ the file (it has a size) is
+    carried forward; one recorded at merge time proves nothing to carry."""
     _ensure_fixer_schema(con)
-    con.execute('UPDATE fixer_sources SET file_sha = ? WHERE scope = ? '
-                'AND file_sha = ?', (new, scope, old))
+    con.execute('UPDATE fixer_sources SET file_sha = ?, file_size = ? '
+                'WHERE scope = ? AND file_sha = ? AND file_size IS NOT NULL',
+                (new, new_size, scope, old))
     con.commit()
 
 
-def import_stamp(con):
-    """``(stamp, last_import)``. The stamp changes with every full import
-    (import_all writes import_counts; a book-scan merge does not), so a pinned
-    report root can tell it is stale."""
-    vals = dict(con.execute("SELECT key, value FROM meta WHERE key IN "
-                            "('import_counts', 'last_import')").fetchall())
-    return vals.get('import_counts') or '', vals.get('last_import') or ''
+def get_import_source(con):
+    """What import_all recorded about the report it imported —
+    ``{'root', 'scanned_at', 'basis'}`` — or None for an import made by an
+    older version, which recorded nothing. A book-scan merge never changes
+    it: those rows carry their own source (``fixer_sources``)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (IMPORT_SOURCE_KEY,)).fetchone()
+    try:
+        src = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    return src if isinstance(src, dict) else None
+
+
+def full_import_stamp(con):
+    """A value that changes with every full import (import_all writes
+    import_counts; a book-scan merge does not), so a root pinned to an old
+    import can tell it is stale. NOT last_import: book-scan merges move it."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'import_counts'"
+                      ).fetchone()
+    return (row[0] if row else None) or ''
 
 
 def record_book_scan_source(outdir, result):
     """Pin the library root a single-book scan read, under 'doc:<doc>',
-    with the hash of the file as scanned.
+    with the fingerprint of the bytes the scan read.
 
     The scan's library comes from the request, not from run_config.json, so
     without this the fixer could only guess which folder the rows describe.
+    The fingerprint is the scan's own (``file_sha`` / ``file_size`` of the
+    result), never a hash of the file taken now: a book edited while it was
+    being scanned would then look unchanged, and its rows would skip the
+    identity checks that tell a line from its parallel twin.
     """
-    from . import patcher
     if result.get('kind') not in ('library', 'file') \
             or not result.get('doc') or not result.get('path'):
         return None
@@ -2148,13 +2439,13 @@ def record_book_scan_source(outdir, result):
         root = os.path.abspath(result['path'])
         for _part in str(result['doc']).split('/'):
             root = os.path.dirname(root)
-    try:
-        sha = patcher.fingerprint(result['path'])
-    except OSError:
-        sha = None
+    sha, size = result.get('file_sha'), result.get('file_size')
+    if not sha or size is None:
+        sha = size = None              # an unproven read is never "unchanged"
     con = connect(outdir)
     try:
-        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha)
+        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha,
+                           file_size=size)
     finally:
         con.close()
     return root
@@ -2340,7 +2631,7 @@ def restore_backup(con, outdir, filename):
         raise FileNotFoundError(hebrew.MESSAGES['not_found'])
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
-    dec = _decisions_con(outdir)
+    dec = _decisions_for_write(outdir)
     out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0}
     warnings, restored = [], []
     try:
@@ -2393,14 +2684,17 @@ def restore_backup(con, outdir, filename):
                          h.get('new_status'), h.get('note'),
                          h.get('prev_state'), h.get('decided_by')))
             out['history'] += 1
-        # the backup may predate a re-scan that changed what was approved
+        # the backup may predate a re-scan that changed what was approved:
+        # such an approval returns as pending, and leaves decisions.db again
         stale = _mark_stale_ids(con, restored)
         out['stale_approvals'] = len(stale)
-        con.commit()
-        dec.commit()
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, stale))
+        _commit_decisions_first(con, dec, gone)
+    except BaseException:
+        con.rollback()
+        raise
     finally:
-        dec.close()
-    _unsync_stale(con, outdir, stale)
+        dec.close()                     # without a commit: rolled back
     if warnings:
         out['warnings'] = warnings
     return out

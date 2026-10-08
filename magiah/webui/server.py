@@ -88,6 +88,22 @@ class Handler(BaseHTTPRequestHandler):
         body.update(exc.extra or {})
         self._json(body, 409 if exc.code in patcher.CONFLICT_CODES else 400)
 
+    def _permission_error(self, exc):
+        """423, always in Hebrew. An error this program raised carries its
+        own Hebrew message (a locked decisions.db or export file, the fixer's
+        AccessDenied); one the OS raised reads "[WinError 5] Access is
+        denied: '...tmp'", so it is replaced, keeping the path it names."""
+        if exc.errno is None and str(exc):
+            body = {'error': str(exc)}
+            if getattr(exc, 'code', None):
+                body['code'] = exc.code
+        else:
+            path = exc.filename2 or exc.filename
+            body = {'error': hebrew.FIXER_MESSAGES['access_denied'].format(
+                path=path) if path else hebrew.FIXER_MESSAGES['locked'],
+                'code': 'access_denied'}
+        self._json(body, 423)
+
     def _static(self, relpath):
         if relpath in ('', '/'):
             relpath = 'index.html'
@@ -175,6 +191,8 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
         except patcher.PatchError as e:
             self._patch_error(e)
+        except PermissionError as e:
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -289,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             # before the ValueError clause below: PatchError subclasses it
             self._patch_error(e)
         except PermissionError as e:
-            self._error(str(e) or hebrew.FIXER_MESSAGES['locked'], 423)
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -338,7 +356,8 @@ class Handler(BaseHTTPRequestHandler):
             res = db.migrate_legacy_decisions(con, self.outdir)
             self._json({'ok': True, **res,
                         'message': 'יובאו החלטות ישנות: '
-                                   f"{res['review']} ממצאים, "
+                                   f"{res['review']} ממצאים "
+                                   f"(מהם {res['recheck']} לבדיקה מחדש), "
                                    f"{res['word_rules']} כללי מילים"})
         elif path == '/api/reset':
             res = db.reset(con, self.outdir, body.get('scope', 'statuses'))

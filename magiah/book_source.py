@@ -22,14 +22,15 @@ on disk. When the given path *is* inside the configured repo it is silently
 promoted to a `library` book, so scanning "the file I just edited" updates the
 right rows instead of creating a parallel `local:` copy of the same book.
 """
+import hashlib
 import os
 import sqlite3
 
 from .corpus import OTZARIA_DB
-from .textsource import OtzariaDB, ReadStats, TextSourceError, split_lines
-from .corpus_hybrid import (DEFAULT_LIBRARY, FALLBACK_ORIGIN,
-                            FILE_UNIT_PREFIX, LibraryCorpus, _HDR_RE,
-                            _header_text)
+from .textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
+                         split_lines)
+from .corpus_hybrid import (DEFAULT_LIBRARY, FILE_UNIT_PREFIX, LibraryCorpus,
+                            _HDR_RE, _header_text)
 
 LOCAL_UNIT_PREFIX = 'local:'
 LOCAL_ORIGIN = 'קבצים מקומיים'
@@ -42,6 +43,12 @@ MAX_BOOK_BYTES = 200 * 1024 * 1024
 
 class BookNotFound(Exception):
     """The requested book does not exist / cannot be read (Hebrew message)."""
+
+
+def file_fingerprint(data):
+    """Content identity of a book file's bytes, in the form the fixer
+    compares (``webui.patcher.fingerprint_bytes`` is this function)."""
+    return 'sha256:' + hashlib.sha256(data).hexdigest()[:32]
 
 
 def parse_local_unit(unit):
@@ -129,10 +136,7 @@ def _scanned_files(library_dir, lib, refresh=False):
 
 
 def _connect_ro(path):
-    import urllib.request
-    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
-          + '?mode=ro'
-    con = sqlite3.connect(uri, uri=True, timeout=30.0)
+    con = sqlite3.connect(ro_uri(path), uri=True, timeout=30.0)
     con.execute('PRAGMA busy_timeout=30000')
     return con
 
@@ -142,22 +146,32 @@ class BookText:
 
     `lines` is a list of ``(unit, ref, text)``; `ref` is the per-line reference
     shown in the UI (heRef in the DB, the running <h2>-<h4> header trail in a
-    file).
+    file). A book read from a file also carries ``file_sha`` / ``file_size``:
+    the fingerprint of the very bytes these lines were decoded from.
     """
 
-    def __init__(self, doc, title, origin, lines, kind, path=None):
+    def __init__(self, doc, title, origin, lines, kind, path=None,
+                 file_sha=None, file_size=None):
         self.doc = doc
         self.title = title
         self.origin = origin
         self.lines = lines
         self.kind = kind          # 'db' | 'library' | 'file'
         self.path = path
+        self.file_sha = file_sha
+        self.file_size = file_size
 
     def __len__(self):
         return len(self.lines)
 
 
 def _read_text_file(path, encoding='utf-8'):
+    """``(lines, sha, size)`` of one read of the file.
+
+    The fingerprint is taken from the bytes that were decoded, never from a
+    second read: a book edited while it is being scanned must not look
+    unchanged afterwards (the fixer trusts line numbers of an unchanged book).
+    """
     try:
         size = os.path.getsize(path)
     except OSError as e:
@@ -167,14 +181,16 @@ def _read_text_file(path, encoding='utf-8'):
             f'הקובץ גדול מדי לסריקת ספר בודד ({size / 1e6:.0f} MB). '
             f'המגבלה היא {MAX_BOOK_BYTES / 1e6:.0f} MB.')
     try:
-        with open(path, encoding=encoding, errors='replace',
-                  newline='') as f:
-            # NOT str.splitlines(): it also breaks on U+2028 and friends,
-            # which would number lines differently from the full scan and
-            # from the patcher
-            return split_lines(f.read())
+        with open(path, 'rb') as f:
+            data = f.read()
     except OSError as e:
         raise BookNotFound(f'לא ניתן לקרוא את הקובץ: {path} ({e})')
+    # decoded the way text mode with newline='' decodes: no newline
+    # translation. NOT str.splitlines(): it also breaks on U+2028 and
+    # friends, which would number lines differently from the full scan and
+    # from the patcher
+    return (split_lines(data.decode(encoding, errors='replace')),
+            file_fingerprint(data), len(data))
 
 
 def _file_refs(raw_lines, title):
@@ -277,10 +293,11 @@ def _load_db_book(key, db_path):
                  for uid, ref, text in odb.book_lines(book_id, stats)]
     finally:
         odb.close()
-    if stats.decode_errors:
-        # a book with unreadable rows must not be scanned as if complete
+    if stats.unread():
+        # a book with unreadable (or missing) rows must not be scanned as if
+        # complete
         raise BookNotFound(
-            f'{stats.decode_errors:,} שורות בספר "{title}" לא פוענחו; '
+            f'{stats.unread():,} שורות בספר "{title}" לא פוענחו; '
             f'הסריקה בוטלה כדי לא להציג תוצאה חלקית. '
             f'דוגמה: {stats.error_samples[:1]}')
     if not lines:
@@ -327,13 +344,14 @@ def _load_library_book(rel, library_dir):
         if twin:
             msg += f'\nהגרסה שנסרקת בפועל היא: {twin}'
         raise BookNotFound(msg)
-    raw = _read_text_file(path)
+    raw, sha, size = _read_text_file(path)
     title = os.path.splitext(rel.rsplit('/', 1)[-1])[0]
     origin = lib.origin_of(rel)
     refs = _file_refs(raw, title)
     lines = [(f'{FILE_UNIT_PREFIX}{rel}:{i}', refs[i], t)
              for i, t in enumerate(raw)]
-    return BookText(rel, title, origin, lines, 'library', path=path)
+    return BookText(rel, title, origin, lines, 'library', path=path,
+                    file_sha=sha, file_size=size)
 
 
 def _load_file_book(path, library_dir):
@@ -350,10 +368,10 @@ def _load_file_book(path, library_dir):
         if rel is not None and rel.lower().endswith('.txt'):
             return _load_library_book(rel, lib_dir)
     abspath = canonical_path(path)
-    raw = _read_text_file(abspath)
+    raw, sha, size = _read_text_file(abspath)
     title = os.path.splitext(os.path.basename(abspath))[0]
     refs = _file_refs(raw, title)
     lines = [(f'{LOCAL_UNIT_PREFIX}{abspath}:{i}', refs[i], t)
              for i, t in enumerate(raw)]
     return BookText(LOCAL_UNIT_PREFIX + abspath, title, LOCAL_ORIGIN,
-                    lines, 'file', path=abspath)
+                    lines, 'file', path=abspath, file_sha=sha, file_size=size)

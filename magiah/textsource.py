@@ -32,7 +32,7 @@ therefore excluded unless explicitly requested, and the exclusion is counted.
 """
 import os
 import sqlite3
-import urllib.request
+import urllib.parse
 
 
 class TextSourceError(Exception):
@@ -70,14 +70,41 @@ def _make_decoder(dict_bytes):
     return decode, 'zstandard'
 
 
+def sqlite_uri(path, ro=False):
+    """SQLite ``file:`` URI for `path`; read-only (``?mode=ro``) if `ro`.
+
+    Built by hand rather than with ``pathname2url``: on Python 3.14 that turns
+    ``\\\\server\\share\\...`` into ``//server/share/...``, so the URI becomes
+    ``file://server/share/...`` and SQLite rejects ``server`` as an authority
+    ("invalid uri authority") — a database on a network share could not be
+    opened at all. SQLite wants an empty authority followed by the UNC path
+    (``file:////server/share/``). Spaces, ``#``, ``%``, ``?`` and Hebrew are
+    percent-encoded (UTF-8).
+    """
+    p = os.path.abspath(path)
+    if os.name == 'nt':
+        p = p.replace('\\', '/')
+    p = urllib.parse.quote(p, safe='/:')
+    if not p.startswith('/'):
+        p = '/' + p                     # drive path: file:///C:/...
+    u = 'file://' + p                   # UNC: file:////server/share/...
+    return u + '?mode=ro' if ro else u
+
+
+def ro_uri(path):
+    """SQLite ``file:`` URI that opens `path` read-only."""
+    return sqlite_uri(path, ro=True)
+
+
 def connect_ro(path, timeout=30.0):
     """Read-only connection. Never creates a missing file (a plain
     ``sqlite3.connect`` would leave a 0-byte database behind)."""
     if not os.path.isfile(path):
         raise TextSourceError(f'קובץ מסד הנתונים לא נמצא: {path}')
-    uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path)) \
-        + '?mode=ro'
-    con = sqlite3.connect(uri, uri=True, timeout=timeout)
+    try:
+        con = sqlite3.connect(ro_uri(path), uri=True, timeout=timeout)
+    except sqlite3.Error as e:
+        raise TextSourceError(f'לא ניתן לפתוח את מסד הנתונים: {path} ({e})')
     con.execute('PRAGMA busy_timeout=30000')
     return con
 
@@ -85,13 +112,19 @@ def connect_ro(path, timeout=30.0):
 class ReadStats:
     """Counts of what a reader actually read — the coverage evidence."""
 
+    # `missing`: a `line` row with no `line_content` row — unread, like a
+    # decode error, so it too makes a pass incomplete
     FIELDS = ('lines', 'chars', 'empty', 'decode_errors', 'null_content',
-              'version_lines', 'version_lines_skipped')
+              'version_lines', 'version_lines_skipped', 'missing')
 
     def __init__(self):
         for f in self.FIELDS:
             setattr(self, f, 0)
         self.error_samples = []          # first few (unit, message)
+
+    def unread(self):
+        """Rows that exist in the input but were not read."""
+        return self.decode_errors + self.missing
 
     def add(self, other):
         for f in self.FIELDS:
@@ -121,23 +154,39 @@ class OtzariaDB:
     def __init__(self, path):
         self.path = path
         self.con = connect_ro(path)
+        # any failure past this point must release the connection: on Windows
+        # an open handle keeps seforim.db locked (WinError 32) for the process
+        try:
+            self._inspect(path)
+        except TextSourceError:
+            self.con.close()
+            raise
+        except Exception as e:          # not a database, a corrupt dictionary
+            self.con.close()
+            raise TextSourceError(
+                f'לא ניתן לקרוא את מסד הנתונים כמסד ספרים של אוצריא: {path}'
+                f' ({e})') from e
+
+    def _inspect(self, path):
         tables = {r[0] for r in self.con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if 'line' not in tables or 'book' not in tables:
-            self.con.close()
             raise TextSourceError(
                 f'הקובץ אינו מסד ספרים של אוצריא (חסרות הטבלאות line/book): '
                 f'{path}')
         line_cols = {r[1] for r in self.con.execute('PRAGMA table_info(line)')}
+        # the 4th column says whether the content row exists at all: a LEFT
+        # JOIN, so a `line` without its `line_content` row is counted as
+        # missing instead of vanishing from the read unnoticed
         if 'line_content' in tables:
             self.layout = 'line_content'
-            self._text_sql = ('SELECT l.id, l.bookId, c.content FROM line l '
-                              'JOIN line_content c ON c.id = l.id')
+            self._text_sql = ('SELECT l.id, l.bookId, c.content, '
+                              'c.id IS NOT NULL FROM line l '
+                              'LEFT JOIN line_content c ON c.id = l.id')
         elif 'content' in line_cols:
             self.layout = 'inline'
-            self._text_sql = 'SELECT l.id, l.bookId, l.content FROM line l'
+            self._text_sql = 'SELECT l.id, l.bookId, l.content, 1 FROM line l'
         else:
-            self.con.close()
             raise TextSourceError(f'לא נמצאה עמודת תוכן במסד: {path}')
         self.has_versions = {'book_version', 'version_line'} <= tables
         self.decode_raw = None
@@ -174,7 +223,12 @@ class OtzariaDB:
             raise TextSourceError('תוכן בינארי במסד ללא מילון zstd')
         return self.decode_raw(bytes(value)).decode('utf-8')
 
-    def _decode_counted(self, unit, value, stats):
+    def _decode_counted(self, unit, value, stats, present=True):
+        if not present:
+            stats.missing += 1
+            if len(stats.error_samples) < 20:
+                stats.error_samples.append((str(unit), 'no line_content row'))
+            return None
         if value is None:
             stats.null_content += 1
             return None
@@ -207,8 +261,8 @@ class OtzariaDB:
         if book_ids_sql:
             sql += f' AND l.bookId IN ({book_ids_sql})'
             args.extend(params)
-        for lid, bid, raw in self.con.execute(sql, args):
-            text = self._decode_counted(lid, raw, stats)
+        for lid, bid, raw, present in self.con.execute(sql, args):
+            text = self._decode_counted(lid, raw, stats, present)
             if text is not None:
                 yield lid, bid, text
 
@@ -216,15 +270,15 @@ class OtzariaDB:
         """``[(line_id, heRef, text)]`` of one book in reading order."""
         stats = stats if stats is not None else ReadStats()
         if self.layout == 'line_content':
-            sql = ('SELECT l.id, l.heRef, c.content FROM line l '
-                   'JOIN line_content c ON c.id = l.id WHERE l.bookId = ? '
-                   'ORDER BY l.lineIndex, l.id')
+            sql = ('SELECT l.id, l.heRef, c.content, c.id IS NOT NULL '
+                   'FROM line l LEFT JOIN line_content c ON c.id = l.id '
+                   'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
         else:
-            sql = ('SELECT l.id, l.heRef, l.content FROM line l '
+            sql = ('SELECT l.id, l.heRef, l.content, 1 FROM line l '
                    'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
         out = []
-        for lid, ref, raw in self.con.execute(sql, (book_id,)):
-            text = self._decode_counted(lid, raw, stats)
+        for lid, ref, raw, present in self.con.execute(sql, (book_id,)):
+            text = self._decode_counted(lid, raw, stats, present)
             if text is not None:
                 out.append((lid, ref or '', text))
         return out
@@ -237,15 +291,17 @@ class OtzariaDB:
         for i in range(0, len(ids), 500):
             batch = ids[i:i + 500]
             ph = ','.join('?' * len(batch))
-            for lid, _bid, raw in self.con.execute(
+            for lid, _bid, raw, present in self.con.execute(
                     self._text_sql + f' WHERE l.id IN ({ph})', batch):
-                text = self._decode_counted(lid, raw, stats)
+                text = self._decode_counted(lid, raw, stats, present)
                 if text is not None:
                     out[lid] = text
         return out
 
-    def count_version_lines(self, lo=None, hi=None):
-        """Version rows that carry their own reading (content NOT NULL)."""
+    def count_version_lines(self, lo=None, hi=None, book_ids_sql=None,
+                            params=()):
+        """Version rows that carry their own reading (content NOT NULL),
+        optionally only of the books `book_ids_sql` selects."""
         if not self.has_versions:
             return 0
         sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
@@ -253,6 +309,10 @@ class OtzariaDB:
         if lo is not None:
             sql += ' AND lineId >= ? AND lineId < ?'
             args = [lo, hi]
+        if book_ids_sql:
+            sql += (' AND lineId IN (SELECT id FROM line '
+                    f'WHERE bookId IN ({book_ids_sql}))')
+            args.extend(params)
         return self.con.execute(sql, args).fetchone()[0]
 
     def iter_version_range(self, lo, hi, stats):

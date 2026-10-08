@@ -1024,5 +1024,130 @@ class TestR2CardQueueJs(ServerCase):
         self.assertEqual(res['second'], False)
 
 
+# ===========================================================================
+# Stale approvals leave decisions.db the way dropped legacy approvals do
+# ===========================================================================
+
+class TestStaleWithdrawal(ServerCase):
+    """A stale approval's decisions.db 'accept' is withdrawn in the same
+    step that drops the approval, decisions.db first; a lock on decisions.db
+    fails the step with DecisionsLocked (423) and changes nothing."""
+
+    def _fid(self, word='אבי'):
+        return self.con.execute('SELECT id FROM findings WHERE word = ?',
+                                (word,)).fetchone()[0]
+
+    def _state(self):
+        c = db.connect(self.outdir)
+        try:
+            ui = [tuple(r) for r in c.execute(
+                'SELECT r.finding_id, r.status, x.flag FROM review r '
+                'LEFT JOIN review_ext x ON x.finding_id = r.finding_id '
+                'ORDER BY 1')]
+            owned = sorted(tuple(r) for r in c.execute(
+                'SELECT word, unit FROM owned_decisions'))
+            undos = c.execute("SELECT COUNT(*) FROM history "
+                              "WHERE action = 'undo'").fetchone()[0]
+        finally:
+            c.close()
+        dec = sqlite3.connect(os.path.join(self.outdir, db.DECISIONS_F))
+        try:
+            d = sorted(dec.execute('SELECT word, unit, verdict, suggestion '
+                                   'FROM decisions'))
+        finally:
+            dec.close()
+        return ui, owned, undos, d
+
+    def _locked(self, mode='BEGIN'):
+        holder = sqlite3.connect(os.path.join(self.outdir, db.DECISIONS_F),
+                                 isolation_level=None)
+        holder.execute(mode)
+        holder.execute('SELECT * FROM decisions').fetchall()
+        return holder
+
+    def _approve_then_change(self, rescan):
+        make_report(self.outdir, [('אבי', 'אביו', '10', '1', 'ספר')])
+        db.import_all(self.outdir)
+        db.set_status(self.con, self.outdir, [self._fid()], 'approved')
+        make_report(self.outdir, [('אבי', 'אבא', '10', '1', 'ספר')])
+        if rescan == 'book':
+            return lambda: db.merge_book_scan(self.outdir, book_result(
+                '1', 'ספר', [('אבי', 'אבא', '10')]))
+        return lambda: db.import_all(self.outdir)
+
+    def test_locked_decisions_db_fails_the_refresh_and_heals(self):
+        from unittest import mock
+        for rescan in ('full', 'book'):
+            for mode in ('BEGIN', 'BEGIN IMMEDIATE'):
+                with self.subTest(rescan=rescan, lock=mode):
+                    self.con.close()
+                    shutil.rmtree(self.outdir)
+                    os.makedirs(self.outdir)
+                    self.con = db.connect(self.outdir)
+                    refresh = self._approve_then_change(rescan)
+                    before = self._state()
+                    self.assertEqual(before[3][0][2:], ('accept', 'אביו'))
+                    holder = self._locked(mode)
+                    try:
+                        with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                            with self.assertRaises(db.DecisionsLocked):
+                                refresh()
+                    finally:
+                        holder.execute('ROLLBACK')
+                        holder.close()
+                    self.assertEqual(self._state(), before)
+                    refresh()
+                    ui, owned, _u, d = self._state()
+                    fid = self._fid()
+                    self.assertEqual(self.eff(fid), 'pending')
+                    self.assertEqual(self.review(fid)['flag'],
+                                     'stale_approval')
+                    self.assertEqual(d, [])
+                    self.assertEqual(owned, [])
+
+    def test_undo_with_locked_decisions_db_is_423_and_changes_nothing(self):
+        from unittest import mock
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'approved')
+        db.set_status(self.con, self.outdir, [1], 'not_error')
+        before = self._state()
+        holder = self._locked('BEGIN IMMEDIATE')
+        try:
+            with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                code, res = self.call('/api/undo', {})
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+        self.assertEqual(code, 423)
+        self.assertIn('decisions.db', res['error'])
+        self.assertEqual(self._state(), before)
+        self.assertEqual(self.call('/api/undo', {})[0], 200)
+        self.assertEqual(self.eff(1), 'approved')
+        self.assertEqual(self._state()[3], [('בית', '10', 'accept', 'ביתו')])
+
+    def test_stale_withdrawal_keeps_a_key_another_approval_stands_on(self):
+        # two findings on one (word, unit) key share one decisions.db row
+        def report(sub_sugg):
+            make_report(self.outdir, [('אבי', sub_sugg, '10', '1', 'ספר')])
+            rep = sqlite3.connect(os.path.join(self.outdir, db.REPORT_DB_F))
+            rep.execute("INSERT INTO occurrences_full VALUES('אבי', "
+                        "'edit1_ins', 'אביי', 5.0, 0, 0, 0, 0, 'ספר', 'r', "
+                        "'10', '', 'o1', '1')")
+            rep.commit()
+            rep.close()
+        report('אביו')
+        db.import_all(self.outdir)
+        ids = dict(self.con.execute('SELECT errtype, id FROM findings'))
+        db.set_status(self.con, self.outdir, list(ids.values()), 'approved')
+        report('אבא')                     # only the edit1_sub row changes
+        res = db.import_all(self.outdir)
+        self.assertEqual(res['stale_approvals'], 1)
+        self.assertEqual(self.eff(ids['edit1_sub']), 'pending')
+        self.assertEqual(self.eff(ids['edit1_ins']), 'approved')
+        # the row still mirrors the approval that stands
+        self.assertEqual([r[:3] for r in self._state()[3]],
+                         [('אבי', '10', 'accept')])
+
+
 if __name__ == '__main__':
     unittest.main()

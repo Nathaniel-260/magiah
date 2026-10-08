@@ -395,6 +395,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
     """Worker: scan one book, then merge it into ui_review.db."""
     from .. import book_scan
     from ..book_source import BookNotFound
+    from ..textsource import TextSourceError
     from . import db as uidb
 
     log_path = os.path.join(outdir, LOG_FILE)
@@ -445,7 +446,8 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
                 'seconds': result.get('seconds')})
     except _Cancelled:
         rc = 1
-    except (book_scan.BookScanError, BookNotFound, ValueError) as e:
+    except (book_scan.BookScanError, BookNotFound, TextSourceError,
+            ValueError) as e:
         rc, err = 1, str(e)
         emit(f'===== [book] שגיאה: {e}')
     except Exception as e:                          # noqa: BLE001

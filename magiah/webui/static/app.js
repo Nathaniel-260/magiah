@@ -892,6 +892,13 @@ function altList(word, alts) {
   return box;
 }
 
+// Hebrew label of a Tanach evidence kind / reason code (from /api/meta);
+// anything unknown — a user's own note included — is shown as-is.
+function evLabel(code) {
+  const m = (S.meta && S.meta.evidence_labels) || {};
+  return (typeof code === "string" && m[code]) || code;
+}
+
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
@@ -983,12 +990,17 @@ function renderDrawer(r, history) {
   if (typeof extra === "string" && extra) { try { extra = JSON.parse(extra); } catch (e) { extra = null; } }
   if (extra && typeof extra === "object") {
     for (const [k, v] of Object.entries(extra)) {
-      if (k === "alternatives" && Array.isArray(v)) {
-        dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
+      if (k === "alternatives") {
+        // null: the evidence names no alternative to the detector's suggestion
+        if (Array.isArray(v) && v.length)
+          dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
         continue;
       }
-      const txt = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
-      dl.append(el("dt", null, "פרטים: " + k), el("dd", null, el("bdi", null, txt)));
+      const txt = (v && typeof v === "object") ? JSON.stringify(v)
+        : typeof v === "boolean" ? (v ? "כן" : "לא")
+        : (k === "evidence_kind" || k === "reason") ? String(evLabel(v)) : String(v);
+      const kl = ((S.meta && S.meta.extra_labels) || {})[k];
+      dl.append(el("dt", null, kl || ("פרטים: " + k)), el("dd", null, el("bdi", null, txt)));
     }
   }
   fSec.append(dl);
@@ -1000,7 +1012,7 @@ function renderDrawer(r, history) {
     const from = h.old_status ? statusInfo(h.old_status).hebrew : "—";
     const to = h.new_status ? statusInfo(h.new_status).hebrew : "—";
     hSec.append(el("div", { class: "h-item" },
-      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + h.note : ""));
+      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + evLabel(h.note) : ""));
   }
   body.append(hSec);
 }
@@ -1265,6 +1277,7 @@ async function loadFixDoc() {
     $("#fixDocPath").textContent = "";
     $("#fixDocMeta").textContent = "";
     setFixBanner(null);
+    renderFixConflicts();
     updateFixProgress();
     updateApplyButton();
     return;
@@ -1316,6 +1329,7 @@ async function loadFixDoc() {
     renderFixDoc();
     renderFixList(true);
     updateFixHead();
+    renderFixConflicts();
     if (!resp.editable) {
       setFixBanner(resp.message || "ספר זה אינו קובץ טקסט — אפשר לייצא את התיקונים בלבד.", "err");
     } else {
@@ -1326,6 +1340,7 @@ async function loadFixDoc() {
     S.fixRows = [];
     list.replaceChildren(el("div", { class: "fixer-empty" }, "הטעינה נכשלה: " + e.message));
     setFixBanner(e.message, "err");
+    renderFixConflicts();
   }
   updateApplyButton();
 }
@@ -1634,11 +1649,62 @@ function showBlockedBanner() {
   for (const [, v] of byCode) {
     ul.append(el("li", null, v.message + " (" + fmtNum(v.n) + ")"));
   }
+  // a click is offered only on a line the server identified; promising one
+  // for the others (a line_mismatch) sends the corrector looking for nothing
+  const pickable = blocked.some(r => (r.anchor.manual_lines || []).length);
   setFixBanner(el("div", { class: "bn-text" },
     el("b", null, fmtNum(blocked.length) + " ממצאים לא יוחלו אוטומטית — "),
-    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש. " +
-    "אפשר ללחוץ על המילה הנכונה בטקסט כדי לסמן אותה ידנית.",
+    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש." +
+    (pickable ? " בשורות שהכלי זיהה אפשר ללחוץ על המילה הנכונה בטקסט " +
+                "כדי לסמן אותה ידנית." : ""),
     ul));
+}
+
+/* An earlier write to this book was cut off (a crash, a closed window) and
+ * the file changed afterwards, so the tool cannot tell whether that write
+ * landed — and it never guesses. The book is named here, with its backup,
+ * until the corrector has checked it and says so; only then is the record
+ * dismissed (/api/fixer/resolve_conflict). Kept apart from #fixerBanner, which
+ * every refusal and reload repaints. */
+function renderFixConflicts() {
+  const box = $("#fixConflicts");
+  if (!box) return;
+  const list = (S.fixDoc && S.fixDoc.journal_conflicts) || [];
+  box.replaceChildren();
+  box.hidden = !list.length;
+  if (!list.length) return;
+  box.append(el("div", null,
+    el("b", null, "⚠ כתיבה קודמת לקובץ הזה נקטעה באמצע, והקובץ השתנה מאז. "),
+    "לכן אי אפשר לדעת אם התיקונים שבה נכתבו: הסטטוס שלהם לא עודכן, ואין לה " +
+    "שחזור מגיבוי. יש לפתוח את הקובץ ולבדוק אותו מול הגיבוי שנשמר לפני " +
+    "הכתיבה, ולתקן ידנית אם צריך. אחרי הבדיקה אפשר להסיר את ההתראה."));
+  const ul = el("ul");
+  for (const c of list) {
+    const words = (c.finding_ids || [])
+      .map(id => (S.fixRows.find(r => r.id === id) || {}).word)
+      .filter(Boolean);
+    ul.append(el("li", null,
+      (c.message || "") +
+        (words.length ? " (המילים: «" + words.join("», «") + "»)" : ""),
+      el("button", { class: "btn", onclick: () => resolveFixConflict(c.jid) },
+        "✔ בדקתי — הסר התראה"),
+      el("div", { class: "fc-meta" },
+        (c.kind === "undo" ? "שחזור מגיבוי" : "החלת תיקונים") +
+          (c.ts ? " · " + String(c.ts).replace("T", " ").slice(0, 19) : ""),
+        c.backup ? [" · גיבוי: ", el("code", null, c.backup)] : null)));
+  }
+  box.append(ul);
+}
+
+async function resolveFixConflict(jid) {
+  if (!confirm("לאשר שבדקת את הקובץ?\nההתראה תוסר, והכלי לא יחזור לבדוק את הכתיבה שנקטעה.")) return;
+  try {
+    await api("/api/fixer/resolve_conflict", { method: "POST", body: { jid } });
+    toast("ההתראה הוסרה", "ok");
+    await loadFixDoc();
+  } catch (e) {
+    toast(e.message, "err", 8000);
+  }
 }
 
 /* -------------------------------------------------- worklist */
