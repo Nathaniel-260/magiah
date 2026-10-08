@@ -165,23 +165,29 @@ def _mark_trusted(con, rows, fp, size):
 
 def _resolve_book(con, outdir, key, rows):
     """``(kind, path, root)`` for a book key, resolved against the root its
-    findings were scanned from — never a guess from the current setting."""
+    findings were scanned from — never a guess from the current setting.
+
+    Every row is checked, but each scope's root is looked up once and each
+    distinct root compared once: a book of thousands of rows is resolved on
+    every page load, and comparing paths touches the disk (over a network
+    share, slowly)."""
     if not key.startswith('file:'):
         kind, path = patcher.resolve_key(key)
         return kind, path, None
     configured = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
-    roots, report = [], []
+    by_scope = {}
     for row in rows:
         scope = _row_scope(row)
-        if scope == 'report':
-            if not report:
-                report.append(_report_root(con, outdir))
-            root = report[0]
-        else:
-            rec = db.get_source_root(con, scope)
-            root = rec['root'] if rec else None
-        if root is None:
+        if scope not in by_scope:
+            if scope == 'report':
+                by_scope[scope] = _report_root(con, outdir)
+            else:
+                rec = db.get_source_root(con, scope)
+                by_scope[scope] = rec['root'] if rec else None
+        if by_scope[scope] is None:
             raise patcher.PatchError('source_unknown', id=row.get('id'))
+    roots = []
+    for root in dict.fromkeys(by_scope.values()):    # distinct, in order
         if not any(_same_root(root, r) for r in roots):
             roots.append(root)
     root = roots[0] if roots else configured

@@ -362,6 +362,41 @@ class TestImportSource(Env):
         db.import_all(self.outdir)
         self.assertIsNone(self.source()['root'])
 
+    def test_each_root_is_looked_up_and_compared_once(self):
+        """Every row of a book is resolved on each page load; comparing
+        paths touches the disk (slowly over a share), so it must not happen
+        per row: 2,000 rows took 2 s locally and 6.5 s over UNC."""
+        make_report(self.outdir, self.lib, self.rows)
+        db.import_all(self.outdir)
+        db.record_book_scan_source(self.outdir, {
+            'doc': 'ספר/פרק.txt', 'kind': 'library', 'path': self.pa})
+        rows = [{'id': i, 'unit': self.key + ':0', 'extra': None}
+                for i in range(500)]
+        rows += [{'id': 1000 + i, 'unit': self.key + ':0',
+                  'doc': 'ספר/פרק.txt', 'extra': {'book_scan': True}}
+                 for i in range(500)]
+        calls = {'same': 0, 'lookup': 0}
+        real_same, real_get = fixer_api._same_root, db.get_source_root
+
+        def same(a, b):
+            calls['same'] += 1
+            return real_same(a, b)
+
+        def lookup(con, scope):
+            calls['lookup'] += 1
+            return real_get(con, scope)
+        fixer_api._same_root, db.get_source_root = same, lookup
+        con = self.con()
+        try:
+            _kind, path, root = fixer_api._resolve_book(
+                con, self.outdir, self.key, rows)
+        finally:
+            con.close()
+            fixer_api._same_root, db.get_source_root = real_same, real_get
+        self.assertEqual(os.path.normcase(path), os.path.normcase(self.pa))
+        self.assertLessEqual(calls['same'], 3)
+        self.assertLessEqual(calls['lookup'], 2)
+
     @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
                          'needs the \\\\localhost\\C$ admin share')
     def test_unc_and_drive_spellings_name_one_root(self):
