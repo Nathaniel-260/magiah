@@ -445,7 +445,8 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
                 findings[-1]['explicit_lineno'] = int(r['explicit_lineno'])
 
     plans, failures = patcher.plan_all(fdoc, findings, default_mode,
-                                       modes, explicit)
+                                       modes, explicit,
+                                       own_edits=list(recorded.values()))
     if failures:
         # nothing is written when anything is in doubt
         return {'ok': False, 'failed': failures,

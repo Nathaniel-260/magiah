@@ -562,6 +562,53 @@ class TestGeresh(TempCase):
                          'כתב רמב"ם כאן')
 
 
+class TestKetivQere(TempCase):
+    """'(x) [word]' is the layout of the fixer's bracket mode AND of ketiv/
+    qere in the books. Only the fixer's own output is 'already applied'."""
+    LINE = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
+
+    def test_a_typo_in_the_qere_is_corrected(self):
+        d = self.doc(self.LINE)
+        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנערה'))
+        patcher.apply_edits(d, [plan])
+        self.assertEqual(d.lines[0],
+                         'ויצא (הנער) [הנערה] אל השדה ותקח את הכד')
+
+    def test_a_manual_pick_in_the_qere_is_corrected(self):
+        d = self.doc(self.LINE)
+        a, b = normalize.phrase_spans(self.LINE, 'הנערח')[0][1:]
+        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנערה'),
+                                 explicit=(a, b))
+        self.assertEqual((plan.start, plan.end, plan.confidence),
+                         (a, b, 'manual'))
+
+    def test_the_fixers_own_output_is_already_applied(self):
+        for line, word, corr in (
+                ('אמר רבי (יושבת) [יותבת] בן זומא', 'יותבת', 'יושבת'),
+                # bracket mode carries the original's geresh onto the fix
+                ('אמר (רבי׳) [רבך׳] שלום', 'רבך', 'רבי')):
+            with self.subTest(line=line):
+                d = self.doc(line)
+                for mode in patcher.MODES:
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, finding(line, word, corr),
+                                          mode=mode)
+                    self.assertEqual(cm.exception.code, 'already_applied')
+
+    def test_a_recorded_bracket_edit_is_ours_whatever_the_correction(self):
+        orig = 'אמר רבי יותבת בן זומא'
+        d = self.doc(orig)
+        plan = patcher.plan_edit(d, finding(orig, 'יותבת', 'יושבת'),
+                                 mode=patcher.MODE_BRACKET)
+        patcher.apply_edits(d, [plan])
+        # re-applied with another correction once the finding's id changed
+        # (a re-scan): only the record says these brackets are ours
+        f = finding(orig, 'יותבת', 'ישבת', fid=2)
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f, own_edits=[plan.to_dict()])
+        self.assertEqual(cm.exception.code, 'already_applied')
+
+
 class TestOutsideTheSpanIsUntouched(TempCase):
     LINES = [
         'וַיֹּ֥אמֶר אֱלֹהִ֖ים יְהִ֣י א֑וֹר',
@@ -857,6 +904,32 @@ class TestIdempotency(FixerEnv):
         self.assertEqual(code, 200, res)
         self.assertEqual(res.get('already_applied'), [1])
         self.assertEqual(raw(self.path), once)
+
+    def test_reapplying_after_the_record_is_lost_does_not_nest(self):
+        res, code = self.apply(self.key, [{'id': 1}], default_mode='bracket')
+        self.assertEqual(code, 200, res)
+        once = raw(self.path)
+        con = self.con()
+        con.execute('DELETE FROM file_edits')
+        con.commit()
+        con.close()
+        self._reapprove(1)
+        res, code = self.apply(self.key, [{'id': 1}], default_mode='bracket')
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['already_applied'])
+        self.assertEqual(raw(self.path), once)
+
+    def test_ketiv_qere_is_written_through_the_api(self):
+        line = 'ויצא (הנער) [הנערח] אל השדה'
+        write(self.path, self.TEXT + line + '\n')
+        self.add(3, 'הנערח', 'הנערה', self.key + ':3',
+                 scan_snippet(line, 'הנערח'))
+        res, code = self.apply(self.key, [{'id': 3}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res['applied'][0]['confidence'], 'exact')
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines()[3],
+                         'ויצא (הנער) [הנערה] אל השדה')
 
     def test_reapplying_in_replace_mode_reports_already_applied(self):
         res, code = self.apply(self.key, [{'id': 1}])

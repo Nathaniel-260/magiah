@@ -530,9 +530,31 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
 # quotes AFTER a word are closing quotation marks, never part of the word.
 _GERESH = "'’׳"
 
-# "(תיקון) [" right before the span and "]" after it: the span is the original
-# half of an earlier bracket-mode correction, and editing it would nest.
+# "(x) [" right before the span and "]" after it. That is the layout of the
+# fixer's own bracket-mode output — editing its original half would nest — but
+# also of ketiv/qere in the books themselves, "(הנער) [הנערה]", where the
+# bracketed word is ordinary text that may well need a correction.
 _BRACKETED_RE = re.compile(r'\([^()\[\]]*\) \[$')
+
+
+def _own_bracket(line, a, b, end, correction, own_edits):
+    """Is ``line[a:b]`` — "(x) [word]" — the fixer's own bracket output?
+
+    Yes when a recorded live edit of this book sits exactly there, or when
+    the parenthesized text is this finding's correction as bracket mode
+    writes it (geresh carried over), which is what a re-apply finds once the
+    record is gone. A ketiv/qere pair is neither, and is corrected normally.
+    """
+    text = line[a:b]
+    for e in own_edits or ():
+        if e.get('new') == text and _locate_entry(line, e) == a:
+            return True
+    paren = text[1:text.index(') [')]
+    corr = correction.strip()
+    if paren == corr:
+        return True
+    tail = line[end:end + 1]
+    return bool(tail) and tail in _GERESH and paren == corr + tail
 
 
 def manual_lines(doc, finding):
@@ -552,13 +574,15 @@ def manual_lines(doc, finding):
 
 
 def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
-              check_vocalization=True):
+              check_vocalization=True, own_edits=None):
     """Verify one finding against the file and return an :class:`EditPlan`.
 
     ``finding`` is a dict with ``id, lineno, word, correction, snippet`` and
     the server-computed ``occurrence``/``expected_count``. ``explicit`` is an
     ``(start, end)`` pair supplied only when the human pointed at the word
     themselves, which resolves an ambiguity that the automatic rules refused.
+    ``own_edits`` are this book's live recorded edits (file_edits detail
+    entries): proof of which text in the file is the fixer's own output.
     """
     fid = finding.get('id')
     lineno = finding.get('lineno')
@@ -641,7 +665,9 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
         start, end = spans[occurrence][0], spans[occurrence][1]
 
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
-    if _BRACKETED_RE.search(line[:start]) and line[close:close + 1] == ']':
+    opened = _BRACKETED_RE.search(line[:start])
+    if opened and line[close:close + 1] == ']' and _own_bracket(
+            line, opened.start(), close + 1, end, correction, own_edits):
         raise PatchError('already_applied', _msg('already_applied',
                                                  n=lineno + 1), id=fid)
 
@@ -687,7 +713,7 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
 
 
 def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
-             explicit=None):
+             explicit=None, own_edits=None):
     """Plan every edit, collecting failures instead of raising on the first.
 
     Returns ``(plans, failures)``. The caller writes ONLY when `failures` is
@@ -700,7 +726,7 @@ def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
         fid = f.get('id')
         try:
             plans.append(plan_edit(doc, f, modes.get(fid, default_mode),
-                                   explicit.get(fid)))
+                                   explicit.get(fid), own_edits=own_edits))
         except PatchError as e:
             failures.append(dict({'id': fid, 'code': e.code,
                                   'message': str(e)}, **e.extra))
@@ -1023,6 +1049,7 @@ def anchor_rows(doc, rows, applied=None):
     such instead of being re-anchored inside its own correction.
     """
     applied = applied or {}
+    own = list(applied.values())
     for r in rows:
         e = applied.get(r.get('id'))
         if e is not None and entry_in_place(doc, e):
@@ -1041,7 +1068,7 @@ def anchor_rows(doc, rows, applied=None):
                 'occurrence': r.get('occurrence'),
                 'expected_count': r.get('expected_count'),
                 'trusted': r.get('trusted', False)},
-                check_vocalization=False)
+                check_vocalization=False, own_edits=own)
             r['anchor'] = {'ok': True, 'start': plan.start, 'end': plan.end,
                            'confidence': plan.confidence,
                            'spans_markup': plan.spans_markup,
