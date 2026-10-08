@@ -989,6 +989,73 @@ class TestSpanUndo(FixerEnv):
 # review round: manual picks, open intents, lock robustness
 # ---------------------------------------------------------------------------
 
+class TestRepeatedWordInSeparateBatches(Env):
+    """The same word twice on a short line, fixed one batch at a time.
+
+    The second apply used to be refused as occurrence_count_changed forever:
+    one copy is gone, and "only one is left" does not say which finding it
+    is. When the missing copy is provably the fixer's own recorded edit on
+    that line, the scan's order still holds over it.
+    """
+    LINE = 'כעבד לפני רבו לשמיס כעבד לפני רבו לשמיס'
+
+    def setUp(self):
+        super().setUp()
+        self.path = write(os.path.join(self.lib, 'כפול.txt'),
+                          'פתיחה\n%s\nסוף\n' % self.LINE)
+        self.key = 'file:כפול.txt'
+        for fid, k in ((1, 0), (2, 1)):
+            self.add(fid, 'לשמיס', 'לשמים', self.key + ':1',
+                     scan_snippet(self.LINE, 'לשמיס', k))
+
+    def test_plan_counts_the_fixers_own_rewrite(self):
+        line = 'שלם אמר שלם'
+        d = self.doc(line + '\n')
+        f1 = finding(line, 'שלם', 'שלום', fid=1, occurrence=0,
+                     expected_count=2)
+        f2 = finding(line, 'שלם', 'שלום', fid=2, k=1, occurrence=1,
+                     expected_count=2)
+        p1 = patcher.plan_edit(d, f1)
+        patcher.apply_edits(d, [p1])
+        own = [p1.to_dict()]
+        # without the record, the vanished copy is unexplained
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f2)
+        self.assertEqual(cm.exception.code, 'occurrence_count_changed')
+        # a finding that meant the rewritten copy is already applied
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, dict(f1, id=3), own_edits=own)
+        self.assertEqual(cm.exception.code, 'already_applied')
+        p2 = patcher.plan_edit(d, f2, own_edits=own)
+        patcher.apply_edits(d, [p2])
+        self.assertEqual(d.lines[0], 'שלום אמר שלום')
+
+    def test_second_copy_applies_in_its_own_batch(self):
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        d = self.open_doc(self.key)
+        two = [i for i in d['items'] if i['id'] == 2][0]
+        self.assertTrue(two['anchor']['ok'], two['anchor'])
+        res, code = self.apply(self.key, [{'id': 2}],
+                               fingerprint=d['fingerprint'])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines(),
+                         ['פתיחה', self.LINE.replace('לשמיס', 'לשמים'),
+                          'סוף'])
+        self.assertEqual((self.status_of(1), self.status_of(2)),
+                         ('fixed', 'fixed'))
+
+    def test_a_copy_fixed_by_hand_is_still_refused(self):
+        write(self.path, 'פתיחה\n%s\nסוף\n'
+              % self.LINE.replace('לשמיס', 'לשמים', 1))
+        before = raw(self.path)
+        res, code = self.apply(self.key, [{'id': 2}])
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['occurrence_count_changed'])
+        self.assertEqual(raw(self.path), before)
+
+
 class TestManualPickNeedsIdentity(Env):
     """A refused anchor must never turn an unidentified line into a click
     target: the human may only choose among snippet-identified lines."""

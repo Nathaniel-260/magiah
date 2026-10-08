@@ -557,6 +557,30 @@ def _own_bracket(line, a, b, end, correction, own_edits):
     return bool(tail) and tail in _GERESH and paren == corr + tail
 
 
+def _own_rewrites(line, lineno, word, own_edits):
+    """Where on this line the fixer's own recorded edits replaced a copy of
+    `word` that is now gone (replace mode; bracket mode keeps the copy).
+
+    Only edits recorded for this very line count, each one proven still in
+    place by its recorded context — a copy that vanished by hand, or any
+    doubt, explains nothing.
+    """
+    want = word.split()
+    out = []
+    for e in own_edits or ():
+        if e.get('lineno') != lineno \
+                or normalize.tokenize(e.get('old') or '') != want:
+            continue
+        new = normalize.tokenize(e.get('new') or '')
+        if any(new[i:i + len(want)] == want
+               for i in range(len(new) - len(want) + 1)):
+            continue
+        pos = _locate_entry(line, e)
+        if pos is not None:
+            out.append(pos)
+    return out
+
+
 def manual_lines(doc, finding):
     """The lines on which a human may point at this finding's word: the
     located line, or the snippet-identified candidates of an ambiguous one.
@@ -644,14 +668,26 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             # Several equally-identified copies (a short line: every window is
             # the whole line). Only the scan's own order can choose, and only
             # while the line still has the count the scan saw — "only one is
-            # left" says nothing about WHICH one the finding meant.
+            # left" says nothing about WHICH one the finding meant. Unless the
+            # missing copies are provably the fixer's own earlier edits on
+            # this line: then they still hold their places in that order.
             if expected is not None and expected != total:
-                raise PatchError(
-                    'occurrence_count_changed',
-                    _msg('occurrence_count_changed', word=word,
-                         n=lineno + 1),
-                    id=fid, candidates=[[s[0], s[1]] for s in spans],
-                    located_line=lineno)
+                own = _own_rewrites(line, lineno, word, own_edits)
+                order = sorted([(s[0], i) for i, s in enumerate(spans)]
+                               + [(p, None) for p in own])
+                if not own or len(order) != expected \
+                        or not 0 <= occurrence < expected:
+                    raise PatchError(
+                        'occurrence_count_changed',
+                        _msg('occurrence_count_changed', word=word,
+                             n=lineno + 1),
+                        id=fid, candidates=[[s[0], s[1]] for s in spans],
+                        located_line=lineno)
+                occurrence = order[occurrence][1]
+                if occurrence is None:
+                    # this very copy was rewritten by the fixer already
+                    raise PatchError('already_applied', _msg(
+                        'already_applied', n=lineno + 1), id=fid)
             if total == 1:
                 occurrence = 0
             elif not (0 <= occurrence < total) or occurrence not in ident:
