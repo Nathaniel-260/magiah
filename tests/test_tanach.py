@@ -515,6 +515,80 @@ class LegacyTest(unittest.TestCase):
         con.close()
         self.assertEqual(st[0], 'not_error')
 
+    def _ui_state(self):
+        """(word -> status, decisions.db (word, unit) -> verdict, number of
+        legacy_recheck history entries, word -> finding id)."""
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        st = dict(con.execute('SELECT f.word, r.status FROM findings f '
+                              'LEFT JOIN review r ON r.finding_id = f.id'))
+        ids = dict(con.execute('SELECT word, id FROM findings'))
+        n = con.execute("SELECT COUNT(*) FROM history "
+                        "WHERE action = 'legacy_recheck'").fetchone()[0]
+        con.close()
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        d = {(w, u): v for w, u, v in dec.execute(
+            'SELECT word, unit, verdict FROM decisions')}
+        dec.close()
+        return st, d, n, ids
+
+    def test_dropped_legacy_approval_is_withdrawn_from_decisions_db(self):
+        """A dropped approval must not come back through decisions.db: not via
+        "import legacy decisions", and not in the old review tool."""
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        rep.executemany(
+            f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})', [
+                ('שמש', 'edit1_sub', 'שמס', 2.0, 0, 0, 0, 2, 'ספר', 'ר',
+                 '12', 's', 'Dicta', '3'),
+                ('ירח', 'edit1_sub', 'ירך', 2.0, 0, 0, 0, 2, 'ספר', 'ר',
+                 '13', 's', 'Dicta', '3')])
+        rep.commit()
+        rep.close()
+        # statuses set through the UI before the re-check mark existed, so
+        # decisions.db mirrors them (and the UI owns those rows)
+        con = uidb.connect(self.dir)
+        seed = ((1, 'error', 'edit1_sub', 'פרץ', '7', 2, 'פרח', 'approved'),
+                (2, 'error', 'edit1_sub', 'בייתה', '8', 0, 'ביתה',
+                 'approved'),
+                (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None,
+                 'אדום', 'approved'),
+                (4, 'error', 'edit1_sub', 'קפץ', '10', 2, 'קפה', 'not_error'),
+                (5, 'error', 'edit1_sub', 'גשמ', '11', 2, 'גשם', 'ignored'),
+                (6, 'error', 'edit1_sub', 'שמש', '12', 2, 'שמס', 'unsure'),
+                (7, 'error', 'edit1_sub', 'ירח', '13', 2, 'ירך', 'fixed'))
+        for fid, fam, et, w, unit, tan, sugg, _ in seed:
+            con.execute('INSERT INTO findings(id, family, errtype, word, '
+                        'unit, ref, tanach, suggestion, source) '
+                        'VALUES(?,?,?,?,?,?,?,?,?)',
+                        (fid, fam, et, w, unit, 'ר', tan, sugg, 'ספר'))
+        con.commit()
+        for fid, *_, status in seed:
+            uidb.set_status(con, self.dir, [fid], status)
+        con.close()
+
+        expect_st = {'פרץ': None, 'בייתה': 'approved', 'אדוס': None,
+                     'קפץ': 'not_error', 'גשמ': 'ignored', 'שמש': 'unsure',
+                     'ירח': 'fixed'}
+        expect_dec = {('בייתה', '8'): 'accept', ('קפץ', '10'): 'reject',
+                      ('גשמ', '11'): 'ignore', ('ירח', '13'): 'accept'}
+        counts = uidb.import_all(self.dir)
+        self.assertEqual(counts['legacy_approvals_dropped'], 2)
+        st, dec, n, _ = self._ui_state()
+        self.assertEqual(st, expect_st)
+        self.assertEqual(dec, expect_dec)
+        self.assertEqual(n, 2)                  # the drop stays in history
+
+        # "import legacy decisions" has nothing to bring back...
+        con = uidb.connect(self.dir)
+        uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        self.assertEqual(self._ui_state()[:3], (expect_st, expect_dec, 2))
+        # ...and a second refresh changes nothing
+        counts = uidb.import_all(self.dir)
+        self.assertEqual(counts['legacy_approvals_dropped'], 0)
+        self.assertEqual(self._ui_state()[:3], (expect_st, expect_dec, 2))
+
 
 class PartialTanachReadTest(_DBCase):
     """A Tanach index built from a partial read never feeds report.db."""

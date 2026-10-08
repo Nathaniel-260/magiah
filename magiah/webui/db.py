@@ -275,6 +275,40 @@ def _tanach_extra(evidence_json, verified):
         return {}
 
 
+def _clear_dropped_decisions(con, outdir, keys):
+    """Withdraw the decisions.db 'accept' rows of dropped legacy approvals.
+
+    The approval is gone from `review`, but its mirror in decisions.db still
+    carries the old Tanach suggestion: the old review tool would keep honouring
+    it, and /api/import_legacy would turn it back into an approval. Only rows
+    this UI owns are removed (an unowned row is the old tool's own decision),
+    and only while no other approved / fixed finding still stands on the same
+    (word, unit) key. The `history` record of the drop is kept.
+
+    Runs inside the caller's ui_review.db transaction. Returns the
+    decisions.db connection (or None); the caller commits it only after its
+    own transaction has committed, and closes it.
+    """
+    keys = {(w or '', u or '') for w, u in keys}
+    if not keys or not os.path.exists(os.path.join(outdir, DECISIONS_F)):
+        return None
+    dec = _decisions_con(outdir)
+    for word, unit in keys:
+        if not _owns_decision(con, word, unit):
+            continue
+        if con.execute('''SELECT 1 FROM review r
+                JOIN findings f ON f.id = r.finding_id
+                WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
+                  AND r.status IN ('approved', 'fixed') LIMIT 1''',
+                       (word, unit)).fetchone():
+            continue
+        if dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
+                       "AND verdict = 'accept'", (word, unit)).rowcount:
+            con.execute('DELETE FROM owned_decisions '
+                        'WHERE word = ? AND unit = ?', (word, unit))
+    return dec
+
+
 def import_all(outdir, migrate_legacy=False):
     """(Re)build the findings table from report.db + the tokdiag CSV.
 
@@ -291,6 +325,7 @@ def import_all(outdir, migrate_legacy=False):
         raise FileNotFoundError(
             hebrew.MESSAGES['report_missing'].format(outdir=outdir))
     con = connect(outdir)
+    dec = None
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
         # A report.db can exist but hold no results: a 0-byte file left by an
@@ -506,12 +541,12 @@ def import_all(outdir, migrate_legacy=False):
 
         # approvals that may rest on legacy Tanach evidence: re-check
         stale = cur.execute('''
-            SELECT r.finding_id, f.word FROM review r
+            SELECT r.finding_id, f.word, f.unit FROM review r
             JOIN assign a ON a.old_id = r.finding_id AND a.lg_changed
             JOIN findings f ON f.id = r.finding_id
             WHERE r.status = 'approved' ''').fetchall()
         ts = _now()
-        for fid, word in stale:
+        for fid, word, _unit in stale:
             cur.execute('INSERT INTO history(ts, action, finding_id, word, '
                         'old_status, new_status, note) '
                         'VALUES(?,?,?,?,?,?,?)',
@@ -524,6 +559,8 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
                        (SELECT id FROM findings)''')
         preserved = cur.execute('SELECT COUNT(*) FROM review').fetchone()[0]
+        dec = _clear_dropped_decisions(con, outdir,
+                                       [(w, u) for _, w, u in stale])
 
         counts.update({
             'total': total,
@@ -545,6 +582,8 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute('DROP TABLE keep_rows')
         cur.execute('DROP TABLE keep_docs')
         con.commit()
+        if dec is not None:
+            dec.commit()
         con.execute('DETACH DATABASE rep')
 
         if migrate_legacy:
@@ -552,6 +591,8 @@ def import_all(outdir, migrate_legacy=False):
         counts['seconds'] = round(time.time() - t0, 1)
         return counts
     finally:
+        if dec is not None:
+            dec.close()
         con.close()
 
 
