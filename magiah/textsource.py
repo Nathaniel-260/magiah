@@ -70,14 +70,16 @@ def _make_decoder(dict_bytes):
     return decode, 'zstandard'
 
 
-def ro_uri(path):
-    """SQLite ``file:`` URI that opens `path` read-only.
+def sqlite_uri(path, ro=False):
+    """SQLite ``file:`` URI for `path`; read-only (``?mode=ro``) if `ro`.
 
     Built by hand rather than with ``pathname2url``: on Python 3.14 that turns
-    ``\\\\server\\share\\...`` into ``///server/share/...`` — a local path —
-    so a database on a network share could not be opened at all. SQLite wants
-    an empty authority followed by the UNC path (``file:////server/share/``).
-    Spaces, ``#``, ``%``, ``?`` and Hebrew are percent-encoded (UTF-8).
+    ``\\\\server\\share\\...`` into ``//server/share/...``, so the URI becomes
+    ``file://server/share/...`` and SQLite rejects ``server`` as an authority
+    ("invalid uri authority") — a database on a network share could not be
+    opened at all. SQLite wants an empty authority followed by the UNC path
+    (``file:////server/share/``). Spaces, ``#``, ``%``, ``?`` and Hebrew are
+    percent-encoded (UTF-8).
     """
     p = os.path.abspath(path)
     if os.name == 'nt':
@@ -85,7 +87,13 @@ def ro_uri(path):
     p = urllib.parse.quote(p, safe='/:')
     if not p.startswith('/'):
         p = '/' + p                     # drive path: file:///C:/...
-    return 'file://' + p + '?mode=ro'   # UNC: file:////server/share/...
+    u = 'file://' + p                   # UNC: file:////server/share/...
+    return u + '?mode=ro' if ro else u
+
+
+def ro_uri(path):
+    """SQLite ``file:`` URI that opens `path` read-only."""
+    return sqlite_uri(path, ro=True)
 
 
 def connect_ro(path, timeout=30.0):

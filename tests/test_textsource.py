@@ -16,6 +16,7 @@ from magiah.corpus import make_corpus
 from magiah.corpus_hybrid import HybridCorpus, LibraryCorpus
 from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
+from magiah.webui import db as webui_db
 
 try:
     from compression import zstd as _zstd
@@ -614,6 +615,85 @@ class ReadOnlyUriTest(unittest.TestCase):
             unc = '\\\\localhost\\' + drive[0] + '$' + rest
             with OtzariaDB(unc) as odb:
                 self.assertEqual(odb.layout, 'inline')
+
+
+def make_report_db(path):
+    """The smallest report.db import_all accepts: one finding."""
+    con = sqlite3.connect(path)
+    con.executescript('''
+        CREATE TABLE occurrences_full(errtype TEXT, word TEXT,
+            suggestion TEXT, score REAL, ctx_hits INT, sugg_local INT,
+            book_repeat INT, tanach INT, origin TEXT, source TEXT, ref TEXT,
+            unit TEXT, doc TEXT, snippet TEXT);
+        CREATE TABLE space_errors_full(part1 TEXT, part2 TEXT, joined TEXT,
+            join_freq INT, source TEXT, ref TEXT, unit TEXT, snippet TEXT,
+            origin TEXT);
+        CREATE TABLE tanach_errors_full(word TEXT, canonical TEXT,
+            source TEXT, ref TEXT, unit TEXT, snippet TEXT, origin TEXT);
+        CREATE TABLE tanach_matches_full(word TEXT, source TEXT, ref TEXT,
+            unit TEXT, snippet TEXT, origin TEXT);''')
+    con.execute('INSERT INTO occurrences_full VALUES'
+                '(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                ('edit1', 'בראשת', 'בראשית', 5.0, 1, 3, 0, 0, 'otzaria',
+                 'ספר', 'ref 1', '1', 'ספר', 'בראשת ברא'))
+    con.commit()
+    con.close()
+
+
+class WebUiUriTest(unittest.TestCase):
+    """The review UI opens ui_review.db (and ATTACHes report.db) through the
+    same URI builder: an output folder on a network share must work too."""
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_local_uri(self):
+        self.assertEqual(webui_db._uri(r'C:\scan\ui_review.db'),
+                         'file:///C:/scan/ui_review.db')
+        self.assertEqual(webui_db._uri(r'C:\scan\report.db', ro=True),
+                         'file:///C:/scan/report.db?mode=ro')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_awkward_uri(self):
+        self.assertEqual(webui_db._uri(r'C:\תוצאות\a b#c%d\ui_review.db'),
+                         'file:///C:/%D7%AA%D7%95%D7%A6%D7%90%D7%95%D7%AA/'
+                         'a%20b%23c%25d/ui_review.db')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_unc_uri_keeps_server_and_share(self):
+        # pathname2url gave file://server/share/... — "invalid uri authority"
+        self.assertEqual(webui_db._uri(r'\\server\share\a b\ui_review.db'),
+                         'file:////server/share/a%20b/ui_review.db')
+        self.assertEqual(webui_db._uri(r'\\server\share\report.db', ro=True),
+                         'file:////server/share/report.db?mode=ro')
+
+    def _import_and_check(self, outdir):
+        con = webui_db.connect(outdir)
+        con.close()
+        counts = webui_db.import_all(outdir)
+        self.assertEqual(counts['error'], 1)
+        con = webui_db.connect(outdir)
+        try:
+            self.assertEqual(con.execute(
+                'SELECT word FROM findings').fetchall()[0][0], 'בראשת')
+        finally:
+            con.close()
+
+    def test_awkward_local_outdir_imports(self):
+        with tempfile.TemporaryDirectory(prefix='תוצאות # 100% ') as d:
+            make_report_db(os.path.join(d, webui_db.REPORT_DB_F))
+            self._import_and_check(d)
+
+    @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
+                         'needs the \\\\localhost\\C$ admin share')
+    def test_unc_outdir_imports(self):
+        with tempfile.TemporaryDirectory(prefix='תוצאות # ') as d:
+            drive, rest = os.path.splitdrive(os.path.abspath(d))
+            if len(drive) != 2:
+                self.skipTest('temp dir is not on a drive letter')
+            unc = '\\\\localhost\\' + drive[0] + '$' + rest
+            make_report_db(os.path.join(unc, webui_db.REPORT_DB_F))
+            self._import_and_check(unc)
+            self.assertTrue(os.path.isfile(
+                os.path.join(d, webui_db.UI_DB_F)))
 
 
 class LibraryPathFileTest(unittest.TestCase):
