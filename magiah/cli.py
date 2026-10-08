@@ -103,7 +103,8 @@ def _run_book_cmd(args, spec, cfg, out_dir):
     from .webui import db as uidb
     # recorded apart from the pipeline's runs: a book scan never touches the
     # full scan's results, so it must neither raise nor clear their warning
-    with runstate.BookRun(out_dir, source, args.book) as run:
+    with runstate.BookRun(out_dir, source, args.book,
+                          library_dir=library_dir) as run:
         try:
             result = book_scan.scan_book(
                 out_dir, source, args.book, cfg=cfg, db_path=db_path,

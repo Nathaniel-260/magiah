@@ -400,7 +400,8 @@ def start_book_scan(outdir, source, key, config_overrides=None,
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
         try:
-            run = runstate.BookRun(outdir, source, key, via='ui')
+            run = runstate.BookRun(outdir, source, key, via='ui',
+                                   library_dir=library_dir)
         except runstate.RunBusy as e:            # a CLI book scan is running
             raise ValueError(str(e))
         _log.clear()

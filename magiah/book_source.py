@@ -254,6 +254,37 @@ def canonical_rel(rel):
     return os.path.normpath(rel).replace(os.sep, '/')
 
 
+def book_identity(source, key, library_dir=None):
+    """``(source, key)`` naming the book that ``load_book(source, key)``
+    reads, resolved the way the loaders resolve it — without reading it, so
+    a scan that fails before (or because) the book cannot be read still has
+    one. A file inside the library is that library book; ``./a//b.txt`` is
+    ``a/b.txt``; a database id loses its leading zeros. Keys are folded to
+    the file system's case, which makes them identities, not display text.
+    """
+    key = str(key).strip()
+    if source == 'db':
+        return source, str(int(key)) if key.isdigit() else key
+    lib_dir = library_dir or DEFAULT_LIBRARY
+    if source == 'file':
+        path = key.strip('"')
+        if not path:
+            return source, ''
+        real = canonical_path(path)
+        if os.path.isdir(lib_dir):          # as _load_file_book decides
+            rel = _rel_within(real, lib_dir)
+            if rel is not None and rel.lower().endswith('.txt'):
+                return book_identity('library', rel, lib_dir)
+        return source, os.path.normcase(real)
+    if source == 'library':
+        rel = canonical_rel(key)
+        if rel:                             # the repo's own spelling
+            rel = _rel_within(canonical_path(
+                os.path.join(lib_dir, *rel.split('/'))), lib_dir) or rel
+        return source, os.path.normcase(rel).replace(os.sep, '/')
+    return source, key
+
+
 def load_book(source, key, db_path=None, library_dir=None):
     """Read one book. `source` is 'db' | 'library' | 'file'.
 

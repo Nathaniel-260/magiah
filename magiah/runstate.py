@@ -67,7 +67,7 @@ import time
 import uuid
 
 from . import core
-from .book_source import canonical_path, canonical_rel
+from .book_source import book_identity
 from .textsource import TextSourceError
 
 STATE_DIR = 'run_state'
@@ -485,18 +485,12 @@ def track_scan(out_dir, stages, via='cli'):
     return ScanRun(out_dir, stages, via)
 
 
-def book_id(source, key):
-    """One book's identity in book.json, however its key was spelled: the
-    same normalization the book loader applies (book_source), so a failure
-    recorded for ``./a//b.txt`` is cleared by a scan of ``a/b.txt``."""
-    key = str(key).strip()
-    if source == 'db':
-        key = str(int(key)) if key.isdigit() else key
-    elif source == 'library':
-        key = canonical_rel(key)
-    elif source == 'file' and key.strip('"'):
-        key = os.path.normcase(canonical_path(key.strip('"')))
-    return f'{source}:{key}'
+def book_id(source, key, library_dir=None):
+    """One book's identity in book.json, however it was asked for: resolved
+    as the book loader resolves it (book_source.book_identity), so a failure
+    recorded for ``./a//b.txt`` is cleared by a scan of ``a/b.txt`` — and one
+    recorded for a file inside the library by a scan of that library book."""
+    return '%s:%s' % book_identity(source, key, library_dir)
 
 
 def _file_failure(data, run):
@@ -523,9 +517,9 @@ class BookRun(_Run):
     busy = ('סריקת ספר בודד אחרת כבר רצה על תיקיית התוצאות הזו '
             '({out_dir}) — יש להמתין לסיומה ולנסות שוב.')
 
-    def __init__(self, out_dir, source, key, via='cli'):
+    def __init__(self, out_dir, source, key, via='cli', library_dir=None):
         self.source, self.key, self.via = source, str(key), via
-        self.book = book_id(source, key)
+        self.book = book_id(source, key, library_dir)
         super().__init__(out_dir)
 
     @staticmethod

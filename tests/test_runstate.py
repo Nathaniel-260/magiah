@@ -410,6 +410,25 @@ class BookRunTest(RunStateCase):
             pass                            # the same book, done
         self.assertEqual(runstate.book_problems(self.out), [])
 
+    def test_a_file_inside_the_library_is_that_library_book(self):
+        # resolved, as a configured library is: the temp folder may sit
+        # behind a symlink (/var -> /private/var on macOS), and the loader
+        # (so book_identity) compares the file's real path with it
+        lib = os.path.realpath(self.lib)
+        lib_file = os.path.join(lib, 'ספר.txt')
+        with runstate.BookRun(self.out, 'file', lib_file,
+                              library_dir=lib) as run:
+            run.fail('boom')
+        with runstate.BookRun(self.out, 'library', './ספר.txt',
+                              library_dir=lib) as run:
+            run.fail('boom again')
+        (p,) = runstate.book_problems(self.out)       # one book, not two
+        self.assertEqual(p['reason'], 'boom again')
+        with runstate.BookRun(self.out, 'file', lib_file,
+                              library_dir=lib):
+            pass
+        self.assertEqual(runstate.book_problems(self.out), [])
+
 
 if __name__ == '__main__':
     unittest.main()
