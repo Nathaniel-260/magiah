@@ -760,7 +760,17 @@ class TanachIndex:
           with a `reason` (one_against_one, no_majority, intra_source, plene,
           qere_ketiv, unrelated). Informational: nobody is outvoted.
 
-        Rows: (unit, word, canonical, snippet, evidence_json)."""
+        Rows: (unit, word, canonical, snippet, evidence_json).
+
+        Location: `unit` is the PRIMARY text's line id, which is also the
+        ``lineId`` of every version's row for that verse; `snippet` is the
+        minority edition's own text. When the minority is a version, `word`
+        is in that version (named by `minority_editions` / `readings` in the
+        evidence), not in the primary line, so an exported fix row names the
+        right line but not the edition to correct. Unresolved rows carry no
+        canonical reading (empty suggestion): they inform, nobody is
+        outvoted. Neither can be applied by the fixer, which does not edit
+        database books."""
         rows = []
         st = Counter()
 
