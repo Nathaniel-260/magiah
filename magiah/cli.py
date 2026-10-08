@@ -45,10 +45,16 @@ def _load_run_config(out_dir):
     return None
 
 
-def _save_run_config(out_dir, spec, cfg):
+def _save_run_config(out_dir, spec, cfg, prev=None):
+    new = {'corpus': spec, 'config': cfg.to_dict()}
+    # an unchanged setting is not rewritten: the file's age tells the review
+    # UI whether a scan was started after report.db (webui.db
+    # .config_root_for_report), and `magiah book` or `report` start none
+    if prev is not None and json.dumps(prev, sort_keys=True) == json.dumps(
+            new, sort_keys=True):
+        return
     with open(os.path.join(out_dir, RUN_CONFIG), 'w', encoding='utf-8') as f:
-        json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                  ensure_ascii=False, indent=2)
+        json.dump(new, f, ensure_ascii=False, indent=2)
 
 
 def _guess_book_source(key):
@@ -197,7 +203,7 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
-    _save_run_config(out_dir, spec, cfg)
+    _save_run_config(out_dir, spec, cfg, prev)
 
     try:
         if args.command == 'book':

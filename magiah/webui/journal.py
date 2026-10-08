@@ -52,11 +52,26 @@ COMPACT_BYTES = 256 * 1024
 TERMINAL = ('committed', 'aborted', 'conflict')
 
 _guard = threading.Lock()
-_locks = {}                      # normalized path -> [RLock, depth, stop]
+_locks = {}                      # _key(path) -> [RLock, depth, stop]
 
 
 def _key(path):
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    """One key per book FILE, however its path is spelled.
+
+    realpath does not map a ``\\\\server\\share`` spelling onto the drive
+    letter of the same folder (or back), and the fixer accepts both for one
+    library, so the folder is keyed by its volume and file id. The file
+    itself is not: every write replaces it, and with it its id.
+    """
+    p = os.path.realpath(os.path.abspath(path))
+    folder, name = os.path.split(p)
+    try:
+        st = os.stat(folder)
+    except (OSError, ValueError):
+        st = None
+    if st is not None and st.st_ino and st.st_dev:
+        return 'id:%x:%x:%s' % (st.st_dev, st.st_ino, os.path.normcase(name))
+    return os.path.normcase(p)
 
 
 def _busy():

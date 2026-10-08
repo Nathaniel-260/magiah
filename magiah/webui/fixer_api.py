@@ -25,8 +25,8 @@ reason a correction for one of them can never reach another.
 import json
 import os
 import sqlite3
+import stat
 import traceback
-from datetime import datetime
 
 from ..corpus_hybrid import DEFAULT_LIBRARY
 from . import db, hebrew, journal, patcher, scanner
@@ -61,6 +61,26 @@ def _norm(path):
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+def _same_root(a, b):
+    """Do two spellings name one library folder?
+
+    First by normalized real path; then by file identity, because realpath
+    leaves ``\\\\server\\share\\...`` and a drive letter for the same folder
+    apart, while both report the same volume and file id. A folder that is
+    missing, or a filesystem without file ids (id 0), compares by path only,
+    so a doubt is always a mismatch, never a match.
+    """
+    if _norm(a) == _norm(b):
+        return True
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except (OSError, ValueError):
+        return False
+    return (stat.S_ISDIR(sa.st_mode) and stat.S_ISDIR(sb.st_mode)
+            and bool(sa.st_ino) and bool(sa.st_dev)
+            and (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino))
+
+
 def _row_scope(row):
     """'report' for full-scan rows, 'doc:<doc>' for single-book-scan rows."""
     extra = row.get('extra') or {}
@@ -72,19 +92,6 @@ def _row_scope(row):
     if isinstance(extra, dict) and extra.get('book_scan'):
         return 'doc:' + (row.get('doc') or '')
     return 'report'
-
-
-def _config_newer_than_import(outdir, last_import):
-    """run_config.json rewritten after the last import means a scan was
-    started whose results are not the ones in the database."""
-    p = os.path.join(outdir, scanner.RUN_CONFIG)
-    if not last_import or not os.path.isfile(p):
-        return False
-    try:
-        written = datetime.fromtimestamp(os.path.getmtime(p))
-        return written > datetime.fromisoformat(last_import)
-    except (OSError, ValueError):
-        return False
 
 
 def _report_scan_meta(outdir):
@@ -104,30 +111,32 @@ def _report_scan_meta(outdir):
 
 
 def _report_root(con, outdir):
-    """The root of the current full import; None while it cannot be known.
+    """The library root the current full import was scanned from; None
+    while it cannot be known.
 
-    report.db names its own library root; that is used whenever report.db is
-    the one imported (scanned before the last import). Older reports fall
-    back to run_config.json, pinned the first time the fixer sees the import.
+    import_all records it in the same transaction as the rows (from
+    report.db's own scan_meta), so neither a later scan written into this
+    folder nor a single-book merge can change what it says — and nothing
+    here is inferred from timestamps.
+
+    An import made by an older version recorded nothing. Then report.db
+    naming a root of its own means it was written AFTER that import (by
+    this version), so it says nothing about the rows: unknown. Otherwise the
+    configured library stands in, pinned to that import the first time the
+    fixer sees it, so a later change of the setting cannot move it.
     """
-    counts, last_import = db.import_stamp(con)
+    src = db.get_import_source(con)
+    if src is not None:
+        return src.get('root') or None
+    stamp = db.full_import_stamp(con)
     rec = db.get_source_root(con, 'report')
-    meta = _report_scan_meta(outdir)
-    scanned = (meta or {}).get('scanned_at') or ''
-    if scanned and last_import and scanned <= last_import:
-        stamp = counts + '|' + scanned
-        if rec is not None and rec['stamp'] == stamp:
-            return rec['root']
-        root = meta.get('library_root') or None
-        if root:
-            db.record_source_root(con, 'report', root, stamp)
-        return root
-    if rec is not None and (rec['stamp'] or '').split('|')[0] == counts:
+    if rec is not None and rec['stamp'] == stamp:
         return rec['root']
-    if _config_newer_than_import(outdir, last_import):
+    if _report_scan_meta(outdir) is not None:
         return None
-    root = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
-    db.record_source_root(con, 'report', root, counts)
+    root = db.config_root_for_report(outdir)
+    if root:
+        db.record_source_root(con, 'report', root, stamp)
     return root
 
 
@@ -157,7 +166,7 @@ def _resolve_book(con, outdir, key, rows):
         kind, path = patcher.resolve_key(key)
         return kind, path, None
     configured = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
-    roots, report = {}, []
+    roots, report = [], []
     for row in rows:
         scope = _row_scope(row)
         if scope == 'report':
@@ -169,9 +178,10 @@ def _resolve_book(con, outdir, key, rows):
             root = rec['root'] if rec else None
         if root is None:
             raise patcher.PatchError('source_unknown', id=row.get('id'))
-        roots.setdefault(_norm(root), root)
-    root = next(iter(roots.values())) if roots else configured
-    if len(roots) > 1 or _norm(root) != _norm(configured):
+        if not any(_same_root(root, r) for r in roots):
+            roots.append(root)
+    root = roots[0] if roots else configured
+    if len(roots) > 1 or not _same_root(root, configured):
         raise patcher.PatchError('source_mismatch', recorded=root,
                                  configured=configured)
     kind, path = patcher.resolve_key(key, root)

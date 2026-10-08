@@ -55,6 +55,39 @@ def finding(line, word, correction, lineno=0, fid=1, k=0, **kw):
     return d
 
 
+def make_report(outdir, lib, rows, scan_meta=True):
+    """A report.db the way `magiah locate` writes it: scan_meta naming the
+    library it read (unless `scan_meta` is False: a pre-scan_meta report),
+    and one occurrences_full row per ``(word, suggestion, unit, snippet)``."""
+    from magiah import core
+    p = os.path.join(outdir, db.REPORT_DB_F)
+    if os.path.exists(p):
+        os.remove(p)
+    con = sqlite3.connect(p)
+    con.executescript('''
+        CREATE TABLE occurrences_full(errtype TEXT, word TEXT,
+            suggestion TEXT, score REAL, ctx_hits INT, sugg_local INT,
+            book_repeat INT, tanach INT, origin TEXT, source TEXT, ref TEXT,
+            unit TEXT, doc TEXT, snippet TEXT);
+        CREATE TABLE space_errors_full(part1 TEXT, part2 TEXT, joined TEXT,
+            join_freq INT, source TEXT, ref TEXT, unit TEXT, snippet TEXT,
+            origin TEXT);
+        CREATE TABLE tanach_errors_full(word TEXT, canonical TEXT,
+            source TEXT, ref TEXT, unit TEXT, snippet TEXT, origin TEXT);
+        CREATE TABLE tanach_matches_full(word TEXT, source TEXT, ref TEXT,
+            unit TEXT, snippet TEXT, origin TEXT);''')
+    if scan_meta:
+        core.write_scan_meta(con, {'type': 'library', 'path': lib})
+    con.executemany(
+        'INSERT INTO occurrences_full VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [('edit1_sub', w, s, 5.0, 1, 3, 0, 0, 'o', 't', 'r', u,
+          patcher.book_key_of(u).split(':', 1)[1], snip)
+         for w, s, u, snip in rows])
+    con.commit()
+    con.close()
+    return p
+
+
 class TempCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='magiah_anchor_')
@@ -218,6 +251,136 @@ class TestSourceIdentity(Env):
         res, code = self.apply(self.key, [{'id': 1}])
         self.assertEqual(code, 200, res)
         self.assertEqual(raw(other), before)
+
+
+class TestImportSource(Env):
+    """The root of a full import is recorded BY the import, with the rows.
+
+    It used to be inferred from report.db's scan time against last_import —
+    and a single-book merge also moves last_import, so a scan of another
+    library written into the same folder (not imported) became 'imported'.
+    """
+    LINE = 'אמר רבי יותבת בן זומא'
+
+    def setUp(self):
+        super().setUp()
+        self.libB = os.path.join(self.tmp, 'libB')
+        self.pa = write(os.path.join(self.lib, 'ספר', 'פרק.txt'),
+                        self.LINE + '\n')
+        self.pb = write(os.path.join(self.libB, 'ספר', 'פרק.txt'),
+                        self.LINE + '\n')
+        self.key = 'file:ספר/פרק.txt'
+        self.rows = [('יותבת', 'יושבת', self.key + ':0',
+                      scan_snippet(self.LINE, 'יותבת'))]
+
+    def import_and_approve(self):
+        db.import_all(self.outdir)
+        con = self.con()
+        try:
+            fid = con.execute('SELECT id FROM findings').fetchone()[0]
+            con.execute("INSERT OR REPLACE INTO review "
+                        "VALUES(?,'approved',NULL,NULL,'t')", (fid,))
+            con.commit()
+        finally:
+            con.close()
+        return fid
+
+    def source(self):
+        con = self.con()
+        try:
+            return db.get_import_source(con)
+        finally:
+            con.close()
+
+    def test_import_records_root_and_scan_time(self):
+        rep = make_report(self.outdir, self.lib, self.rows)
+        db.import_all(self.outdir)
+        con = sqlite3.connect(rep)
+        meta = dict(con.execute('SELECT key, value FROM scan_meta'))
+        con.close()
+        self.assertEqual(self.source(), {
+            'root': os.path.abspath(self.lib),
+            'scanned_at': meta['scanned_at'], 'basis': 'scan_meta'})
+
+    def test_book_merge_after_an_unimported_scan_keeps_the_import_root(self):
+        """QA's reproduction: scan A + refresh; a full scan of a copy B into
+        the same folder, NOT imported; then any single-book merge. The rows
+        are still A's, so writing them into B must be refused."""
+        make_report(self.outdir, self.lib, self.rows)
+        fid = self.import_and_approve()
+        self.assertTrue(self.open_doc(self.key)['editable'])
+        # a full scan of B into the same folder: report.db and run_config.json
+        # are B's now, the database still holds A's rows
+        make_report(self.outdir, self.libB, self.rows)
+        self.set_config(self.libB)
+        other = write(os.path.join(self.libB, 'ספר', 'אחר.txt'), 'שורה\n')
+        db.merge_book_scan(self.outdir, {
+            'doc': 'ספר/אחר.txt', 'title': 'אחר', 'kind': 'library',
+            'path': other, 'findings': [], 'space_errors': []})
+        self.assertEqual(self.source()['root'], os.path.abspath(self.lib))
+        before = (raw(self.pa), raw(self.pb))
+        with self.assertRaises(patcher.PatchError) as cm:
+            self.open_doc(self.key)
+        self.assertEqual(cm.exception.code, 'source_mismatch')
+        res, code = self.apply(self.key, [{'id': fid}],
+                               fingerprint=patcher.fingerprint(self.pb))
+        self.assertEqual(code, 409, res)
+        self.assertEqual(res['code'], 'source_mismatch')
+        self.assertEqual(res['recorded'], os.path.abspath(self.lib))
+        self.assertEqual((raw(self.pa), raw(self.pb)), before)
+        # importing B's report makes B the source, and the fix lands there
+        db.import_all(self.outdir)
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(raw(self.pa), before[0])
+        self.assertIn('יושבת', raw(self.pb).decode('utf-8'))
+
+    def test_older_import_and_a_newer_report_is_unknown(self):
+        """No recorded source (imported by an older version) while report.db
+        names a root: report.db was written after that import."""
+        make_report(self.outdir, self.lib, self.rows)
+        self.add(1, 'יותבת', 'יושבת', self.key + ':0', self.rows[0][3])
+        before = raw(self.pa)
+        res, code = self.apply(self.key, [{'id': 1}],
+                               fingerprint=patcher.fingerprint(self.pa))
+        self.assertEqual(code, 409, res)
+        self.assertEqual(res['code'], 'source_unknown')
+        self.assertEqual(raw(self.pa), before)
+
+    def test_report_without_scan_meta_uses_the_configured_root(self):
+        rep = make_report(self.outdir, self.lib, self.rows, scan_meta=False)
+        old = time.time() - 3600
+        os.utime(os.path.join(self.outdir, 'run_config.json'), (old, old))
+        fid = self.import_and_approve()
+        self.assertEqual(self.source()['root'], os.path.abspath(self.lib))
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        # a scan started after report.db rewrote run_config.json: the setting
+        # may describe that scan, so it is not taken as this report's root
+        os.utime(rep, (old, old))
+        self.set_config(self.lib)
+        db.import_all(self.outdir)
+        self.assertIsNone(self.source()['root'])
+
+    @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
+                         'needs the \\\\localhost\\C$ admin share')
+    def test_unc_and_drive_spellings_name_one_root(self):
+        from magiah.webui import journal
+        drive, rest = os.path.splitdrive(os.path.abspath(self.lib))
+        if len(drive) != 2:
+            self.skipTest('temp dir is not on a drive letter')
+        unc = '\\\\localhost\\' + drive[0] + '$' + rest
+        self.assertTrue(fixer_api._same_root(unc, self.lib))
+        self.assertFalse(fixer_api._same_root(unc, self.libB))
+        unc_book = os.path.join(unc, 'ספר', 'פרק.txt')
+        self.assertEqual(journal._key(unc_book), journal._key(self.pa))
+        self.assertNotEqual(journal._key(unc_book), journal._key(self.pb))
+        make_report(self.outdir, unc, self.rows)     # scanned over the share
+        fid = self.import_and_approve()               # configured: drive path
+        res, code = self.apply(self.key, [{'id': fid}])
+        self.assertEqual(code, 200, res)
+        self.assertIn('יושבת', raw(self.pa).decode('utf-8'))
+        self.assertNotIn('יושבת', raw(self.pb).decode('utf-8'))
 
 
 # ---------------------------------------------------------------------------
@@ -1045,23 +1208,22 @@ class TestRecordedEvidence(Env):
         self.assertEqual(two['anchor'].get('code'), 'ambiguous_line')
 
     def test_report_root_comes_from_report_db(self):
-        from magiah import core
         libB = os.path.join(self.tmp, 'libB')
         os.makedirs(libB)
-        write(os.path.join(self.lib, 'ספר.txt'), 'אמר רבי יותבת בן זומא\n')
-        rep = sqlite3.connect(os.path.join(self.outdir, 'report.db'))
-        core.write_scan_meta(rep, {'type': 'library', 'path': self.lib})
-        rep.commit()
-        rep.close()
+        line = 'אמר רבי יותבת בן זומא'
+        write(os.path.join(self.lib, 'ספר.txt'), line + '\n')
+        make_report(self.outdir, self.lib, [
+            ('יותבת', 'יושבת', 'file:ספר.txt:0',
+             scan_snippet(line, 'יותבת'))])
+        db.import_all(self.outdir)
         con = self.con()
-        con.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
-                    ('2999-01-01T00:00:00',))
+        fid = con.execute('SELECT id FROM findings').fetchone()[0]
+        con.execute("INSERT INTO review VALUES(?,'approved',NULL,NULL,'t')",
+                    (fid,))
         con.commit()
         con.close()
-        self.add(1, 'יותבת', 'יושבת', 'file:ספר.txt:0',
-                 'אמר רבי יותבת בן זומא')
         self.set_config(libB)             # run_config says B, the scan said A
-        res, code = self.apply('file:ספר.txt', [{'id': 1}],
+        res, code = self.apply('file:ספר.txt', [{'id': fid}],
                                fingerprint='sha256:x')
         self.assertEqual(code, 409, res)
         self.assertEqual(res['code'], 'source_mismatch')

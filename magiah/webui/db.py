@@ -63,6 +63,7 @@ import time
 from datetime import datetime
 
 from . import hebrew
+from ..corpus_hybrid import DEFAULT_LIBRARY
 # one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
 from ..textsource import sqlite_uri as _uri
 
@@ -71,6 +72,8 @@ REPORT_DB_F = 'report.db'
 DECISIONS_F = 'decisions.db'
 TOKDIAG_GLOB = '*tokdiag_source_he.csv'
 BACKUP_DIR = 'backups'
+# meta key: the library root (and scan time) of the report import_all imported
+IMPORT_SOURCE_KEY = 'import_source'
 
 # --- copied VERBATIM from magiah/core.py (keep in sync) --------------------
 RANK_SQL = '''score
@@ -340,6 +343,43 @@ def _clear_dropped_decisions(con, outdir, keys):
     return len(gone)
 
 
+def config_root_for_report(outdir):
+    """The configured library (run_config.json), standing in as the root of
+    a report.db that does not name its own (one written before scan_meta).
+
+    None when run_config.json was rewritten after report.db: a later scan
+    has been started since, so the setting may describe that scan instead.
+    """
+    from . import scanner
+    rc = os.path.join(outdir, scanner.RUN_CONFIG)
+    rep = os.path.join(outdir, REPORT_DB_F)
+    try:
+        if os.path.isfile(rc) and os.path.isfile(rep) \
+                and os.path.getmtime(rc) > os.path.getmtime(rep):
+            return None
+    except OSError:
+        return None
+    try:
+        lib = scanner.scan_config(outdir)['corpus'].get('library_dir')
+    except Exception:                       # config unreadable -> the default
+        lib = None
+    return os.path.abspath(lib or DEFAULT_LIBRARY)
+
+
+def _report_source(cur, outdir):
+    """The identity of the report.db attached as ``rep``: the library root
+    its scan read and when it was written, from its own scan_meta table."""
+    if cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                   "AND name='scan_meta'").fetchone():
+        meta = dict(cur.execute('SELECT key, value FROM rep.scan_meta'))
+        return {'root': meta.get('library_root') or None,
+                'scanned_at': meta.get('scanned_at') or None,
+                'basis': 'scan_meta'}
+    root = config_root_for_report(outdir)
+    return {'root': root, 'scanned_at': None,
+            'basis': 'run_config' if root else 'unknown'}
+
+
 def import_all(outdir, migrate_legacy=False):
     """(Re)build the findings table from report.db + the tokdiag CSV.
 
@@ -606,6 +646,13 @@ def import_all(outdir, migrate_legacy=False):
                     (_now(),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
+        # which library these rows were scanned from, committed with the rows
+        # themselves: the fixer reads it from here and never infers it from
+        # timestamps (a book-scan merge also moves last_import)
+        cur.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (IMPORT_SOURCE_KEY,
+                     json.dumps(_report_source(cur, outdir),
+                                ensure_ascii=False)))
         cur.execute('DROP TABLE imp')
         cur.execute('DROP TABLE imp2')
         cur.execute('DROP TABLE oldmap')
@@ -1572,13 +1619,27 @@ def advance_scan_file_sha(con, scope, old, new):
     con.commit()
 
 
-def import_stamp(con):
-    """``(stamp, last_import)``. The stamp changes with every full import
-    (import_all writes import_counts; a book-scan merge does not), so a pinned
-    report root can tell it is stale."""
-    vals = dict(con.execute("SELECT key, value FROM meta WHERE key IN "
-                            "('import_counts', 'last_import')").fetchall())
-    return vals.get('import_counts') or '', vals.get('last_import') or ''
+def get_import_source(con):
+    """What import_all recorded about the report it imported —
+    ``{'root', 'scanned_at', 'basis'}`` — or None for an import made by an
+    older version, which recorded nothing. A book-scan merge never changes
+    it: those rows carry their own source (``fixer_sources``)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (IMPORT_SOURCE_KEY,)).fetchone()
+    try:
+        src = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    return src if isinstance(src, dict) else None
+
+
+def full_import_stamp(con):
+    """A value that changes with every full import (import_all writes
+    import_counts; a book-scan merge does not), so a root pinned to an old
+    import can tell it is stale. NOT last_import: book-scan merges move it."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'import_counts'"
+                      ).fetchone()
+    return (row[0] if row else None) or ''
 
 
 def record_book_scan_source(outdir, result):
