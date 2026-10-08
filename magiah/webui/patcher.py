@@ -553,30 +553,49 @@ _GERESH = "'’׳"
 _BRACKETED_RE = re.compile(r'\([^()\[\]]*\) \[$')
 
 
-def _bracket_origin(line, lineno, a, b, snippet, own_edits):
-    """Where ``line[a:b]`` — "(x) [word]" — came from.
+def _bare(text):
+    """Text compared without marks, spacing or a trailing geresh."""
+    return normalize.clean(text or '').strip().rstrip("'\"")
 
-    The text cannot tell the fixer's output from a ketiv/qere pair (a
-    ketiv may even equal the correction), so its history decides:
 
-    * ``'record'``: a live recorded edit of THIS line sits exactly there —
-      the fixer's own output;
-    * ``'scanned'``: the scan's snippet already shows the layout around the
-      word — the book's own text when it was scanned (ketiv/qere), which is
-      corrected like any other word;
-    * None: the brackets came after the scan and nothing records them — the
-      fixer's output whose record is gone, or a hand edit. A correction there
-      would nest the brackets or overwrite the original half.
+def _bracket_origin(line, a, b, snippet, corrections, own_edits):
+    """Where ``line[a:b]`` — "(x) [word]" — came from: ``'record'`` or
+    ``'own'`` (the fixer's output), ``'later'`` (unexplained brackets that
+    came after the scan), or ``'scanned'`` (the book's own ketiv/qere).
+
+    The text alone cannot tell the fixer's output from a ketiv/qere pair,
+    and the two mistakes are not alike: taking a real pair for the fixer's
+    output only refuses a correction, while taking the fixer's output for a
+    pair nests brackets into it or overwrites the original half — data lost.
+    So every doubt counts as the fixer's, in this order:
+
+    1. a live record of the fixer sitting exactly there, matched by its text
+       and context on whatever line it is now (lines move; matching a twin
+       line by mistake only refuses) — ``'record'``;
+    2. the parenthesized text is what this finding writes, or the detector's
+       suggestion for it — ``'own'``. Bracket output keeps the original typo
+       inside "[...]", so every later scan flags it again, and a scan in a new
+       folder has no record of it. A ketiv equal to the correction is refused
+       here too: a refusal is the price of never nesting into the fixer's
+       brackets;
+    3. the layout is missing from the scan's snippet: brackets that came
+       after the scan with nothing to explain them — ``'later'``;
+    4. otherwise the book had this pair when it was scanned and nothing ties
+       it to the fixer: ketiv/qere, corrected like any word — ``'scanned'``.
+       (Left open: a pair the fixer wrote with a custom correction, re-scanned
+       in a new folder, then re-applied with yet another correction.)
     """
     text = line[a:b]
     for e in own_edits or ():
-        if e.get('lineno') == lineno and e.get('new') == text \
-                and _locate_entry(line, e) == a:
+        if e.get('new') == text and _locate_entry(line, e) == a:
             return 'record'
+    paren = _bare(text[1:text.index(') [')])
+    if paren and any(paren == _bare(c) for c in corrections if c):
+        return 'own'
     layout = normalize.clean(text).strip()
-    if snippet and layout and layout in snippet:
-        return 'scanned'
-    return None
+    if not (snippet and layout and layout in snippet):
+        return 'later'
+    return 'scanned'
 
 
 def _as_scanned(line, lineno, own_edits):
@@ -759,12 +778,13 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
     opened = _BRACKETED_RE.search(line[:start])
     if opened and line[close:close + 1] == ']':
-        origin = _bracket_origin(line, lineno, opened.start(), close + 1,
-                                 finding.get('snippet'), own_edits)
-        if origin == 'record':
+        origin = _bracket_origin(
+            line, opened.start(), close + 1, finding.get('snippet'),
+            (correction, finding.get('suggestion')), own_edits)
+        if origin in ('record', 'own'):
             raise PatchError('already_applied', _msg('already_applied',
                                                      n=lineno + 1), id=fid)
-        if origin is None:
+        if origin == 'later':
             raise PatchError('already_bracketed', _msg(
                 'already_bracketed', word=word, n=lineno + 1), id=fid)
 
@@ -1141,6 +1161,7 @@ def anchor_rows(doc, rows, applied=None):
                 'id': r.get('id'), 'lineno': r.get('lineno'),
                 'word': r.get('word'),
                 'correction': r.get('correction') or r.get('word'),
+                'suggestion': r.get('suggestion'),
                 'snippet': r.get('snippet'),
                 'occurrence': r.get('occurrence'),
                 'expected_count': r.get('expected_count'),
