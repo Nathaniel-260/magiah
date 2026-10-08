@@ -786,6 +786,9 @@ RESULT_STATUS = {
                   'לא הושפעו ממנה.',
     'book_todo': 'לבדוק את הסיבה (בפרטים) ולסרוק את הספר שוב. ההודעה '
                  'תיעלם כשסריקה של הספר הזה תסתיים בהצלחה.',
+    # appended when a full scan reads the book(s) too (runstate: superseded)
+    'book_todo_full': ' גם סריקה מלאה שתסתיים בהצלחה תסיר מההודעה את '
+                      'ספרי המאגר, כי היא קוראת אותם מחדש.',
     # a book from the database whose scan failed before its title was known
     'book_db_key': 'ספר {key} במסד הנתונים',
     # more than one book: one notice, the books named compactly

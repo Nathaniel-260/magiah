@@ -177,6 +177,14 @@ def _book_label(con, p, short=False):
     return '⁨' + name + '⁩'
 
 
+def _todo(base, problems):
+    """What to do, plus — when a full scan reads one of the books — that a
+    successful full scan clears the notice too."""
+    corpus = any(str(p.get('book')).startswith(runstate._CORPUS_BOOKS)
+                 for p in problems)
+    return T[base] + (T['book_todo_full'] if corpus else '')
+
+
 def book_notice(con, outdir, ctx):
     """Books whose latest single-book scan failed or was cut off — one
     notice for all of them, each book listed once. Such a scan changed
@@ -190,7 +198,8 @@ def book_notice(con, outdir, ctx):
         what = T['book_what'][p['state']].format(
             book=_book_label(con, p), started=_minute(p['started_at']))
         return _notice('book_scan_incomplete', 'warning', T['book_title'],
-                       what + ' ' + T['book_after'], T['book_todo'],
+                       what + ' ' + T['book_after'],
+                       _todo('book_todo', problems),
                        p['reason'], 'book_scan')
     shown = problems[:BOOKS_NAMED]
     books = ', '.join(f'«{_book_label(con, p, short=True)}»' for p in shown)
@@ -204,7 +213,8 @@ def book_notice(con, outdir, ctx):
     return _notice('book_scan_incomplete', 'warning',
                    T['books_title'].format(n=len(problems)),
                    T['books_what'].format(books=books) + ' '
-                   + T['books_after'], T['books_todo'], details, 'book_scan')
+                   + T['books_after'], _todo('books_todo', problems), details,
+                   'book_scan')
 
 
 PROVIDERS = (stale_notice, refresh_notice, book_notice)

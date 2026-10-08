@@ -21,7 +21,7 @@ from http.server import ThreadingHTTPServer
 from unittest import mock
 
 from magiah import core, runstate
-from magiah.webui import db, scanner, server
+from magiah.webui import db, hebrew, scanner, server
 
 from test_runstate import (REPO, TUNE, RunStateCase, break_library,
                            mend_library)
@@ -180,6 +180,8 @@ class MetaTest(ResultStatusCase):
         (n,) = meta_status(self.out)['result_status']['notices']
         self.assertIn('ספר בדיקה', n['text'])          # known from findings
         self.assertIn('ספר 8 במסד הנתונים', n['text'])  # nothing to go by
+        # a full scan reads database books again: it would clear them too
+        self.assertIn(hebrew.RESULT_STATUS['book_todo_full'], n['hint'])
 
     def test_failed_book_scan_is_its_own_warning(self):
         self.import_good_scan()
@@ -192,6 +194,8 @@ class MetaTest(ResultStatusCase):
                          ('book_scan_incomplete', 'warning'))
         self.assertIn('אין כזה.txt', n['text'])
         self.assertTrue(n['details'])
+        # a file outside the library is no part of a full scan
+        self.assertNotIn(hebrew.RESULT_STATUS['book_todo_full'], n['hint'])
 
     def test_failed_book_scans_are_listed_per_book(self):
         self.import_good_scan()

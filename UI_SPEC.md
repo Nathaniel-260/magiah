@@ -363,10 +363,16 @@ that was gone after ten seconds or a server restart.
   record: they do not write the pipeline's outputs, and their merge is one
   transaction, so a failed one leaves every finding as it was. It can neither
   raise nor clear the full scan's warning; it gets its own, lower-level
-  notice. The record is per book (`failed: {book: run}`, the book keyed by
-  source and its normalized key, `runstate.book_id`): a successful scan of a
-  book clears that book only, a cancelled one changes nothing, and at most
-  `runstate.MAX_BOOK_FAILURES` (20) books are kept, oldest dropped first.
+  notice. The record is per book (`failed: {book: run}`, the book keyed as
+  the loader resolves it, `runstate.book_id` — a file inside the library is
+  that library book): a successful scan of a book clears that book only, a
+  cancelled one changes nothing, and at most `runstate.MAX_BOOK_FAILURES`
+  (20) books are kept, oldest dropped first. A full scan (all of lexicon →
+  detect → locate in one run) that ends `done` reads every corpus book
+  again, so it supersedes the failures of database and library books that
+  ended before it began (`scan.json` `books_superseded`, which
+  `book_problems` leaves out); a file outside the library is not part of it
+  and stays listed.
   One notice covers them all — a single book is named with its reason;
   several are counted in the title, the newest three named in the text and
   every one, with its reason, in the details.

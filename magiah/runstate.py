@@ -43,7 +43,9 @@ own record and can neither raise nor clear the warning about the full scan.
 That record is kept per book: a failed scan of one book says nothing about
 another, so ``book.json`` lists every book whose latest scan failed or was
 interrupted, and a successful scan of a book takes only that book off the
-list (:func:`book_problems`).
+list (:func:`book_problems`). A full scan that succeeds reads every book of
+the corpus again, so it supersedes the failures of those books that ended
+before it began (not of a file outside the library, which it never reads).
 
 Concurrency
 -----------
@@ -281,6 +283,7 @@ class _Run:
     busy = None
 
     def __init__(self, out_dir):
+        self.out_dir = out_dir
         self._slot = _Slot(out_dir, self.kind)
         self.id = time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8]
         self.stage = None
@@ -368,6 +371,8 @@ class ScanRun(_Run):
     def __init__(self, out_dir, stages, via='cli'):
         self.stages = list(stages)
         self.via = via
+        # it rebuilds the results from the whole corpus
+        self.full = set(RESULT_CHAIN) <= set(self.stages)
         super().__init__(out_dir)
 
     @staticmethod
@@ -393,6 +398,12 @@ class ScanRun(_Run):
             'id': self.id, 'via': self.via, 'stages': self.stages,
             'state': 'running', 'stage': None, 'started_at': _now(),
             'finished_at': None, 'reason': None}
+        if self.full:
+            # the failed book scans it will supersede if it succeeds: those
+            # that ended before it began, of books it reads
+            data['runs'][self.id]['supersedes'] = [
+                r.get('id') for r in _book_failures(self.out_dir)
+                if str(r.get('book')).startswith(_CORPUS_BOOKS)]
         for st in self.stages:
             if st in RESULT_CHAIN:
                 data['stages'][st] = self.id
@@ -422,6 +433,19 @@ class ScanRun(_Run):
         if state != 'done' and self.stage:
             fields.setdefault('stage', self.stage)
         super()._finish(state, **fields)
+
+    def _ended(self, data, run):
+        if not (self.full and run['state'] == 'done'):
+            return
+        # book.json is the book scans' to write; the superseded ones are
+        # listed here and left out by book_problems. Ids no longer listed
+        # there are dropped, so the list stays as short as book.json's.
+        listed = {r.get('id') for r in _book_failures(self.out_dir)}
+        old = data.get('books_superseded')
+        old = old if isinstance(old, list) else []
+        data['books_superseded'] = sorted(
+            i for i in listed & set(old + (run.get('supersedes') or []))
+            if isinstance(i, str))
 
 
 class _ChildRun:
@@ -491,6 +515,11 @@ def book_id(source, key, library_dir=None):
     recorded for ``./a//b.txt`` is cleared by a scan of ``a/b.txt`` — and one
     recorded for a file inside the library by a scan of that library book."""
     return '%s:%s' % book_identity(source, key, library_dir)
+
+
+# books a full scan reads, and so supersedes a failed scan of (a file outside
+# the library is no part of it: the import even keeps its rows apart)
+_CORPUS_BOOKS = ('db:', 'library:')
 
 
 def _file_failure(data, run):
@@ -615,27 +644,36 @@ def scan_problem(out_dir):
     return None
 
 
-def book_problems(out_dir):
-    """The books whose latest single-book scan failed or was interrupted,
-    newest first — ``[]`` if none. A scan the user cancelled changed nothing
-    and is not reported; a book scanned successfully since is not either.
-
-    Each is ``{'state', 'source', 'key', 'title', 'started_at',
-    'finished_at', 'reason', 'id'}``.
-    """
+def _book_failures(out_dir):
+    """The book scans book.json holds as failed or interrupted (one per
+    book, oldest first), superseded or not."""
     data = _Slot(out_dir, 'book').settled()
     if not isinstance(data, dict):
         return []
     failed = data.get('failed')
-    runs = [r for r in failed.values() if isinstance(r, dict)] \
-        if isinstance(failed, dict) else []
+    runs = [r for r in failed.values() if isinstance(r, dict)]         if isinstance(failed, dict) else []
     run = data.get('run')
     if isinstance(run, dict) and run.get('state') == 'interrupted':
         # found dead by this read: it replaces its book's older entry
         runs = [r for r in runs if r.get('book') != run.get('book')] + [run]
     # `failed` is in the order the scans ended, newest last
-    return [{k: r.get(k) for k in ('state', 'source', 'key', 'title',
+    return [r for r in runs if r.get('state') in ('failed', 'interrupted')]
+
+
+def book_problems(out_dir):
+    """The books whose latest single-book scan failed or was interrupted,
+    newest first — ``[]`` if none. A scan the user cancelled changed nothing
+    and is not reported; a book scanned successfully since is not either,
+    nor one a full scan has read since (ScanRun: ``books_superseded``).
+
+    Each is ``{'state', 'source', 'key', 'book', 'title', 'started_at',
+    'finished_at', 'reason', 'id'}``.
+    """
+    scan = _Slot(out_dir, 'scan').load()
+    gone = scan.get('books_superseded') if isinstance(scan, dict) else None
+    gone = {i for i in gone if isinstance(i, str)}         if isinstance(gone, list) else set()
+    return [{k: r.get(k) for k in ('state', 'source', 'key', 'book', 'title',
                                    'started_at', 'finished_at', 'reason',
                                    'id')}
-            for r in reversed(runs)
-            if r.get('state') in ('failed', 'interrupted')]
+            for r in reversed(_book_failures(out_dir))
+            if not (isinstance(r.get('id'), str) and r['id'] in gone)]

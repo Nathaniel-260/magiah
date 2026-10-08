@@ -429,6 +429,40 @@ class BookRunTest(RunStateCase):
             pass
         self.assertEqual(runstate.book_problems(self.out), [])
 
+    def test_a_successful_full_scan_supersedes_earlier_book_failures(self):
+        self.start_from_good_scan()
+        outside = os.path.join(self.tmp.name, 'elsewhere.txt')
+        for source, key in (('db', '5'), ('file', outside)):
+            with runstate.BookRun(self.out, source, key,
+                                  library_dir=self.lib) as run:
+                run.fail('boom')
+        with runstate.ScanRun(self.out, list(core._READ_STAGES)) as full:
+            # a book scan that fails while the full scan runs is not
+            # superseded: it may have read the book after the full scan did
+            with runstate.BookRun(self.out, 'db', '6') as run:
+                run.fail('boom')
+            for st in core._READ_STAGES:
+                full.enter(st)
+        # a file outside the library is no part of a full scan
+        self.assertEqual(sorted(str(p['key']) for p in
+                                runstate.book_problems(self.out)),
+                         sorted(['6', outside]))
+        # it stays superseded through later runs — partial or full
+        rc, err = self.scan('lexicon')
+        self.assertFalse(rc, err)
+        self.assertEqual(len(runstate.book_problems(self.out)), 2)
+        self.good_scan()
+        self.assertEqual(len(runstate.book_problems(self.out)), 1)
+        # a failed or partial full scan supersedes nothing
+        with runstate.BookRun(self.out, 'db', '7') as run:
+            run.fail('boom')
+        with mock.patch.object(core, 'locate',
+                               side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self.scan()
+        self.assertIn('7', [p['key'] for p in
+                            runstate.book_problems(self.out)])
+
 
 if __name__ == '__main__':
     unittest.main()
