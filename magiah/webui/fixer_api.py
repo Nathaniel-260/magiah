@@ -144,19 +144,23 @@ def _book_scan_scopes(rows):
     return {_row_scope(r) for r in rows} - {'report'}
 
 
-def _mark_trusted(con, rows, fp):
-    """Flag rows whose book file is byte-identical to the one scanned: their
-    recorded line number is then evidence in its own right."""
-    sha = {}
+def _mark_trusted(con, rows, fp, size):
+    """Flag rows whose book file is byte-identical to the bytes their scan
+    read (fingerprint AND size, both recorded at read time): their recorded
+    line number is then evidence in its own right — together with an exact
+    snippet window there (patcher._locate_line)."""
+    seen = {}
     for r in rows:
         scope = _row_scope(r)
         if scope == 'report':
             r['trusted'] = False
             continue
-        if scope not in sha:
-            rec = db.get_source_root(con, scope)
-            sha[scope] = rec and rec.get('file_sha')
-        r['trusted'] = bool(sha[scope]) and sha[scope] == fp
+        if scope not in seen:
+            rec = db.get_source_root(con, scope) or {}
+            seen[scope] = (rec.get('file_sha'), rec.get('file_size'))
+        sha, rsize = seen[scope]
+        r['trusted'] = (bool(sha) and rsize is not None and sha == fp
+                        and int(rsize) == size)
 
 
 def _resolve_book(con, outdir, key, rows):
@@ -243,7 +247,7 @@ def doc(con, outdir, q):
     # never wait on a busy file just to draw a page; a writer settles it
     journal.recover(con, outdir, path, wait=False)
     fdoc = patcher.read_doc(path)
-    _mark_trusted(con, items, fdoc.fingerprint)
+    _mark_trusted(con, items, fdoc.fingerprint, fdoc.size)
     patcher.anchor_rows(fdoc, items, db.get_live_edit_entries(con, key))
 
     # lines the client needs: the ones carrying findings, plus context. Whole
@@ -329,10 +333,12 @@ def _settle_or_refuse(con, outdir, path):
         raise patcher.PatchError('journal_pending')
 
 
-def _advance_trust(con, rows, fp_before, fp_after):
+def _advance_trust(con, rows, fp_before, data_after):
+    fp_after = patcher.fingerprint_bytes(data_after)
     for scope in _book_scan_scopes(rows):
         try:
-            db.advance_scan_file_sha(con, scope, fp_before, fp_after)
+            db.advance_scan_file_sha(con, scope, fp_before, fp_after,
+                                     len(data_after))
         except Exception:
             traceback.print_exc()
 
@@ -408,7 +414,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
     # (e.g. the status update was lost): re-anchoring it would find the word
     # inside its own correction and apply it twice.
     recorded = db.get_live_edit_entries(con, key)
-    _mark_trusted(con, list(rows.values()), fdoc.fingerprint)
+    _mark_trusted(con, list(rows.values()), fdoc.fingerprint, len(data))
     already = sorted(fid for fid in by_id if fid in recorded
                      and patcher.entry_in_place(fdoc, recorded[fid]))
 
@@ -475,7 +481,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
             out['db_warning'] = hebrew.FIXER_MESSAGES['db_warning']
         else:
             journal.finish(outdir, jid, 'committed', edit_id=out['edit_id'])
-        _advance_trust(con, rows.values(), fdoc.fingerprint, fp_after)
+        _advance_trust(con, rows.values(), fdoc.fingerprint, new_data)
         out.update(applied=[p.to_dict() for p in plans],
                    changed_lines=[{'n': n, 'text': fdoc.lines[n]}
                                   for n in changed],
@@ -546,8 +552,7 @@ def undo_file(con, outdir, body):
         journal.finish(outdir, jid, 'committed', edit_id=rec['id'])
         rows = [db.get_finding(con, fid) for fid in rec['finding_ids']]
         _advance_trust(con, [r for r in rows if r],
-                       patcher.fingerprint_bytes(data),
-                       patcher.fingerprint_bytes(restored))
+                       patcher.fingerprint_bytes(data), restored)
     out = {'ok': True, 'restored': 0,
            'fingerprint': patcher.fingerprint_bytes(restored),
            'message': hebrew.FIXER_MESSAGES['restored']}

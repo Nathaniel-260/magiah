@@ -1190,8 +1190,11 @@ class TestRecordedEvidence(Env):
             self.add(fid, 'יותבת', 'יושבת', '%s:%d' % (key, n),
                      scan_snippet(line, 'יותבת'), doc='מקור/ד.txt',
                      extra=json.dumps({'book_scan': True}))
+        data = raw(path)
         db.record_book_scan_source(self.outdir, {
-            'doc': 'מקור/ד.txt', 'kind': 'library', 'path': path})
+            'doc': 'מקור/ד.txt', 'kind': 'library', 'path': path,
+            'file_sha': patcher.fingerprint_bytes(data),
+            'file_size': len(data)})
         d = self.open_doc(key)
         self.assertEqual([i['anchor'].get('ok') for i in d['items']],
                          [True, True])
@@ -1228,6 +1231,122 @@ class TestRecordedEvidence(Env):
         self.assertEqual(code, 409, res)
         self.assertEqual(res['code'], 'source_mismatch')
         self.assertEqual(res['recorded'], os.path.abspath(self.lib))
+
+
+class TestScanTimeFingerprint(Env):
+    """A book scan records the fingerprint of the bytes it READ.
+
+    It used to hash the file when the result was merged. A book edited while
+    it was being scanned (context verification can take minutes) then looked
+    unchanged, its rows skipped the parallel-verse (twin) check, and a
+    correction landed on the verse the user had judged not_error.
+    """
+    P = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בבקר'    # parallel verse
+    S = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בערב'    # the scanned one
+    REL = 'מקור/מקביל.txt'
+
+    def setUp(self):
+        super().setUp()
+        import pickle
+        from collections import Counter
+        from magiah import core
+        words = set(normalize.tokenize(
+            ' '.join((self.P, self.S, 'ויאמר משה אל העם לאמר',
+                      'ויהי ערב ויהי בקר יום אחד הקדמה חדשה קרבן'))))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq['קדבן'] = 2
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            pickle.dump(freq, f)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'ויאמר משה אל העם לאמר\n%s\n%s\n'
+                          'ויהי ערב ויהי בקר יום אחד\n' % (self.P, self.S))
+        self.key = 'file:' + self.REL
+
+    def scan(self):
+        from magiah import book_scan
+        return book_scan.scan_book(self.outdir, 'library', self.REL,
+                                   library_dir=self.lib)
+
+    def judge_and_apply(self):
+        """P is correct here (not_error); S is the typo (approved)."""
+        con = self.con()
+        try:
+            ids = {r[1].rsplit(':', 1)[1]: r[0] for r in con.execute(
+                "SELECT id, unit FROM findings WHERE word = 'קדבן'")}
+        finally:
+            con.close()
+        self.assertEqual(sorted(ids), ['1', '2'])
+        con = self.con()
+        try:
+            db.set_status(con, self.outdir, [ids['1']], 'not_error')
+            db.set_status(con, self.outdir, [ids['2']], 'approved')
+        finally:
+            con.close()
+        d = self.open_doc(self.key)
+        self.trusted = {i['trusted'] for i in d['items']}
+        return self.apply(self.key, [{'id': ids['2']}],
+                          fingerprint=d['fingerprint'])
+
+    def test_the_book_read_carries_its_fingerprint(self):
+        from magiah import book_source
+        book = book_source.load_book('library', self.REL,
+                                     library_dir=self.lib)
+        self.assertEqual(book.file_sha, patcher.fingerprint(self.path))
+        self.assertEqual(book.file_size, len(raw(self.path)))
+        result = self.scan()
+        self.assertEqual((result['file_sha'], result['file_size']),
+                         (book.file_sha, book.file_size))
+
+    def test_a_book_edited_during_its_scan_is_not_trusted(self):
+        result = self.scan()
+        scanned = raw(self.path)
+        # edited while the scan was still running: a line inserted on top
+        write(self.path, 'הקדמה חדשה\n' + scanned.decode('utf-8'))
+        db.merge_book_scan(self.outdir, result)
+        con = self.con()
+        try:
+            rec = db.get_source_root(con, 'doc:' + self.REL)
+        finally:
+            con.close()
+        self.assertEqual(rec['file_sha'], patcher.fingerprint_bytes(scanned))
+        self.assertEqual(rec['file_size'], len(scanned))
+        before = raw(self.path)
+        res, code = self.judge_and_apply()
+        self.assertEqual(self.trusted, {False})
+        # the scanned line number now holds P: never written there
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['ambiguous_line'])
+        self.assertEqual(raw(self.path), before)
+
+    def test_an_unchanged_book_still_trusts_its_line_numbers(self):
+        db.merge_book_scan(self.outdir, self.scan())
+        res, code = self.judge_and_apply()
+        self.assertEqual(self.trusted, {True})
+        self.assertEqual(code, 200, res)
+        lines = raw(self.path).decode('utf-8').splitlines()
+        self.assertEqual(lines[1], self.P)
+        self.assertEqual(lines[2], self.S.replace('קדבן', 'קרבן'))
+
+    def test_trust_needs_the_exact_window_at_the_line(self):
+        """Even a byte-identical book: a token-level match at the recorded
+        line is no proof, so the twin check still runs."""
+        d = self.doc('פתיחה\n%s\n%s\n' % (self.P, self.S))
+        f = finding(self.S, 'קדבן', 'קרבן', lineno=1, trusted=True)
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'ambiguous_line')
+        self.assertEqual(cm.exception.extra['candidate_lines'], [1, 2])
+
+    def test_a_merge_without_a_read_fingerprint_is_not_trusted(self):
+        db.record_book_scan_source(self.outdir, {
+            'doc': self.REL, 'kind': 'library', 'path': self.path})
+        con = self.con()
+        try:
+            rec = db.get_source_root(con, 'doc:' + self.REL)
+        finally:
+            con.close()
+        self.assertEqual((rec['file_sha'], rec['file_size']), (None, None))
 
 
 class TestCliBookScanRecordsRoot(Env):

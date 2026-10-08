@@ -193,7 +193,7 @@ class FileDoc:
     """
 
     def __init__(self, path, raw, encoding, lines, line_ends, bom=False,
-                 fingerprint=None):
+                 fingerprint=None, size=None):
         self.path = path
         self.raw = raw                  # decoded text, BOM excluded
         self.encoding = encoding
@@ -201,6 +201,9 @@ class FileDoc:
         self.line_ends = line_ends
         self.bom = bom                  # re-emitted verbatim on write
         self.fingerprint = fingerprint or fingerprint_bytes(self.encode())
+        # bytes on disk when read (BOM included); with the fingerprint, what a
+        # book scan's record is compared against
+        self.size = size
         self._clean = {}                # lineno -> clean(line), for scans
 
     def __len__(self):
@@ -244,7 +247,7 @@ def read_doc(path):
 def doc_from_bytes(path, data):
     """Parse bytes already read, so the fingerprint and the text a plan is
     made against are guaranteed to be the same version of the file."""
-    fp = fingerprint_bytes(data)
+    fp, size = fingerprint_bytes(data), len(data)
     # the BOM is a property of the file, kept aside so it is neither lost nor
     # invented on write
     bom = data.startswith(b'\xef\xbb\xbf')
@@ -273,7 +276,8 @@ def doc_from_bytes(path, data):
         ends.pop()
     elif not raw:
         lines, ends = [], []           # an empty file has no lines at all
-    doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp)
+    doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp,
+                  size=size)
     if doc.encode() != ((b'\xef\xbb\xbf' + data) if bom else data):
         # a decode/encode round trip that is not byte-exact would rewrite
         # bytes outside every span; refuse rather than write such a file
@@ -284,7 +288,9 @@ def doc_from_bytes(path, data):
 def fingerprint_bytes(text_or_bytes):
     data = (text_or_bytes.encode('utf-8')
             if isinstance(text_or_bytes, str) else text_or_bytes)
-    return 'sha256:' + hashlib.sha256(data).hexdigest()[:32]
+    # one definition with the book scan, which records the fingerprint of the
+    # bytes it read for _locate_line's "unchanged since the scan" test
+    return book_source.file_fingerprint(data)
 
 
 def fingerprint(path):
@@ -465,15 +471,18 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     inserted above shifts a DIFFERENT sentence that happens to contain the
     word into that slot. So the line must be identified by the snippet; if it
     is not, the finding is looked for nearby (unambiguous matches only).
-    ``trusted`` means the file is byte-identical to the one scanned, so the
-    line number itself is evidence and identical twins nearby do not matter.
+    ``trusted`` means the file is byte-identical to the bytes the scan read
+    (fingerprint and size recorded when the scan read them), so the line
+    number itself is evidence and identical twins nearby do not matter — but
+    only when the snippet window matches that line EXACTLY as well. A token-
+    level match there is a parallel verse as easily as the scanned one.
     """
     here = None
     if lineno < len(doc.lines):
         occs, ident, level = _identify(doc.lines[lineno], word, snippet)
         if level:
             here = (lineno, occs, ident, level, False)
-    if here is not None and not trusted:
+    if here is not None and not (trusted and here[3] == LEVEL_WINDOW):
         # an identical twin nearby means the line number alone is deciding,
         # and a line number is exactly what an insertion invalidates
         twins = _candidates(doc, lineno, word, snippet, skip=lineno)

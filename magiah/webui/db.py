@@ -1529,15 +1529,17 @@ def set_fixer_mode(con, key, mode):
 # file_edits gains journal_id (ties a row to its write-journal intent, which
 # makes recovery idempotent), backup_sha and source_root; fixer_sources holds
 # the library root each scan was made against ('report' or 'doc:<doc>') and,
-# for book scans, the hash of the file as scanned (file_sha).
+# for book scans, the fingerprint of the bytes the scan read (file_sha and
+# file_size, taken when the file was read — not when the result was merged).
 _FILE_EDIT_COLS = ('journal_id', 'backup_sha', 'source_root')
+_SOURCE_COLS = (('file_sha', 'TEXT'), ('file_size', 'INTEGER'))
 
 
 def _ensure_fixer_schema(con):
     have = {r[1] for r in con.execute('PRAGMA table_info(file_edits)')}
     missing = [c for c in _FILE_EDIT_COLS if c not in have]
     src = {r[1] for r in con.execute('PRAGMA table_info(fixer_sources)')}
-    if not missing and 'file_sha' in src:
+    if not missing and all(c in src for c, _t in _SOURCE_COLS):
         return
     for col in missing:
         try:
@@ -1546,12 +1548,13 @@ def _ensure_fixer_schema(con):
             pass                       # another connection added it first
     con.execute('''CREATE TABLE IF NOT EXISTS fixer_sources(
         scope TEXT PRIMARY KEY, root TEXT NOT NULL, stamp TEXT,
-        recorded_at TEXT NOT NULL, file_sha TEXT)''')
-    if src and 'file_sha' not in src:
-        try:
-            con.execute('ALTER TABLE fixer_sources ADD COLUMN file_sha TEXT')
-        except sqlite3.OperationalError:
-            pass
+        recorded_at TEXT NOT NULL, file_sha TEXT, file_size INTEGER)''')
+    for col, typ in _SOURCE_COLS:
+        if src and col not in src:
+            try:
+                con.execute(f'ALTER TABLE fixer_sources ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
     con.commit()
 
 
@@ -1593,29 +1596,35 @@ def get_live_edit_entries(con, key):
     return out
 
 
-def record_source_root(con, scope, root, stamp=None, file_sha=None):
+def record_source_root(con, scope, root, stamp=None, file_sha=None,
+                       file_size=None):
     _ensure_fixer_schema(con)
     con.execute('INSERT OR REPLACE INTO fixer_sources(scope, root, stamp, '
-                'recorded_at, file_sha) VALUES(?,?,?,?,?)',
+                'recorded_at, file_sha, file_size) VALUES(?,?,?,?,?,?)',
                 (scope, os.path.abspath(root) if root else '', stamp, _now(),
-                 file_sha))
+                 file_sha, file_size))
     con.commit()
 
 
 def get_source_root(con, scope):
     _ensure_fixer_schema(con)
-    row = con.execute('SELECT root, stamp, file_sha FROM fixer_sources '
-                      'WHERE scope = ?', (scope,)).fetchone()
-    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2]}
-            if row else None)
+    row = con.execute('SELECT root, stamp, file_sha, file_size '
+                      'FROM fixer_sources WHERE scope = ?',
+                      (scope,)).fetchone()
+    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2],
+             'file_size': row[3]} if row else None)
 
 
-def advance_scan_file_sha(con, scope, old, new):
+def advance_scan_file_sha(con, scope, old, new, new_size):
     """The fixer's own write moved the file from `old` to `new` without
-    moving any line, so line numbers recorded at scan time stay valid."""
+    moving any line, so line numbers recorded at scan time stay valid.
+
+    Only a fingerprint taken when the scan READ the file (it has a size) is
+    carried forward; one recorded at merge time proves nothing to carry."""
     _ensure_fixer_schema(con)
-    con.execute('UPDATE fixer_sources SET file_sha = ? WHERE scope = ? '
-                'AND file_sha = ?', (new, scope, old))
+    con.execute('UPDATE fixer_sources SET file_sha = ?, file_size = ? '
+                'WHERE scope = ? AND file_sha = ? AND file_size IS NOT NULL',
+                (new, new_size, scope, old))
     con.commit()
 
 
@@ -1644,12 +1653,15 @@ def full_import_stamp(con):
 
 def record_book_scan_source(outdir, result):
     """Pin the library root a single-book scan read, under 'doc:<doc>',
-    with the hash of the file as scanned.
+    with the fingerprint of the bytes the scan read.
 
     The scan's library comes from the request, not from run_config.json, so
     without this the fixer could only guess which folder the rows describe.
+    The fingerprint is the scan's own (``file_sha`` / ``file_size`` of the
+    result), never a hash of the file taken now: a book edited while it was
+    being scanned would then look unchanged, and its rows would skip the
+    identity checks that tell a line from its parallel twin.
     """
-    from . import patcher
     if result.get('kind') not in ('library', 'file') \
             or not result.get('doc') or not result.get('path'):
         return None
@@ -1658,13 +1670,13 @@ def record_book_scan_source(outdir, result):
         root = os.path.abspath(result['path'])
         for _part in str(result['doc']).split('/'):
             root = os.path.dirname(root)
-    try:
-        sha = patcher.fingerprint(result['path'])
-    except OSError:
-        sha = None
+    sha, size = result.get('file_sha'), result.get('file_size')
+    if not sha or size is None:
+        sha = size = None              # an unproven read is never "unchanged"
     con = connect(outdir)
     try:
-        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha)
+        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha,
+                           file_size=size)
     finally:
         con.close()
     return root
