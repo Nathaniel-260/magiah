@@ -40,6 +40,10 @@ interrupted ``lexicon``. Nor does a failed ``report`` (CSV export) or
 A single-book scan never writes the pipeline's outputs (it reads the lexicon
 and merges one book into ui_review.db in a single transaction), so it has its
 own record and can neither raise nor clear the warning about the full scan.
+That record is kept per book: a failed scan of one book says nothing about
+another, so ``book.json`` lists every book whose latest scan failed or was
+interrupted, and a successful scan of a book takes only that book off the
+list (:func:`book_problems`).
 
 Concurrency
 -----------
@@ -62,6 +66,7 @@ import time
 import uuid
 
 from . import core
+from .book_source import canonical_path, canonical_rel
 from .textsource import TextSourceError
 
 STATE_DIR = 'run_state'
@@ -74,6 +79,8 @@ RESULT_CHAIN = core._READ_STAGES
 # holds the marker for a moment; a run waits that out instead of failing.
 _RETRIES = 40
 _RETRY_S = 0.05
+# books whose failed scan book.json remembers; past it the oldest is dropped
+MAX_BOOK_FAILURES = 20
 
 
 class RunBusy(core.StageError):
@@ -251,12 +258,16 @@ class _Run:
     def _mine(self, data):
         return None
 
+    def _ended(self, data, run):
+        """Hook: `run` (in `data`) was just finalized."""
+
     def _finish(self, state, **fields):
         def change(data):
             run = self._mine(data)
             if run is None or run.get('state') != 'running':
                 return
             run.update(fields, state=state, finished_at=_now())
+            self._ended(data, run)
         try:
             self._update(change)
         except OSError as e:
@@ -416,8 +427,39 @@ def track_scan(out_dir, stages, via='cli'):
     return ScanRun(out_dir, stages, via)
 
 
+def book_id(source, key):
+    """One book's identity in book.json, however its key was spelled: the
+    same normalization the book loader applies (book_source), so a failure
+    recorded for ``./a//b.txt`` is cleared by a scan of ``a/b.txt``."""
+    key = str(key).strip()
+    if source == 'db':
+        key = str(int(key)) if key.isdigit() else key
+    elif source == 'library':
+        key = canonical_rel(key)
+    elif source == 'file' and key.strip('"'):
+        key = os.path.normcase(canonical_path(key.strip('"')))
+    return f'{source}:{key}'
+
+
+def _file_failure(data, run):
+    """Remember `run` as its book's latest, unsuccessful, scan."""
+    failed = data.setdefault('failed', {})
+    book = run.get('book') or book_id(run.get('source'), run.get('key'))
+    failed.pop(book, None)
+    failed[book] = dict(run)
+    # newest last (insertion order): the oldest go first past the cap
+    for old in list(failed)[:-MAX_BOOK_FAILURES]:
+        del failed[old]
+
+
 class BookRun(_Run):
-    """A single-book scan owned by this process."""
+    """A single-book scan owned by this process.
+
+    ``book.json`` = ``{version, run: the latest book scan, failed: {book:
+    run}}``. A book scan that ends ``done`` takes its book out of `failed`,
+    one that fails (or never ends: interrupted) puts it there, and one that
+    is cancelled changed nothing, so it leaves the book as it was.
+    """
 
     kind = 'book'
     busy = ('סריקת ספר בודד אחרת כבר רצה על תיקיית התוצאות הזו '
@@ -425,26 +467,44 @@ class BookRun(_Run):
 
     def __init__(self, out_dir, source, key, via='cli'):
         self.source, self.key, self.via = source, str(key), via
+        self.book = book_id(source, key)
         super().__init__(out_dir)
 
     @staticmethod
     def _fresh():
-        return {'version': VERSION, 'run': None}
+        return {'version': VERSION, 'run': None, 'failed': {}}
 
     @staticmethod
     def _valid(data):
-        return data.get('run') is None or isinstance(data.get('run'), dict)
+        return ((data.get('run') is None or isinstance(data.get('run'), dict))
+                and isinstance(data.get('failed', {}), dict))
 
     def _mine(self, data):
         run = data.get('run')
         return run if isinstance(run, dict) and run.get('id') == self.id \
             else None
 
+    def fail(self, reason, partial=False):
+        # a book scan's result is all or nothing: a partial one is a failure
+        self._finish('failed', reason=reason)
+
+    def _ended(self, data, run):
+        if run['state'] == 'done':
+            data.setdefault('failed', {}).pop(self.book, None)
+        elif run['state'] != 'cancelled':
+            _file_failure(data, run)
+
     def _begin(self, data):
+        prev = data.get('run')
+        if isinstance(prev, dict) and prev.get('state') == 'running':
+            # we hold the lock, so it died without saying so
+            prev['state'] = 'interrupted'
+            _file_failure(data, prev)
         data['run'] = {
             'id': self.id, 'via': self.via, 'source': self.source,
-            'key': self.key, 'title': None, 'state': 'running',
-            'started_at': _now(), 'finished_at': None, 'reason': None}
+            'key': self.key, 'book': self.book, 'title': None,
+            'state': 'running', 'started_at': _now(), 'finished_at': None,
+            'reason': None}
 
 
 # ---------------------------------------------------------------------------
@@ -498,18 +558,27 @@ def scan_problem(out_dir):
     return None
 
 
-def book_problem(out_dir):
-    """The latest single-book scan, if it failed or was interrupted (a scan
-    the user cancelled changed nothing and is not reported) — else None.
+def book_problems(out_dir):
+    """The books whose latest single-book scan failed or was interrupted,
+    newest first — ``[]`` if none. A scan the user cancelled changed nothing
+    and is not reported; a book scanned successfully since is not either.
 
-    Returns ``{'state', 'source', 'key', 'title', 'started_at',
+    Each is ``{'state', 'source', 'key', 'title', 'started_at',
     'finished_at', 'reason', 'id'}``.
     """
     data = _Slot(out_dir, 'book').settled()
-    run = data.get('run') if isinstance(data, dict) else None
-    if not isinstance(run, dict) \
-            or run.get('state') not in ('failed', 'interrupted'):
-        return None
-    return {k: run.get(k) for k in ('state', 'source', 'key', 'title',
-                                    'started_at', 'finished_at', 'reason',
-                                    'id')}
+    if not isinstance(data, dict):
+        return []
+    failed = data.get('failed')
+    runs = [r for r in failed.values() if isinstance(r, dict)] \
+        if isinstance(failed, dict) else []
+    run = data.get('run')
+    if isinstance(run, dict) and run.get('state') == 'interrupted':
+        # found dead by this read: it replaces its book's older entry
+        runs = [r for r in runs if r.get('book') != run.get('book')] + [run]
+    # `failed` is in the order the scans ended, newest last
+    return [{k: r.get(k) for k in ('state', 'source', 'key', 'title',
+                                   'started_at', 'finished_at', 'reason',
+                                   'id')}
+            for r in reversed(runs)
+            if r.get('state') in ('failed', 'interrupted')]

@@ -168,6 +168,19 @@ class MetaTest(ResultStatusCase):
         self.assertIn('לא מצאה ממצאים', n['text'])
         self.assertNotIn('עדיין לא הושלמה', n['text'])
 
+    def test_failed_db_book_is_named_by_its_title(self):
+        self.import_good_scan()
+        con = sqlite3.connect(os.path.join(self.out, db.UI_DB_F))
+        con.execute("UPDATE findings SET doc = '7', source = 'ספר בדיקה'")
+        con.commit()
+        con.close()
+        for key in ('7', '8'):
+            with runstate.BookRun(self.out, 'db', key) as run:
+                run.fail('boom')
+        (n,) = meta_status(self.out)['result_status']['notices']
+        self.assertIn('ספר בדיקה', n['text'])          # known from findings
+        self.assertIn('ספר 8 במסד הנתונים', n['text'])  # nothing to go by
+
     def test_failed_book_scan_is_its_own_warning(self):
         self.import_good_scan()
         rc, _ = run_book(self, os.path.join(self.lib, 'אין כזה.txt'))
@@ -179,6 +192,32 @@ class MetaTest(ResultStatusCase):
                          ('book_scan_incomplete', 'warning'))
         self.assertIn('אין כזה.txt', n['text'])
         self.assertTrue(n['details'])
+
+    def test_failed_book_scans_are_listed_per_book(self):
+        self.import_good_scan()
+        names = ['א', 'ב', 'ג', 'ד']
+        for name in names:
+            run_book(self, os.path.join(self.lib, name + '.txt'))
+        st = meta_status(self.out)['result_status']
+        self.assertFalse(st['stale'])
+        (n,) = st['notices']                     # one notice for them all
+        self.assertEqual(n['kind'], 'book_scan_incomplete')
+        self.assertIn('4', n['title'])
+        # the newest named in the text, every one in the details
+        self.assertIn('ד.txt', n['text'])
+        self.assertNotIn('א.txt', n['text'])
+        self.assertIn('ועוד 1', n['text'])
+        for name in names:
+            self.assertIn(name + '.txt', n['details'])
+        # a successful scan of a book takes off that book only
+        shutil.copy(os.path.join(self.lib, 'ספר.txt'),
+                    os.path.join(self.lib, 'ב.txt'))
+        rc, err = run_book(self, os.path.join(self.lib, 'ב.txt'))
+        self.assertFalse(rc, err)
+        (n,) = meta_status(self.out)['result_status']['notices']
+        self.assertNotIn('ב.txt', n['details'])
+        self.assertIn('ג.txt', n['details'])
+        self.assertIn('3', n['title'])
 
 
 def run_book(case, key):

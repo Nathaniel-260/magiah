@@ -363,7 +363,13 @@ that was gone after ten seconds or a server restart.
   record: they do not write the pipeline's outputs, and their merge is one
   transaction, so a failed one leaves every finding as it was. It can neither
   raise nor clear the full scan's warning; it gets its own, lower-level
-  notice, cleared by the next successful book scan.
+  notice. The record is per book (`failed: {book: run}`, the book keyed by
+  source and its normalized key, `runstate.book_id`): a successful scan of a
+  book clears that book only, a cancelled one changes nothing, and at most
+  `runstate.MAX_BOOK_FAILURES` (20) books are kept, oldest dropped first.
+  One notice covers them all — a single book is named with its reason;
+  several are counted in the title, the newest three named in the text and
+  every one, with its reason, in the details.
 - **API:** `webui/result_status.py` builds `result_status = {stale,
   results_at, notices:[{kind, level, stale, title, text, hint, details,
   action, action_label}]}` for `/api/meta` and `/api/refresh`. Notices come
@@ -371,7 +377,8 @@ that was gone after ten seconds or a server restart.
   or — for folders without one — from the coverage files the CLI already
   refuses, `core.coverage_problem`), `refresh_needed` (info: `report.db` is
   newer than the one imported, recorded as `meta.report_mtime`),
-  `book_scan_incomplete` (warning). A further warning about the results is
+  `book_scan_incomplete` (warning; every book whose latest scan failed or was
+  interrupted). A further warning about the results is
   one more provider. Hebrew texts: `hebrew.RESULT_STATUS`.
 - **Frontend:** `#resultBanner`, above the view tabs in every view: one block
   per notice (title, text, "מה לעשות", collapsible full reason, an action

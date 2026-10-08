@@ -31,6 +31,8 @@ from . import hebrew
 
 T = hebrew.RESULT_STATUS
 LEVELS = ('error', 'warning', 'info')
+# books named in the text of the failed-book-scans notice (all are in details)
+BOOKS_NAMED = 3
 
 
 def _clock(epoch):
@@ -148,20 +150,61 @@ def refresh_notice(con, outdir, ctx):
                    action='refresh')
 
 
-def book_notice(con, outdir, ctx):
-    """The latest single-book scan failed or was cut off. It changed nothing
-    (its merge is one transaction), so the full results are not stale."""
-    p = runstate.book_problem(outdir)
-    if not p:
+def _db_title(con, key):
+    """The title the findings give the database book `key`, or None (a
+    failed scan never learned it; an id alone tells a person nothing)."""
+    key = str(key).strip()
+    if not key.isdigit():
         return None
-    # isolated: a book key is often a path, which the surrounding
-    # right-to-left text would otherwise scramble
-    what = T['book_what'][p['state']].format(
-        book='\u2068' + (p['title'] or p['key']) + '\u2069',
-        started=_minute(p['started_at']))
-    return _notice('book_scan_incomplete', 'warning', T['book_title'],
-                   what + ' ' + T['book_after'], T['book_todo'], p['reason'],
-                   'book_scan')
+    row = con.execute('SELECT source FROM findings WHERE doc = ? AND '
+                      "source IS NOT NULL AND source != '' LIMIT 1",
+                      (str(int(key)),)).fetchone()
+    return row[0] if row else None
+
+
+def _book_label(con, p, short=False):
+    """A book named in the banner: its title once a scan learned it, else
+    the key it was asked for (`short`: a path's file name only) — isolated,
+    since a key is often a path, which the surrounding right-to-left text
+    would otherwise scramble."""
+    key = str(p['key'])
+    if p['title']:
+        name = p['title']
+    elif p['source'] == 'db':
+        name = _db_title(con, key) or T['book_db_key'].format(key=key)
+    else:
+        name = key.replace('\\', '/').rsplit('/', 1)[-1] if short else key
+    return '⁨' + name + '⁩'
+
+
+def book_notice(con, outdir, ctx):
+    """Books whose latest single-book scan failed or was cut off — one
+    notice for all of them, each book listed once. Such a scan changed
+    nothing (its merge is one transaction), so the full results are not
+    stale, and a later successful scan of a book takes only that book off."""
+    problems = runstate.book_problems(outdir)
+    if not problems:
+        return None
+    if len(problems) == 1:
+        (p,) = problems
+        what = T['book_what'][p['state']].format(
+            book=_book_label(con, p), started=_minute(p['started_at']))
+        return _notice('book_scan_incomplete', 'warning', T['book_title'],
+                       what + ' ' + T['book_after'], T['book_todo'],
+                       p['reason'], 'book_scan')
+    shown = problems[:BOOKS_NAMED]
+    books = ', '.join(f'«{_book_label(con, p, short=True)}»' for p in shown)
+    if len(problems) > len(shown):
+        books += ' ' + T['books_more'].format(n=len(problems) - len(shown))
+    details = '\n\n'.join(
+        T['books_detail'][p['state']].format(
+            book=_book_label(con, p), started=_minute(p['started_at']))
+        + (':\n' + p['reason'] if p['reason'] else '')
+        for p in problems)
+    return _notice('book_scan_incomplete', 'warning',
+                   T['books_title'].format(n=len(problems)),
+                   T['books_what'].format(books=books) + ' '
+                   + T['books_after'], T['books_todo'], details, 'book_scan')
 
 
 PROVIDERS = (stale_notice, refresh_notice, book_notice)

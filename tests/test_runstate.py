@@ -252,7 +252,7 @@ class PipelineRunTest(RunStateCase):
         self.start_from_good_scan()
         shutil.rmtree(os.path.join(self.out, runstate.STATE_DIR))
         self.assertIsNone(runstate.scan_problem(self.out))
-        self.assertIsNone(runstate.book_problem(self.out))
+        self.assertEqual(runstate.book_problems(self.out), [])
 
     def test_unreadable_marker_is_unknown_and_replaced_by_next_run(self):
         self.start_from_good_scan()
@@ -290,14 +290,23 @@ class BookRunTest(RunStateCase):
         return run_cli('book', '--book', key, '--book-source', source,
                        '--textdir', self.lib, '--out', self.out, *TUNE)
 
+    def missing(self, name):
+        """A book scan that fails: the file does not exist."""
+        rc, err = self.book(os.path.join(self.lib, name + '.txt'))
+        self.assertEqual(rc, 1)
+        return err
+
+    def failed_keys(self):
+        return [os.path.basename(p['key'])
+                for p in runstate.book_problems(self.out)]
+
     def test_failed_book_scan_leaves_the_scan_record_alone(self):
         self.start_from_good_scan()
         before = scan_record(self.out)
-        rc, err = self.book(os.path.join(self.lib, 'אין כזה.txt'))
-        self.assertEqual(rc, 1)
+        self.missing('אין כזה')
         self.assertEqual(scan_record(self.out), before)
         self.assertIsNone(runstate.scan_problem(self.out))
-        p = runstate.book_problem(self.out)
+        (p,) = runstate.book_problems(self.out)
         self.assertEqual(p['state'], 'failed')
         self.assertEqual(p['source'], 'file')
         self.assertTrue(p['reason'])
@@ -313,25 +322,57 @@ class BookRunTest(RunStateCase):
         rc, err = self.book(os.path.join(self.lib, 'ספר.txt'))
         self.assertFalse(rc, err)
         self.assertEqual(runstate.scan_problem(self.out)['stage'], 'locate')
-        self.assertIsNone(runstate.book_problem(self.out))
+        self.assertEqual(runstate.book_problems(self.out), [])
 
-    def test_book_scan_clears_its_own_failure(self):
+    def test_failures_are_kept_per_book(self):
+        # a scan of one book says nothing about another: fail X, fail Y,
+        # then succeed X -> only Y is left
         self.start_from_good_scan()
-        self.book(os.path.join(self.lib, 'אין כזה.txt'))
-        self.assertIsNotNone(runstate.book_problem(self.out))
-        rc, err = self.book(os.path.join(self.lib, 'ספר.txt'))
+        x = os.path.join(self.lib, 'ספר.txt')
+        os.rename(x, x + '.away')
+        self.missing('ספר')
+        self.missing('אחר')
+        self.assertEqual(self.failed_keys(), ['אחר.txt', 'ספר.txt'])
+        os.rename(x + '.away', x)
+        # spelled differently, still the same book
+        rc, err = self.book(os.path.join(self.lib, '.', 'ספר.txt'))
         self.assertFalse(rc, err)
-        self.assertIsNone(runstate.book_problem(self.out))
+        self.assertEqual(self.failed_keys(), ['אחר.txt'])
+        # a book's newer failure replaces its older one; a cancelled scan
+        # changed nothing and keeps it
+        self.missing('אחר')
+        self.assertEqual(self.failed_keys(), ['אחר.txt'])
+        with runstate.BookRun(self.out, 'file',
+                              os.path.join(self.lib, 'אחר.txt')) as run:
+            run.cancel()
+        self.assertEqual(self.failed_keys(), ['אחר.txt'])
+
+    def test_failure_list_is_capped(self):
+        for i in range(runstate.MAX_BOOK_FAILURES + 3):
+            with runstate.BookRun(self.out, 'db', str(i)) as run:
+                run.fail('boom')
+        keys = [p['key'] for p in runstate.book_problems(self.out)]
+        self.assertEqual(len(keys), runstate.MAX_BOOK_FAILURES)
+        self.assertNotIn('0', keys)                  # the oldest went first
+        self.assertIn(str(runstate.MAX_BOOK_FAILURES + 2), keys)
 
     def test_killed_and_cancelled_book_scans(self):
         run = runstate.BookRun(self.out, 'db', '7')
-        self.assertIsNone(runstate.book_problem(self.out))   # in progress
+        self.assertEqual(runstate.book_problems(self.out), [])  # in progress
         run.close()
-        self.assertEqual(runstate.book_problem(self.out)['state'],
-                         'interrupted')
-        with runstate.BookRun(self.out, 'db', '7') as run:
+        (p,) = runstate.book_problems(self.out)
+        self.assertEqual((p['state'], p['key']), ('interrupted', '7'))
+        # the next scan files the dead one under its book for good
+        with runstate.BookRun(self.out, 'db', '8') as run:
+            pass
+        self.assertEqual([p['key'] for p in runstate.book_problems(self.out)],
+                         ['7'])
+        with runstate.BookRun(self.out, 'db', '07') as run:
             run.cancel()                    # nothing was merged
-        self.assertIsNone(runstate.book_problem(self.out))
+        self.assertEqual(len(runstate.book_problems(self.out)), 1)
+        with runstate.BookRun(self.out, 'db', '07'):
+            pass                            # the same book, done
+        self.assertEqual(runstate.book_problems(self.out), [])
 
 
 if __name__ == '__main__':
