@@ -48,7 +48,7 @@ def _load_run_config(out_dir):
 
 
 def _save_run_config(out_dir, spec, cfg, prev=None):
-    new = {'corpus': spec, 'config': cfg.to_dict()}
+    new = {'corpus': spec, 'config': cfg.to_run_config()}
     # an unchanged setting is not rewritten: the file's age tells the review
     # UI whether a scan was started after report.db (webui.db
     # .config_root_for_report), and `magiah book` or `report` start none
@@ -57,6 +57,18 @@ def _save_run_config(out_dir, spec, cfg, prev=None):
         return
     with open(os.path.join(out_dir, RUN_CONFIG), 'w', encoding='utf-8') as f:
         json.dump(new, f, ensure_ascii=False, indent=2)
+
+
+def _non_negative(text):
+    """argparse type of --allow-unread: a count, never negative."""
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f'expected a non-negative number of rows, got {text!r}')
+    return n
 
 
 def _guess_book_source(key):
@@ -182,6 +194,15 @@ def main(argv=None):
     ap.add_argument('--whitelist', action='append', metavar='FILE',
                     help='word-list file (one word per line); listed words are '
                          'never flagged. May be given multiple times.')
+    ap.add_argument('--allow-unread', type=_non_negative, default=0,
+                    metavar='N',
+                    help='go on when at most N input rows cannot be read '
+                         '(corrupt or missing in seforim.db): they are '
+                         'skipped and every output built on them is marked '
+                         'partial. Also needed to USE such outputs in a '
+                         'later run. Default 0: any unreadable row stops the '
+                         'stage. Applies to this run only — never remembered '
+                         'in run_config.json.')
     tune = ap.add_argument_group('thresholds')
     for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
               'workers', 'n_chunks'):
@@ -200,7 +221,8 @@ def main(argv=None):
     spec = _build_spec(args) or (prev and prev['corpus'])
     if spec is None:
         ap.error('no corpus source: use --otzaria, --sqlite or --textdir')
-    cfg = Config.from_dict(prev['config']) if prev else Config()
+    cfg = Config.from_run_config(prev['config']) if prev else Config()
+    cfg.allow_unread = args.allow_unread
     for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
               'workers', 'n_chunks'):
         v = getattr(args, f)

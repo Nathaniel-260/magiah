@@ -303,7 +303,7 @@ class UiScanTest(ResultStatusCase):
         self.assertEqual(self.ui_scan()['state'], 'done')
         db.import_all(self.out)
         at = meta_status(self.out)['result_status']['results_at']
-        with mock.patch.object(scanner, '_stage_cmd', lambda stage, out: (
+        with mock.patch.object(scanner, '_stage_cmd', lambda stage, out, *_: (
                 [sys.executable, '-X', 'utf8', '-c',
                  'import sys; sys.path.insert(0, sys.argv[1]); '
                  'from magiah import cli, core; '
@@ -343,7 +343,7 @@ class UiScanTest(ResultStatusCase):
         self.ui_scan()
         db.import_all(self.out)
         at = meta_status(self.out)['result_status']['results_at']
-        with mock.patch.object(scanner, '_stage_cmd', lambda stage, out: (
+        with mock.patch.object(scanner, '_stage_cmd', lambda stage, out, *_: (
                 [sys.executable, '-c', 'import sys; sys.exit(3)'])):
             self.ui_scan()
         n = self.assert_stale('נכשלה', at)

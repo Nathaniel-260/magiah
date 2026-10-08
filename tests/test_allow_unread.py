@@ -16,9 +16,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from magiah import core
+from magiah import cli, core
 from magiah.config import Config
 from magiah.textsource import OtzariaDB, ReadStats
+from magiah.webui import scanner
 
 from test_tanach import BIBLE, make_bible_db
 from test_textsource import (_corrupt_row, _coverage, _otzaria_spec, _zstd,
@@ -390,6 +391,106 @@ class DistinctRowsTest(_Case):
         self.assertIn('לא הצליח לקרוא 2 שורות', str(cm.exception))
         self.assertFalse(os.path.exists(
             os.path.join(self.out, core.REPORT_DB_F)))
+
+
+class CliTest(_Case):
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main([*argv, '--otzaria', '--db', self.db,
+                           '--out', self.out, '--workers', '1',
+                           '--n-chunks', '2'])
+        return rc, out.getvalue(), err.getvalue()
+
+    def run_config(self):
+        with open(os.path.join(self.out, cli.RUN_CONFIG),
+                  encoding='utf-8') as f:
+            return json.load(f)['config']
+
+    def test_option_must_be_a_non_negative_count(self):
+        for bad in ('-1', 'abc', '1.5'):
+            with self.subTest(value=bad), self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                cli.main(['lexicon', '--allow-unread', bad, '--out', self.out])
+
+    def test_blocked_then_accepted_then_required_again(self):
+        rc, _, err = self.main('lexicon')
+        self.assertEqual(rc, 1)
+        self.assertIn('--allow-unread 2', err)
+        self.assertNotIn('Traceback', err)
+
+        rc, out, _ = self.main('lexicon', '--allow-unread', '2')
+        self.assertFalse(rc)
+        self.assertIn('אזהרה', out)
+        # never remembered: run_config.json is what it was before the option
+        self.assertEqual(set(self.run_config()),
+                         set(Config().to_dict()) - {'allow_unread'})
+
+        rc, _, err = self.main('detect')
+        self.assertEqual(rc, 1)
+        self.assertIn('--allow-unread 2', err)
+        rc, _, _ = self.main('detect', '--allow-unread', '2')
+        self.assertFalse(rc)
+
+    def test_a_value_planted_in_run_config_is_ignored(self):
+        self.main('lexicon', '--allow-unread', '2')
+        path = os.path.join(self.out, cli.RUN_CONFIG)
+        with open(path, encoding='utf-8') as f:
+            rc_json = json.load(f)
+        rc_json['config']['allow_unread'] = 99
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(rc_json, f)
+        rc, _, err = self.main('detect')
+        self.assertEqual(rc, 1)
+        self.assertIn('לא אישרה', err)
+        self.assertNotIn('allow_unread', self.run_config())
+
+
+class ScanPanelTest(_Case):
+    """The UI's scan panel: the same option, per run, on the command line."""
+
+    def test_stage_command_carries_the_option_only_when_set(self):
+        base = scanner._stage_cmd('lexicon', self.out)
+        self.assertNotIn('--allow-unread', base)
+        self.assertEqual(scanner._stage_cmd('lexicon', self.out, 3),
+                         base + ['--allow-unread', '3'])
+
+    def test_field_is_offered_at_zero_whatever_run_config_says(self):
+        with open(os.path.join(self.out, scanner.RUN_CONFIG), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'corpus': {}, 'config': {'allow_unread': 5}}, f)
+        field = next(f for f in scanner.scan_config(self.out)['fields']
+                     if f['key'] == 'allow_unread')
+        self.assertEqual((field['value'], field['default'], field['type']),
+                         (0, 0, 'int'))
+        # the CLI's messages send the user to this field by name
+        self.assertTrue(field['hebrew'].startswith(core.ALLOW_UNREAD_UI))
+        self.assertEqual(scanner._merge_config(self.out, {}).allow_unread, 0)
+
+    def test_negative_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            scanner._merge_config(self.out, {'allow_unread': -1})
+        self.assertEqual(
+            scanner._merge_config(self.out, {'allow_unread': '2'})
+            .allow_unread, 2)
+
+    def test_full_scan_passes_it_per_run_and_never_saves_it(self):
+        seen = {}
+
+        def fake_run(outdir, stages, run, allow_unread=0):
+            seen['allow_unread'] = allow_unread
+            run.done()
+            run.close()
+            with scanner._lock:
+                scanner._state.update(state='done')
+        with mock.patch.object(scanner, '_run', fake_run):
+            scanner.start_scan(self.out, ['lexicon'], {'allow_unread': 3},
+                               {'mode': 'sqlite', 'db_path': self.db})
+            scanner._thread.join(10)
+        self.assertEqual(seen, {'allow_unread': 3})
+        with open(os.path.join(self.out, scanner.RUN_CONFIG),
+                  encoding='utf-8') as f:
+            self.assertNotIn('allow_unread', json.load(f)['config'])
 
 
 if __name__ == '__main__':

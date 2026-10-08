@@ -71,18 +71,22 @@ def _log_line(text):
     _log.append(text.rstrip('\r\n'))
 
 
-def _stage_cmd(stage, outdir):
+def _stage_cmd(stage, outdir, allow_unread=0):
     """Command that runs one pipeline stage as a subprocess.
 
     Frozen (PyInstaller) there is no interpreter to call: sys.executable IS
     the exe, which ignores `-m magiah <stage>` and would open a second UI
     instead of scanning. The exe's launcher accepts `<exe> <stage> --out <dir>`
     and dispatches to the CLI, so call it that way.
+
+    `allow_unread` travels on the command line, not in run_config.json: it
+    is a per-run option (see Config.PER_RUN).
     """
+    extra = ['--allow-unread', str(allow_unread)] if allow_unread else []
     if getattr(sys, 'frozen', False):
-        return [sys.executable, stage, '--out', outdir]
+        return [sys.executable, stage, '--out', outdir] + extra
     return [sys.executable, '-X', 'utf8', '-m', 'magiah', stage,
-            '--out', outdir]
+            '--out', outdir] + extra
 
 
 def _parse_chunk(line):
@@ -122,8 +126,8 @@ def load_run_config(outdir):
 
 def _merge_config(outdir, overrides):
     prev = load_run_config(outdir)
-    cfg = Config.from_dict(prev['config']) if prev and prev.get('config') \
-        else Config()
+    cfg = Config.from_run_config(prev['config']) \
+        if prev and prev.get('config') else Config()
     fields = {f.name for f in dataclasses.fields(Config)}
     for key, val in (overrides or {}).items():
         if key not in fields or val is None or val == '':
@@ -141,6 +145,9 @@ def _merge_config(outdir, overrides):
         except (TypeError, ValueError):
             raise ValueError(
                 hebrew.SCAN_MESSAGES['bad_config_value'] + str(key))
+    if cfg.allow_unread < 0:
+        raise ValueError(
+            hebrew.SCAN_MESSAGES['bad_config_value'] + 'allow_unread')
     return cfg
 
 
@@ -184,8 +191,8 @@ def start_scan(outdir, stages=None, config_overrides=None,
         try:
             with open(os.path.join(outdir, RUN_CONFIG), 'w',
                       encoding='utf-8') as f:
-                json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                          ensure_ascii=False, indent=2)
+                json.dump({'corpus': spec, 'config': cfg.to_run_config()},
+                          f, ensure_ascii=False, indent=2)
         except BaseException as e:      # the scan never started
             run.fail(f'{type(e).__name__}: {e}')
             run.close()
@@ -200,16 +207,18 @@ def start_scan(outdir, stages=None, config_overrides=None,
                       chunk_done=0, chunk_total=0, book=None,
                       started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                       started_epoch=time.time())
-        _thread = threading.Thread(target=_run, args=(outdir, stages, run),
-                                   daemon=True)
+        _thread = threading.Thread(
+            target=_run, args=(outdir, stages, run, cfg.allow_unread),
+            daemon=True)
         _thread.start()
     return dict(get_status())
 
 
-def _run(outdir, stages, run):
+def _run(outdir, stages, run, allow_unread=0):
     """Worker: run `stages` as subprocesses. `run` (runstate.ScanRun) is
     this scan's record; it is finalized before the in-memory state, so the
-    UI never sees the scan end ahead of the record that explains it."""
+    UI never sees the scan end ahead of the record that explains it.
+    `allow_unread` goes on every stage's command line (Config.PER_RUN)."""
     global _proc
     log_path = os.path.join(outdir, LOG_FILE)
     rc = 0
@@ -244,7 +253,7 @@ def _run(outdir, stages, run):
                 _state.update(stage=stage, stage_index=i,
                               chunk_done=0, chunk_total=0)
             run.enter(stage)
-            cmd = _stage_cmd(stage, outdir)
+            cmd = _stage_cmd(stage, outdir, allow_unread)
             emit(f'===== [{stage}] {" ".join(cmd)}')
             _proc = subprocess.Popen(
                 cmd, cwd=REPO_DIR, env=env,
@@ -528,7 +537,9 @@ def scan_config(outdir):
         db_path = spec.get('db') or OTZARIA_DB
     defaults = Config().to_dict()
     current = dict(defaults)
-    current.update(rc.get('config') or {})
+    # a per-run option always starts at its default, whatever the file says
+    current.update({k: v for k, v in (rc.get('config') or {}).items()
+                    if k not in Config.PER_RUN})
     fields = []
     for key, default in defaults.items():
         lab = hebrew.CONFIG_LABELS.get(key, {})
@@ -560,4 +571,5 @@ def scan_config(outdir):
         'fields': fields,
         'stages': stages,
         'run_config': rc or None,
+        'allow_unread_confirm': hebrew.SCAN_MESSAGES['allow_unread_confirm'],
     }
