@@ -9,6 +9,21 @@ Python install needed.
 
 ---
 
+## בנייה אוטומטית ב־GitHub / Automatic release build
+
+מעלים את `version` ב־`pyproject.toml` **וגם** את `__version__` ב־`magiah/__init__.py`
+לאותו מספר, ודוחפים ל־`main`. GitHub Actions מריץ את הבדיקות, בונה את
+`magiah.exe` ומפרסם אותו ב־Release בשם `v<גרסה>`. אם כבר יש Release לגרסה הזו
+— לא קורה כלום. אפשר גם להפעיל ידנית מלשונית Actions ← Release ← Run workflow.
+
+Bump `version` in `pyproject.toml` **and** `__version__` in
+`magiah/__init__.py` to the same number and push to `main`. GitHub Actions runs
+the tests, builds `magiah.exe` and publishes it as release `v<version>`. A
+version that already has a release is skipped. It can also be started by hand
+from Actions → Release → Run workflow.
+
+---
+
 ## עברית — הוראות בנייה
 
 יש לבנות במחשב שיש בו פייתון 3.9+ **וחיבור אינטרנט** (להתקנת PyInstaller אם חסר).
