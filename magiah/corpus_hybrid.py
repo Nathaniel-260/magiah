@@ -170,9 +170,7 @@ class LibraryCorpus:
                     yield f'{FILE_UNIT_PREFIX}{rel}:{lineno}', rel, text
             except OSError as e:
                 # an unreadable book is a coverage gap, not an empty book
-                self.stats.decode_errors += 1
-                if len(self.stats.error_samples) < 20:
-                    self.stats.error_samples.append((rel, repr(e)[:200]))
+                self.stats.unread_row(rel, 'decode_errors', repr(e)[:200])
 
     # -- enrichment --------------------------------------------------------
     def file_unit_meta(self, units):

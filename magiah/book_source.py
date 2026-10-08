@@ -26,6 +26,7 @@ import hashlib
 import os
 import sqlite3
 
+from . import core
 from .corpus import OTZARIA_DB
 from .textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                          split_lines)
@@ -147,11 +148,14 @@ class BookText:
     `lines` is a list of ``(unit, ref, text)``; `ref` is the per-line reference
     shown in the UI (heRef in the DB, the running <h2>-<h4> header trail in a
     file). A book read from a file also carries ``file_sha`` / ``file_size``:
-    the fingerprint of the very bytes these lines were decoded from.
+    the fingerprint of the very bytes these lines were decoded from. `stats`
+    is what reading a DB book counted — including the rows skipped under
+    ``allow_unread`` — and None for a file, which is read whole or not at
+    all.
     """
 
     def __init__(self, doc, title, origin, lines, kind, path=None,
-                 file_sha=None, file_size=None):
+                 file_sha=None, file_size=None, stats=None):
         self.doc = doc
         self.title = title
         self.origin = origin
@@ -160,6 +164,7 @@ class BookText:
         self.path = path
         self.file_sha = file_sha
         self.file_size = file_size
+        self.stats = stats
 
     def __len__(self):
         return len(self.lines)
@@ -254,13 +259,49 @@ def canonical_rel(rel):
     return os.path.normpath(rel).replace(os.sep, '/')
 
 
-def load_book(source, key, db_path=None, library_dir=None):
+def book_identity(source, key, library_dir=None):
+    """``(source, key)`` naming the book that ``load_book(source, key)``
+    reads, resolved the way the loaders resolve it — without reading it, so
+    a scan that fails before (or because) the book cannot be read still has
+    one. A file inside the library is that library book; ``./a//b.txt`` is
+    ``a/b.txt``; a database id loses its leading zeros. Keys are folded to
+    the file system's case, which makes them identities, not display text.
+    """
+    key = str(key).strip()
+    if source == 'db':
+        return source, str(int(key)) if key.isdigit() else key
+    lib_dir = library_dir or DEFAULT_LIBRARY
+    if source == 'file':
+        path = key.strip('"')
+        if not path:
+            return source, ''
+        real = canonical_path(path)
+        if os.path.isdir(lib_dir):          # as _load_file_book decides
+            rel = _rel_within(real, lib_dir)
+            if rel is not None and rel.lower().endswith('.txt'):
+                return book_identity('library', rel, lib_dir)
+        return source, os.path.normcase(real)
+    if source == 'library':
+        rel = canonical_rel(key)
+        if rel:                             # the repo's own spelling
+            rel = _rel_within(canonical_path(
+                os.path.join(lib_dir, *rel.split('/'))), lib_dir) or rel
+        return source, os.path.normcase(rel).replace(os.sep, '/')
+    return source, key
+
+
+def load_book(source, key, db_path=None, library_dir=None, allow_unread=0):
     """Read one book. `source` is 'db' | 'library' | 'file'.
+
+    A DB book with unreadable rows is refused, unless there are at most
+    `allow_unread` of them: then the rest of the book is returned and the
+    skipped rows are counted in ``BookText.stats``, for the scan to mark its
+    result partial — the same rule the full scan applies.
 
     Returns a BookText. Raises BookNotFound with a Hebrew message.
     """
     if source == 'db':
-        return _load_db_book(key, db_path)
+        return _load_db_book(key, db_path, allow_unread)
     if source == 'library':
         return _load_library_book(key, library_dir)
     if source == 'file':
@@ -268,7 +309,7 @@ def load_book(source, key, db_path=None, library_dir=None):
     raise BookNotFound(f'מקור ספר לא מוכר: {source}')
 
 
-def _load_db_book(key, db_path):
+def _load_db_book(key, db_path, allow_unread=0):
     db_path = db_path or OTZARIA_DB
     if not os.path.isfile(db_path):
         raise BookNotFound(f'קובץ מסד הנתונים לא נמצא: {db_path}')
@@ -293,16 +334,25 @@ def _load_db_book(key, db_path):
                  for uid, ref, text in odb.book_lines(book_id, stats)]
     finally:
         odb.close()
-    if stats.unread():
+    unread = stats.unread()
+    if unread > max(allow_unread, 0):
         # a book with unreadable (or missing) rows must not be scanned as if
         # complete
-        raise BookNotFound(
-            f'{stats.unread():,} שורות בספר "{title}" לא פוענחו; '
-            f'הסריקה בוטלה כדי לא להציג תוצאה חלקית. '
-            f'דוגמה: {stats.error_samples[:1]}')
+        gaps = core.gap_record({'book': stats}, {}, allow_unread, db_path)
+        msg = [f'{unread:,} שורות בספר "{title}" לא נקראו (פגומות או חסרות '
+               f'במסד הנתונים); הסריקה בוטלה כדי לא להציג תוצאה חלקית.']
+        if allow_unread > 0:
+            msg.append(f'הריצה אישרה לדלג על {allow_unread:,} שורות לכל '
+                       f'היותר.')
+        msg += core.refs_lines(gaps['unread_refs'], unread)
+        msg.append(core.proceed_hint(unread))
+        raise BookNotFound('\n'.join(msg))
     if not lines:
+        if unread:
+            raise BookNotFound(f'אף אחת מ-{unread:,} השורות בספר "{title}" '
+                               f'אינה קריאה במסד הנתונים — אין מה לסרוק')
         raise BookNotFound(f'לא נמצאו שורות טקסט בספר "{title}"')
-    return BookText(str(book_id), title, origin, lines, 'db')
+    return BookText(str(book_id), title, origin, lines, 'db', stats=stats)
 
 
 def _load_library_book(rel, library_dir):

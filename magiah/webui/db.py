@@ -63,7 +63,7 @@ import sqlite3
 import time
 from datetime import datetime
 
-from . import hebrew
+from . import hebrew, result_status
 from ..corpus_hybrid import DEFAULT_LIBRARY
 # one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
 from ..textsource import sqlite_uri as _uri
@@ -641,6 +641,10 @@ def import_all(outdir, migrate_legacy=False):
     if not os.path.exists(report_path):
         raise FileNotFoundError(
             hebrew.MESSAGES['report_missing'].format(outdir=outdir))
+    # identifies the report.db these findings come from (result_status.py:
+    # a newer report.db means a refresh is due); taken before reading, so a
+    # report.db replaced meanwhile reads as newer, never as already loaded
+    report_mtime = os.path.getmtime(report_path)
     con = connect(outdir)
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
@@ -912,8 +916,18 @@ def import_all(outdir, migrate_legacy=False):
             'book_scan_kept': kept,
             'stale_approvals': len(stale),
         })
+        # what the scan behind these findings could not read: report.db
+        # carries it only when locate wrote it partial (--allow-unread)
+        _set_meta_json(cur, 'coverage', _report_coverage(cur))
+        # a book scan's record stays only while the book's rows do
+        books = _meta_json(cur, 'book_coverage') or {}
+        kept_docs = {r[0] for r in cur.execute('SELECT doc FROM keep_docs')}
+        _set_meta_json(cur, 'book_coverage',
+                       {d: v for d, v in books.items() if d in kept_docs})
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('report_mtime', ?)",
+                    (repr(report_mtime),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
         # which library these rows were scanned from, committed with the rows
@@ -938,6 +952,52 @@ def import_all(outdir, migrate_legacy=False):
         return counts
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# coverage: findings that rest on rows the scan could not read
+# ---------------------------------------------------------------------------
+
+def _meta_json(con, key):
+    """A JSON object stored in `meta`, or None (absent or unreadable)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (key,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _set_meta_json(con, key, value):
+    if value:
+        con.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (key, json.dumps(value, ensure_ascii=False)))
+    else:
+        con.execute('DELETE FROM meta WHERE key = ?', (key,))
+
+
+def _gap_summary(rec):
+    """What the UI needs of a coverage record (core.gap_record): not the row
+    ids, which may run to thousands."""
+    return {k: rec[k] for k in ('unread_rows', 'allow_unread', 'unread_refs',
+                                'inherited', 'unread_kind') if k in rec}
+
+
+def _report_coverage(con):
+    """The gap summary report.db (attached as `rep`) carries, or None."""
+    if not con.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                       "AND name='coverage'").fetchone():
+        return None
+    row = con.execute('SELECT info FROM rep.coverage').fetchone()
+    try:
+        info = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        info = None
+    if not isinstance(info, dict):
+        # a mark that cannot be read still says "partial", count unknown
+        return {'unread_rows': None, 'allow_unread': None, 'unread_refs': []}
+    return _gap_summary(info)
 
 
 def import_book_scan(outdir, result):
@@ -1150,6 +1210,13 @@ def import_book_scan(outdir, result):
         legacy_keys = [(w, u) for _, w, u in legacy]
         gone = _clear_dropped_decisions(con, outdir, legacy_keys + stale)
 
+        # each scan of the book replaces its coverage record; a complete one
+        # removes it
+        books = _meta_json(cur, 'book_coverage') or {}
+        books.pop(doc, None)
+        if result.get('coverage'):
+            books[doc] = dict(_gap_summary(result['coverage']), title=title)
+        _set_meta_json(cur, 'book_coverage', books)
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
         for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
@@ -1313,7 +1380,9 @@ def _rowdict(row):
     return d
 
 
-def get_meta(con):
+def get_meta(con, outdir=None):
+    """Labels, counts and — given the output folder — ``result_status``:
+    whether the findings are those of the latest scan (result_status.py)."""
     origins = []
     for raw, cnt, done in con.execute(f'''
             SELECT f.origin, COUNT(*),
@@ -1359,7 +1428,9 @@ def get_meta(con):
             'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
-            'last_import': last_import[0] if last_import else None}
+            'last_import': last_import[0] if last_import else None,
+            'result_status': (result_status.build(con, outdir)
+                              if outdir else None)}
 
 
 def get_books(con, origin=None, q=None):

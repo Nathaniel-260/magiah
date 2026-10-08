@@ -116,15 +116,34 @@ class ReadStats:
     # decode error, so it too makes a pass incomplete
     FIELDS = ('lines', 'chars', 'empty', 'decode_errors', 'null_content',
               'version_lines', 'version_lines_skipped', 'missing')
+    # Unread rows are also kept by unit id, up to this many, so that a row met
+    # by several passes (or stages) is counted once. Past the cap, the count
+    # alone remains, and a caller must assume the passes did not overlap.
+    UNITS_CAP = 10000
 
     def __init__(self):
         for f in self.FIELDS:
             setattr(self, f, 0)
         self.error_samples = []          # first few (unit, message)
+        self.unread_units = set()
 
     def unread(self):
         """Rows that exist in the input but were not read."""
         return self.decode_errors + self.missing
+
+    def unread_row(self, unit, kind, message):
+        """Count one row that could not be read: `kind` is
+        'decode_errors' or 'missing'."""
+        setattr(self, kind, getattr(self, kind) + 1)
+        unit = str(unit)
+        if len(self.error_samples) < 20:
+            self.error_samples.append((unit, message))
+        if len(self.unread_units) < self.UNITS_CAP:
+            self.unread_units.add(unit)
+
+    def units_complete(self):
+        """Whether every unread row is known by id (none past the cap)."""
+        return len(self.unread_units) == self.unread()
 
     def add(self, other):
         for f in self.FIELDS:
@@ -132,11 +151,17 @@ class ReadStats:
         room = 20 - len(self.error_samples)
         if room > 0:
             self.error_samples.extend(other.error_samples[:room])
+        for u in other.unread_units:
+            if len(self.unread_units) >= self.UNITS_CAP:
+                break
+            self.unread_units.add(u)
         return self
 
     def to_dict(self):
         d = {f: getattr(self, f) for f in self.FIELDS}
         d['error_samples'] = list(self.error_samples)
+        if self.unread_units:            # absent from a complete read's dict
+            d['unread_units'] = sorted(self.unread_units)
         return d
 
     @classmethod
@@ -145,6 +170,7 @@ class ReadStats:
         for f in cls.FIELDS:
             setattr(s, f, int((d or {}).get(f, 0)))
         s.error_samples = list((d or {}).get('error_samples') or [])
+        s.unread_units = {str(u) for u in (d or {}).get('unread_units') or ()}
         return s
 
 
@@ -225,9 +251,7 @@ class OtzariaDB:
 
     def _decode_counted(self, unit, value, stats, present=True):
         if not present:
-            stats.missing += 1
-            if len(stats.error_samples) < 20:
-                stats.error_samples.append((str(unit), 'no line_content row'))
+            stats.unread_row(unit, 'missing', 'no line_content row')
             return None
         if value is None:
             stats.null_content += 1
@@ -235,9 +259,7 @@ class OtzariaDB:
         try:
             text = self.decode(value)
         except Exception as e:                      # noqa: BLE001
-            stats.decode_errors += 1
-            if len(stats.error_samples) < 20:
-                stats.error_samples.append((str(unit), repr(e)[:200]))
+            stats.unread_row(unit, 'decode_errors', repr(e)[:200])
             return None
         stats.lines += 1
         stats.chars += len(text)
@@ -252,14 +274,17 @@ class OtzariaDB:
     def iter_range(self, lo, hi, stats, book_ids_sql=None, params=()):
         """Yield ``(line_id, book_id, text)`` for ``lo <= id < hi``.
 
-        `book_ids_sql` optionally restricts to a sub-select of book ids.
+        `book_ids_sql` optionally restricts to a sub-select of book ids; the
+        range still drives the scan, the books are only checked per row.
         Unreadable rows are counted in `stats` and skipped — never yielded as
         empty text, which would make a broken read look like an empty book.
         """
         sql = self._text_sql + ' WHERE l.id >= ? AND l.id < ?'
         args = [lo, hi]
         if book_ids_sql:
-            sql += f' AND l.bookId IN ({book_ids_sql})'
+            # unary '+' keeps idx_line_book_index from driving the scan:
+            # through it, every chunk walked the lines of every selected book
+            sql += f' AND +l.bookId IN ({book_ids_sql})'
             args.extend(params)
         for lid, bid, raw, present in self.con.execute(sql, args):
             text = self._decode_counted(lid, raw, stats, present)
@@ -298,21 +323,43 @@ class OtzariaDB:
                     out[lid] = text
         return out
 
+    def describe_lines(self, line_ids):
+        """``{line_id: (book title, heRef)}`` — where a line is, for telling
+        the user which rows could not be read (an id alone says nothing)."""
+        out = {}
+        ids = list(line_ids)
+        for i in range(0, len(ids), 500):
+            batch = ids[i:i + 500]
+            ph = ','.join('?' * len(batch))
+            for lid, title, ref in self.con.execute(
+                    'SELECT l.id, b.title, l.heRef FROM line l '
+                    f'LEFT JOIN book b ON b.id = l.bookId WHERE l.id IN ({ph})',
+                    batch):
+                out[lid] = (title or '', ref or '')
+        return out
+
     def count_version_lines(self, lo=None, hi=None, book_ids_sql=None,
                             params=()):
         """Version rows that carry their own reading (content NOT NULL),
         optionally only of the books `book_ids_sql` selects."""
         if not self.has_versions:
             return 0
-        sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
-        args = []
+        sql = 'SELECT COUNT(*) FROM version_line v'
+        conds, args = ['v.content IS NOT NULL'], []
         if lo is not None:
-            sql += ' AND lineId >= ? AND lineId < ?'
+            conds.append('v.lineId >= ? AND v.lineId < ?')
             args = [lo, hi]
         if book_ids_sql:
-            sql += (' AND lineId IN (SELECT id FROM line '
-                    f'WHERE bookId IN ({book_ids_sql}))')
+            # a join on line's primary key, not `lineId IN (SELECT id FROM
+            # line WHERE bookId IN ...)`: SQLite drove that from the IN list,
+            # building every selected book's line ids (~5M for Sefaria) on
+            # each chunk. Same rows (a version row without its `line` row
+            # matches neither); '+' keeps the book index from driving the
+            # join too.
+            sql += ' JOIN line l ON l.id = v.lineId'
+            conds.append(f'+l.bookId IN ({book_ids_sql})')
             args.extend(params)
+        sql += ' WHERE ' + ' AND '.join(conds)
         return self.con.execute(sql, args).fetchone()[0]
 
     def iter_version_range(self, lo, hi, stats):
