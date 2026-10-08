@@ -99,25 +99,37 @@ def _break_if_stale(lf):
 
 
 def _acquire_lock_file(lf, deadline):
-    if not os.path.isdir(os.path.dirname(lf) or '.'):
+    folder = os.path.dirname(lf) or '.'
+    if not os.path.isdir(folder):
         return                        # the book's folder is gone: nothing to guard
+    denied = False
     while True:
         try:
             fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError):
-            # PermissionError: Windows reports a lock file that is being
-            # deleted ("delete pending") this way — busy, not fatal
-            _break_if_stale(lf)
-            if time.time() >= deadline:
-                raise _busy()
-            time.sleep(0.05)
-            continue
-        try:
-            os.write(fd, json.dumps({'pid': os.getpid(),
-                                     'ts': time.time()}).encode('ascii'))
-        finally:
-            os.close(fd)
-        return
+        except FileExistsError:
+            pass
+        except PermissionError:
+            # Windows reports a lock file that is being deleted ("delete
+            # pending") this way: busy, not fatal. With no lock file there at
+            # all, the folder itself refuses new files, and no amount of
+            # waiting helps: say so at once rather than "busy, try again".
+            if not os.path.lexists(lf):
+                if denied:
+                    raise patcher.denied_folder(folder)
+                denied = True         # a pending delete may just have ended
+                time.sleep(0.05)
+                continue
+        else:
+            try:
+                os.write(fd, json.dumps({'pid': os.getpid(),
+                                         'ts': time.time()}).encode('ascii'))
+            finally:
+                os.close(fd)
+            return
+        _break_if_stale(lf)
+        if time.time() >= deadline:
+            raise _busy()
+        time.sleep(0.05)
 
 
 def _keep_fresh(lf, stop):
@@ -342,7 +354,8 @@ def recover(con, outdir, path=None, wait=True):
     """Settle every open intent (for one file, or all). Returns one dict per
     intent: ``{'jid', 'path', 'kind', 'state'}``; ``state`` stays 'pending'
     when the database is still failing, and is 'busy' when ``wait`` is False
-    and another writer holds the file."""
+    and another writer holds the file ('denied' when the file or its folder
+    refuses access; with ``wait`` that error is raised instead)."""
     intents, last, _r = _settled(outdir)
     order = list(intents.values())
     k = _key(path) if path else None
@@ -373,6 +386,12 @@ def recover(con, outdir, path=None, wait=True):
             if e.code != 'file_busy':
                 raise
             state = 'busy'
+        except PermissionError:
+            # the book (or its folder) refuses access: a writer is told why
+            # it cannot go on; a page load just leaves the intent open
+            if wait:
+                raise
+            state = 'denied'
         except Exception:
             # the DB is still unavailable: leave the intent open; writers
             # refuse this file until it is settled

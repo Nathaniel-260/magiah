@@ -868,6 +868,47 @@ class TestApi(TempCase):
         self.assertEqual(code, 200, res2)
         self.assertEqual(raw(self.paths[1]), before)
 
+    def test_a_locked_or_read_only_book_is_refused_in_hebrew(self):
+        """os.replace onto a read-only or locked book fails with
+        "[WinError 5] Access is denied: '<temp>' -> '<book>'"; the user is
+        told, in Hebrew, which book and why, and nothing is written."""
+        key = 'file:ספר שני/פרק א.txt'
+        _c, doc = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
+        before = raw(self.paths[1])
+        real = patcher.os.replace
+
+        def denied(src, dst):
+            raise PermissionError(13, 'Access is denied', src, None, dst)
+        patcher.os.replace = denied
+        try:
+            code, res = self.call('/api/fixer/apply', {
+                'key': key, 'fingerprint': doc['fingerprint'],
+                'items': [{'id': 1}]})
+        finally:
+            patcher.os.replace = real
+        self.assertEqual(code, 423, res)
+        self.assertEqual(res['code'], 'access_denied')
+        self.assertIn(self.paths[1], res['error'])
+        self.assertNotIn('Access is denied', res['error'])
+        self.assertNotIn('.tmp', res['error'])
+        self.assertEqual(raw(self.paths[1]), before)
+
+    def test_any_permission_error_is_reported_in_hebrew(self):
+        from magiah.webui import fixer_api
+        real = fixer_api.doc
+
+        def denied(*a, **kw):
+            raise PermissionError(13, 'Access is denied', r'C:\x\book.txt')
+        fixer_api.doc = denied
+        try:
+            code, res = self.call('/api/fixer/doc?key=' +
+                                  urllib.request.quote('file:x.txt'))
+        finally:
+            fixer_api.doc = real
+        self.assertEqual(code, 423, res)
+        self.assertIn(r'C:\x\book.txt', res['error'])
+        self.assertNotIn('Access is denied', res['error'])
+
     def test_mode_is_remembered_per_book(self):
         key = 'file:ספר שני/פרק א.txt'
         self.call('/api/fixer/mode', {'key': key, 'mode': 'bracket'})

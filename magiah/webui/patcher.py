@@ -100,6 +100,27 @@ class PatchError(ValueError):
         super().__init__(message or hebrew.FIXER_MESSAGES.get(code, code))
 
 
+class AccessDenied(PermissionError):
+    """A file or folder the fixer must read or write refuses access: the book
+    is locked by another program or read-only, or its folder does not allow
+    new files. Waiting cannot help, so it is reported at once (HTTP 423),
+    with a Hebrew message and a machine code, like a :class:`PatchError`.
+    """
+
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+def denied_folder(folder):
+    return AccessDenied('folder_not_writable',
+                        _msg('folder_not_writable', folder=folder))
+
+
+def denied_file(path):
+    return AccessDenied('access_denied', _msg('access_denied', path=path))
+
+
 def _msg(code, **fmt):
     text = hebrew.FIXER_MESSAGES.get(code, code)
     return text.format(**fmt) if fmt else text
@@ -235,8 +256,11 @@ def read_bytes(path):
         raise PatchError('too_big', _msg(
             'too_big', mb=size / 1e6,
             limit=book_source.MAX_BOOK_BYTES / 1e6))
-    with open(path, 'rb') as f:
-        return f.read()
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError as e:       # opened exclusively by another program
+        raise denied_file(path) from e
 
 
 def read_doc(path):
@@ -943,12 +967,14 @@ def write_backup(outdir, path, data):
     name; returns ``(backup_path, sha)``."""
     for _ in range(5):
         bpath = backup_path(outdir, path)
-        os.makedirs(os.path.dirname(bpath), exist_ok=True)
         try:
+            os.makedirs(os.path.dirname(bpath), exist_ok=True)
             _write_new(bpath, data)
             return bpath, fingerprint_bytes(data)
         except FileExistsError:
             continue
+        except PermissionError as e:
+            raise denied_folder(os.path.dirname(bpath)) from e
     raise FileExistsError(bpath)
 
 
@@ -980,15 +1006,22 @@ def atomic_write(path, data):
     sees the old book or the new one, never half of either."""
     _clean_stale_temps(path)
     tmp = temp_path_for(path)
+    placed = False
     try:
         _write_new(tmp, data)
+        placed = True
         os.replace(tmp, path)
-    except BaseException:
+    except BaseException as e:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
+        if isinstance(e, PermissionError) and not isinstance(e, AccessDenied):
+            # the raw error names the temp file, in English; say what it means
+            if placed:
+                raise denied_file(path) from e        # locked or read-only
+            raise denied_folder(os.path.dirname(path) or '.') from e
         raise
     return fingerprint_bytes(data)
 

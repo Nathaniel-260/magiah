@@ -1261,6 +1261,8 @@ class TestLockRobustness(FixerEnv):
 
     def test_delete_pending_lock_is_busy_not_an_error(self):
         from magiah.webui import journal
+        # a lock file being deleted still has its name in the folder
+        write(self.path + journal.LOCK_SUFFIX, '{}')
         real_open = journal.os.open
 
         def pending(path, *a, **kw):
@@ -1275,6 +1277,49 @@ class TestLockRobustness(FixerEnv):
         finally:
             journal.os.open = real_open
         self.assertEqual(r, 'file_busy')
+
+    def _folder_refuses_new_files(self):
+        from magiah.webui import journal
+        real_open = journal.os.open
+
+        def denied(path, *a, **kw):
+            if path.endswith(journal.LOCK_SUFFIX):
+                raise PermissionError(13, 'Access is denied', path)
+            return real_open(path, *a, **kw)
+        journal.os.open = denied
+        return real_open
+
+    def test_a_folder_that_refuses_new_files_fails_at_once(self):
+        """No lock file, yet it cannot be created: a permission problem,
+        not contention. It used to wait 15 s and then say "busy"."""
+        from magiah.webui import journal
+        real_open = self._folder_refuses_new_files()
+        t0 = time.time()
+        try:
+            with self.assertRaises(patcher.AccessDenied) as cm:
+                with journal.file_lock(self.path):
+                    pass
+        finally:
+            journal.os.open = real_open
+        self.assertLess(time.time() - t0, 2)
+        self.assertEqual(cm.exception.code, 'folder_not_writable')
+        self.assertIn(os.path.dirname(self.path), str(cm.exception))
+        self.assertTrue(any('א' <= c <= 'ת'
+                            for c in str(cm.exception)))
+
+    def test_apply_in_a_folder_that_refuses_new_files(self):
+        from magiah.webui import journal
+        fp = self.open_doc(self.key)['fingerprint']
+        real_open = self._folder_refuses_new_files()
+        t0 = time.time()
+        try:
+            with self.assertRaises(patcher.AccessDenied):
+                self.apply(self.key, [{'id': 1}], fingerprint=fp)
+        finally:
+            journal.os.open = real_open
+        self.assertLess(time.time() - t0, 2)
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+        self.assertEqual(journal.read_records(self.outdir), [])
 
     def test_held_lock_is_kept_fresh(self):
         from magiah.webui import journal
