@@ -1472,29 +1472,27 @@ def get_fixer_items(con, key, statuses=None, origin=None):
 
     Rows are matched by the file part of `unit` (see the module note above),
     so two books sharing a filename never share a worklist.
+
+    Occurrence numbers are assigned over EVERY finding of the file, whatever
+    its status or origin, and only then is the list filtered. The writer
+    (fixer_api.apply) numbers them that way, and the page must agree with it:
+    numbered among the shown statuses only, a repeated word whose sibling is
+    'not_error' looked "count changed" on the page while apply accepted it.
     """
     from . import patcher
     if not statuses:
         statuses = ['approved']
     if isinstance(statuses, str):
         statuses = [s for s in statuses.split(',') if s]
-    sph = ','.join('?' * len(statuses))
-    params = list(statuses)
-    where = ''
-    if origin:
-        where = ' AND f.origin = ?'
-        params.append(origin)
     # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
     # each row by parsing its unit — LIKE alone could match a longer path
-    params.append(key + ':%')
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion
         FROM findings f {JOINS}
-        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
-          AND f.unit LIKE ?
+        WHERE f.unit LIKE ?
         ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
-        params).fetchall()
+        (key + ':%',)).fetchall()
     items = []
     for r in rows:
         d = _rowdict(r)
@@ -1507,7 +1505,9 @@ def get_fixer_items(con, key, statuses=None, origin=None):
         d['correction'] = d.get('custom_suggestion') or d.get('suggestion') or ''
         items.append(d)
     patcher.assign_occurrences(items)
-    return items
+    keep = set(statuses) | {'fixed'}
+    return [d for d in items if d['effective_status'] in keep
+            and (not origin or d.get('origin') == origin)]
 
 
 def get_fixer_mode(con, key, default='replace'):

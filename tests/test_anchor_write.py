@@ -1080,6 +1080,27 @@ class TestRepeatedWordInSeparateBatches(Env):
         self.assertEqual((self.status_of(1), self.status_of(2)),
                          ('fixed', 'fixed'))
 
+    def test_the_page_numbers_copies_like_apply_does(self):
+        """A sibling judged not_error is not shown, but it still holds its
+        place among the copies. Numbered among the shown rows only, copy 1
+        looked "count changed" on the page while apply accepted it."""
+        con = self.con()
+        try:
+            db.set_status(con, self.outdir, [1], 'not_error')
+        finally:
+            con.close()
+        d = self.open_doc(self.key)
+        [two] = d['items']
+        self.assertEqual((two['id'], two['occurrence'],
+                          two['expected_count']), (2, 1, 2))
+        self.assertTrue(two['anchor']['ok'], two['anchor'])
+        res, code = self.apply(self.key, [{'id': 2}],
+                               fingerprint=d['fingerprint'])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(res['applied'][0]['start'], two['anchor']['start'])
+        self.assertEqual(raw(self.path).decode('utf-8').splitlines()[1],
+                         'כעבד לפני רבו לשמיס כעבד לפני רבו לשמים')
+
     def test_a_copy_fixed_by_hand_is_still_refused(self):
         write(self.path, 'פתיחה\n%s\nסוף\n'
               % self.LINE.replace('לשמיס', 'לשמים', 1))
