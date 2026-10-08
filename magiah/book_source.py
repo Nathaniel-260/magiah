@@ -28,9 +28,8 @@ import sqlite3
 from .corpus import OTZARIA_DB
 from .textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                          split_lines)
-from .corpus_hybrid import (DEFAULT_LIBRARY, FALLBACK_ORIGIN,
-                            FILE_UNIT_PREFIX, LibraryCorpus, _HDR_RE,
-                            _header_text)
+from .corpus_hybrid import (DEFAULT_LIBRARY, FILE_UNIT_PREFIX, LibraryCorpus,
+                            _HDR_RE, _header_text)
 
 LOCAL_UNIT_PREFIX = 'local:'
 LOCAL_ORIGIN = 'קבצים מקומיים'
