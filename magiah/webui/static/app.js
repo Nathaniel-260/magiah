@@ -1239,6 +1239,7 @@ async function loadFixDoc() {
     $("#fixDocPath").textContent = "";
     $("#fixDocMeta").textContent = "";
     setFixBanner(null);
+    renderFixConflicts();
     updateFixProgress();
     updateApplyButton();
     return;
@@ -1290,6 +1291,7 @@ async function loadFixDoc() {
     renderFixDoc();
     renderFixList(true);
     updateFixHead();
+    renderFixConflicts();
     if (!resp.editable) {
       setFixBanner(resp.message || "ספר זה אינו קובץ טקסט — אפשר לייצא את התיקונים בלבד.", "err");
     } else {
@@ -1300,6 +1302,7 @@ async function loadFixDoc() {
     S.fixRows = [];
     list.replaceChildren(el("div", { class: "fixer-empty" }, "הטעינה נכשלה: " + e.message));
     setFixBanner(e.message, "err");
+    renderFixConflicts();
   }
   updateApplyButton();
 }
@@ -1613,6 +1616,53 @@ function showBlockedBanner() {
     "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש. " +
     "אפשר ללחוץ על המילה הנכונה בטקסט כדי לסמן אותה ידנית.",
     ul));
+}
+
+/* An earlier write to this book was cut off (a crash, a closed window) and
+ * the file changed afterwards, so the tool cannot tell whether that write
+ * landed — and it never guesses. The book is named here, with its backup,
+ * until the corrector has checked it and says so; only then is the record
+ * dismissed (/api/fixer/resolve_conflict). Kept apart from #fixerBanner, which
+ * every refusal and reload repaints. */
+function renderFixConflicts() {
+  const box = $("#fixConflicts");
+  if (!box) return;
+  const list = (S.fixDoc && S.fixDoc.journal_conflicts) || [];
+  box.replaceChildren();
+  box.hidden = !list.length;
+  if (!list.length) return;
+  box.append(el("div", null,
+    el("b", null, "⚠ כתיבה קודמת לקובץ הזה נקטעה באמצע, והקובץ השתנה מאז. "),
+    "לכן אי אפשר לדעת אם התיקונים שבה נכתבו: הסטטוס שלהם לא עודכן, ואין לה " +
+    "שחזור מגיבוי. יש לפתוח את הקובץ ולבדוק אותו מול הגיבוי שנשמר לפני " +
+    "הכתיבה, ולתקן ידנית אם צריך. אחרי הבדיקה אפשר להסיר את ההתראה."));
+  const ul = el("ul");
+  for (const c of list) {
+    const words = (c.finding_ids || [])
+      .map(id => (S.fixRows.find(r => r.id === id) || {}).word)
+      .filter(Boolean);
+    ul.append(el("li", null,
+      (c.message || "") +
+        (words.length ? " (המילים: «" + words.join("», «") + "»)" : ""),
+      el("button", { class: "btn", onclick: () => resolveFixConflict(c.jid) },
+        "✔ בדקתי — הסר התראה"),
+      el("div", { class: "fc-meta" },
+        (c.kind === "undo" ? "שחזור מגיבוי" : "החלת תיקונים") +
+          (c.ts ? " · " + String(c.ts).replace("T", " ").slice(0, 19) : ""),
+        c.backup ? [" · גיבוי: ", el("code", null, c.backup)] : null)));
+  }
+  box.append(ul);
+}
+
+async function resolveFixConflict(jid) {
+  if (!confirm("לאשר שבדקת את הקובץ?\nההתראה תוסר, והכלי לא יחזור לבדוק את הכתיבה שנקטעה.")) return;
+  try {
+    await api("/api/fixer/resolve_conflict", { method: "POST", body: { jid } });
+    toast("ההתראה הוסרה", "ok");
+    await loadFixDoc();
+  } catch (e) {
+    toast(e.message, "err", 8000);
+  }
 }
 
 /* -------------------------------------------------- worklist */

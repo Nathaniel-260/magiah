@@ -193,8 +193,13 @@ def _resolve_book(con, outdir, key, rows):
 
 
 def _conflicts(outdir, path):
-    keep = ('jid', 'ts', 'kind', 'backup', 'fp_before', 'fp_after', 'fp_seen')
-    return [{k: c.get(k) for k in keep}
+    """Interrupted writes of this book that could not be settled because
+    the file changed since: shown in the fixer until the user acknowledges
+    them (resolve_conflict)."""
+    keep = ('jid', 'ts', 'kind', 'backup', 'finding_ids', 'fp_before',
+            'fp_after', 'fp_seen')
+    return [dict({k: c.get(k) for k in keep},
+                 message=hebrew.FIXER_MESSAGES['journal_conflict'])
             for c in journal.conflicts(outdir, path)]
 
 

@@ -1363,6 +1363,71 @@ class TestLockRobustness(FixerEnv):
             release.set()
             t.join(5)
 
+    def _crashed_write(self, landed=True):
+        """What a process killed mid-write leaves: an open intent, its lock
+        file (stale by now) and a partial temp file next to the book."""
+        from magiah.webui import journal
+        d = patcher.read_doc(self.path)
+        before = d.encode()
+        plans, failures = patcher.plan_all(d, [finding(
+            d.lines[1], 'יותבת', 'יושבת', lineno=1)])
+        self.assertEqual(failures, [])
+        patcher.apply_edits(d, plans)
+        after = d.encode()
+        journal.begin(self.outdir, {
+            'kind': 'apply', 'path': self.path, 'book_key': self.key,
+            'mode': 'replace', 'finding_ids': [1], 'mark_fixed': True,
+            'detail': patcher.detail_json(plans), 'backup': '',
+            'fp_before': patcher.fingerprint_bytes(before),
+            'fp_after': patcher.fingerprint_bytes(after)})
+        if landed:
+            write(self.path, after.decode('utf-8'))
+        lf = write(self.path + journal.LOCK_SUFFIX, '{"pid": 1}')
+        old = time.time() - journal.STALE_LOCK_SECONDS - 80
+        os.utime(lf, (old, old))
+        tmp = write(self.path + '.' + 'b' * 32 + '.tmp', 'חלקי')
+        return lf, tmp
+
+    def test_first_page_load_after_a_crash_settles_it(self):
+        """The page load used to break the dead holder's lock and still
+        report the book busy (it has no time to wait), leaving the intent,
+        the partial temp file and the bookkeeping for a later write."""
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        d = self.open_doc(self.key)
+        self.assertEqual(journal.pending(self.outdir), [])
+        self.assertEqual(len(d['edits']), 1)
+        self.assertEqual(self.status_of(1), 'fixed')
+        self.assertFalse(os.path.exists(lf))
+        self.assertFalse(os.path.exists(tmp))
+        self.assertEqual(sorted(os.listdir(self.lib)), ['ספר.txt'])
+
+    def test_crash_then_hand_edit_reaches_the_page_as_a_conflict(self):
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        write(self.path, raw(self.path).decode('utf-8') + 'שורה ביד\n')
+        d = self.open_doc(self.key)
+        self.assertEqual(journal.pending(self.outdir), [])
+        [c] = d['journal_conflicts']
+        self.assertEqual((c['kind'], c['finding_ids']), ('apply', [1]))
+        self.assertEqual(c['message'],
+                         patcher._msg('journal_conflict'))
+        self.assertFalse(os.path.exists(lf) or os.path.exists(tmp))
+        con = self.con()
+        try:
+            fixer_api.resolve_conflict(con, self.outdir, {'jid': c['jid']})
+        finally:
+            con.close()
+        self.assertEqual(self.open_doc(self.key)['journal_conflicts'], [])
+
+    def test_a_live_holders_lock_is_not_broken(self):
+        from magiah.webui import journal
+        lf, tmp = self._crashed_write()
+        os.utime(lf, None)                     # refreshed: its holder lives
+        self.open_doc(self.key)
+        self.assertEqual(len(journal.pending(self.outdir)), 1)
+        self.assertTrue(os.path.exists(lf) and os.path.exists(tmp))
+
     def test_journal_is_compacted(self):
         from magiah.webui import journal
         for _ in range(30):

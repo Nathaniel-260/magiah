@@ -982,8 +982,11 @@ def write_backup(outdir, path, data):
 STALE_TEMP_SECONDS = 600
 
 
-def _clean_stale_temps(path):
-    """Remove this book's own temp files that a crash left behind."""
+def _clean_stale_temps(path, max_age=STALE_TEMP_SECONDS):
+    """Remove this book's own temp files that a crash left behind: those
+    older than `max_age` seconds, or all of them with ``max_age=0`` — which
+    only a holder of the book's lock may ask for: every writer of these
+    files holds it, so then none of them is still being written."""
     d, base = os.path.split(path)
     pat = re.compile(re.escape(base) + r'\.[0-9a-f]{32}\.tmp$')
     try:
@@ -995,7 +998,7 @@ def _clean_stale_temps(path):
         if pat.match(n):
             full = os.path.join(d, n)
             try:
-                if now - os.path.getmtime(full) > STALE_TEMP_SECONDS:
+                if max_age <= 0 or now - os.path.getmtime(full) > max_age:
                     os.remove(full)
             except OSError:
                 pass

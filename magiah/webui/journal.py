@@ -79,30 +79,32 @@ def _busy():
 
 
 def _break_if_stale(lf):
-    """Remove a dead holder's lock file; any failure just means 'still busy'."""
+    """Remove a dead holder's lock file; True when it is gone. Any failure
+    just means 'still busy'."""
     try:
         if time.time() - os.path.getmtime(lf) <= STALE_LOCK_SECONDS:
-            return
+            return False
         aside = '%s.%s.stale' % (lf, uuid.uuid4().hex)
         os.rename(lf, aside)
     except OSError:
-        return
+        return False
     try:
         if time.time() - os.path.getmtime(aside) <= STALE_LOCK_SECONDS:
             # a live holder re-created it between our check and the rename
             if not os.path.exists(lf):
                 os.rename(aside, lf)
-                return
+                return False
         os.remove(aside)
     except OSError:
         pass
+    return True
 
 
 def _acquire_lock_file(lf, deadline):
     folder = os.path.dirname(lf) or '.'
     if not os.path.isdir(folder):
         return                        # the book's folder is gone: nothing to guard
-    denied = False
+    denied = retried = False
     while True:
         try:
             fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -126,7 +128,12 @@ def _acquire_lock_file(lf, deadline):
             finally:
                 os.close(fd)
             return
-        _break_if_stale(lf)
+        if _break_if_stale(lf) and not retried:
+            # a dead holder's lock is gone: take it now, even past the
+            # deadline — a page load has no time to wait at all, and would
+            # otherwise break the lock and still report the book as busy
+            retried = True
+            continue
         if time.time() >= deadline:
             raise _busy()
         time.sleep(0.05)
@@ -382,6 +389,10 @@ def recover(con, outdir, path=None, wait=True):
                     state = 'conflict'
                 finish(outdir, rec['jid'], state, fp_seen=fp, **extra)
                 last[rec['jid']] = {'op': state}
+                # the interrupted write may have left its partial temp file
+                # next to the book; its stale lock went when this one was
+                # taken (and goes on release)
+                patcher._clean_stale_temps(p, max_age=0)
         except patcher.PatchError as e:
             if e.code != 'file_busy':
                 raise
