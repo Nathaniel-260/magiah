@@ -1611,10 +1611,14 @@ function showBlockedBanner() {
   for (const [, v] of byCode) {
     ul.append(el("li", null, v.message + " (" + fmtNum(v.n) + ")"));
   }
+  // a click is offered only on a line the server identified; promising one
+  // for the others (a line_mismatch) sends the corrector looking for nothing
+  const pickable = blocked.some(r => (r.anchor.manual_lines || []).length);
   setFixBanner(el("div", { class: "bn-text" },
     el("b", null, fmtNum(blocked.length) + " ממצאים לא יוחלו אוטומטית — "),
-    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש. " +
-    "אפשר ללחוץ על המילה הנכונה בטקסט כדי לסמן אותה ידנית.",
+    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש." +
+    (pickable ? " בשורות שהכלי זיהה אפשר ללחוץ על המילה הנכונה בטקסט " +
+                "כדי לסמן אותה ידנית." : ""),
     ul));
 }
 

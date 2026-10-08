@@ -68,6 +68,17 @@ def scan_snippet(line, word, k=0):
     return text[max(0, s - 45):e + 45].strip()
 
 
+def write_doc(doc, outdir):
+    """Test helper: the fixer's two write steps, backup first and then an
+    atomic replace, without the lock and journal fixer_api wraps them in
+    (tested in test_anchor_write). Production code has no such shortcut."""
+    with open(doc.path, 'rb') as f:
+        before = f.read()
+    backup, sha = patcher.write_backup(outdir, doc.path, before)
+    return {'backup': backup, 'backup_sha': sha,
+            'fingerprint': patcher.atomic_write(doc.path, doc.encode())}
+
+
 def plan_all(doc, findings, *a, **kw):
     """patcher.plan_all with the scan-time snippet every real finding has."""
     for f in findings:
@@ -617,7 +628,7 @@ class TestWriteAndRestore(TempCase):
             doc, [{'id': 1, 'lineno': 0, 'word': 'יותבת',
                    'correction': 'יושבת'}])
         patcher.apply_edits(doc, plans)
-        return patcher.write_doc(doc, self.outdir)
+        return write_doc(doc, self.outdir)
 
     def test_backup_holds_the_original(self):
         res = self._apply()
@@ -633,22 +644,12 @@ class TestWriteAndRestore(TempCase):
         leftovers = [x for x in os.listdir(self.lib) if x.endswith('.tmp')]
         self.assertEqual(leftovers, [])
 
-    def test_restore_brings_back_the_original(self):
+    def test_backup_restores_the_original_bytes(self):
         res = self._apply()
-        patcher.restore_backup(self.outdir, res['backup'], self.path,
-                               res['fingerprint'])
+        data = patcher.read_backup(self.outdir, res['backup'],
+                                   res['backup_sha'])
+        patcher.atomic_write(self.path, data)
         self.assertEqual(raw(self.path), self.orig.encode('utf-8'))
-
-    def test_restore_refuses_after_a_manual_edit(self):
-        """Restoring would silently destroy work the corrector did by hand in
-        another editor, so a changed file refuses instead."""
-        res = self._apply()
-        with open(self.path, 'a', encoding='utf-8') as f:
-            f.write('עריכה ידנית\n')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.restore_backup(self.outdir, res['backup'], self.path,
-                                   res['fingerprint'])
-        self.assertEqual(cm.exception.code, 'file_changed_since_edit')
 
     def test_backup_name_separates_same_named_books(self):
         other = write(os.path.join(self.lib, 'sub', 'ספר.txt'), 'טקסט')
@@ -658,12 +659,10 @@ class TestWriteAndRestore(TempCase):
 
     def test_fingerprint_detects_change(self):
         fp = patcher.fingerprint(self.path)
-        patcher.check_fingerprint(self.path, fp)          # no raise
+        self.assertEqual(patcher.fingerprint(self.path), fp)
         with open(self.path, 'a', encoding='utf-8') as f:
             f.write('x')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.check_fingerprint(self.path, fp)
-        self.assertEqual(cm.exception.code, 'file_changed')
+        self.assertNotEqual(patcher.fingerprint(self.path), fp)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +701,7 @@ class TestNeverTouchesAnotherBook(TempCase):
                    'correction': 'יושבת'}])
         self.assertEqual(failures, [])
         patcher.apply_edits(doc, plans)
-        patcher.write_doc(doc, self.outdir)
+        write_doc(doc, self.outdir)
 
         after = [raw(p) for p in self.paths]
         self.assertEqual(after[0], before[0], 'ספר ראשון was modified!')

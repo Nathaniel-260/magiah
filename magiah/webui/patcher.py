@@ -6,7 +6,8 @@ The one rule this module exists to enforce
 **A correction must never land on an unrelated passage.** Everything below is
 an identity check; whenever identity is uncertain the module REFUSES and the
 human is asked. Silence is never an option, and a partial write never happens:
-:func:`plan_all` validates every edit before :func:`write_doc` touches a byte.
+:func:`plan_all` validates every edit before a byte is written — and the only
+writer, ``fixer_api``, writes under the book's lock and its journal.
 
 Why a plain ``line.replace(word, fix)`` would corrupt books
 ----------------------------------------------------------
@@ -322,15 +323,6 @@ def fingerprint(path):
     editors preserve it and FAT rounds it to two seconds."""
     with open(path, 'rb') as f:
         return fingerprint_bytes(f.read())
-
-
-def check_fingerprint(path, expected):
-    if not expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    actual = fingerprint(path)
-    if actual != expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    return actual
 
 
 # ---------------------------------------------------------------------------
@@ -1029,23 +1021,9 @@ def atomic_write(path, data):
     return fingerprint_bytes(data)
 
 
-def write_doc(doc, outdir):
-    """Back the file up, then replace it atomically.
-
-    Order matters: the backup is taken FIRST, so any later failure — a locked
-    file, a full disk, a crash — leaves the user with both the untouched
-    original and a copy. The fixer's own write path (fixer_api.apply) adds a
-    lock and a journal around these same two steps.
-    """
-    with open(doc.path, 'rb') as f:
-        before = f.read()
-    bpath, bsha = write_backup(outdir, doc.path, before)  # PermissionError -> 423
-    data = doc.encode()
-    atomic_write(doc.path, data)
-    doc.raw = doc.text()
-    doc.fingerprint = fingerprint_bytes(data)
-    return {'backup': bpath, 'backup_sha': bsha,
-            'fingerprint': doc.fingerprint, 'bytes': len(data)}
+# There is deliberately no "write this doc" or "restore this backup" helper
+# here: a write that skipped the book's lock and its journal would reopen the
+# lost-update and no-undo holes. fixer_api._write_journaled is the only writer.
 
 
 def backup_file(outdir, backup):
@@ -1068,24 +1046,6 @@ def read_backup(outdir, backup, expect_sha=None):
     if expect_sha and fingerprint_bytes(data) != expect_sha:
         raise PatchError('backup_corrupt', _msg('backup_corrupt'))
     return data
-
-
-def restore_backup(outdir, backup, path, expect_fingerprint=None,
-                   backup_fingerprint=None):
-    """Put a backup back, refusing if the file changed after we wrote it.
-
-    If the corrector edited the book by hand since the fix was applied,
-    restoring would destroy that work, so a fingerprint mismatch refuses
-    instead (fixer_api.undo_file then tries a span-level undo).
-    """
-    full = backup_file(outdir, backup)
-    if not os.path.isfile(path):
-        raise PatchError('not_a_file', _msg('not_a_file', path=path))
-    data = read_backup(outdir, full, backup_fingerprint)
-    if expect_fingerprint and fingerprint(path) != expect_fingerprint:
-        raise PatchError('file_changed_since_edit',
-                         _msg('file_changed_since_edit'))
-    return {'restored': path, 'fingerprint': atomic_write(path, data)}
 
 
 # ---------------------------------------------------------------------------

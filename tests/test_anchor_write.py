@@ -763,14 +763,10 @@ class TestBackups(FixerEnv):
 
     def test_two_writes_in_one_second_keep_both_backups(self):
         contents = []
-        for word, corr in (('יותבת', 'יושבת'), ('מחורז', 'מחוז')):
-            d = patcher.read_doc(self.path)
-            contents.append(d.encode())
-            ln = 1 if word == 'יותבת' else 2
-            plan = patcher.plan_edit(d, finding(d.lines[ln], word, corr,
-                                                lineno=ln))
-            patcher.apply_edits(d, [plan])
-            patcher.write_doc(d, self.outdir)
+        for fid in (1, 2):
+            contents.append(raw(self.path))
+            res, code = self.apply(self.key, [{'id': fid}])
+            self.assertEqual(code, 200, res)
         bdir = os.path.join(self.outdir, patcher.FIXER_BACKUP_DIR)
         baks = sorted(raw(os.path.join(bdir, n)) for n in os.listdir(bdir)
                       if n.endswith('.bak'))
@@ -787,20 +783,18 @@ class TestBackups(FixerEnv):
         self.assertEqual(os.path.dirname(a), os.path.dirname(self.path))
 
     def test_corrupt_backup_is_not_restored(self):
-        d = patcher.read_doc(self.path)
-        plan = patcher.plan_edit(d, finding(d.lines[1], 'יותבת', 'יושבת',
-                                            lineno=1))
-        patcher.apply_edits(d, [plan])
-        res = patcher.write_doc(d, self.outdir)
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        con = self.con()
+        try:
+            rec = db.get_file_edit(con, res['edit_id'])
+        finally:
+            con.close()
         with open(res['backup'], 'ab') as f:
             f.write(b'garbage')
-        after = raw(self.path)
         with self.assertRaises(patcher.PatchError) as cm:
-            patcher.restore_backup(self.outdir, res['backup'], self.path,
-                                   res['fingerprint'],
-                                   backup_fingerprint=res['backup_sha'])
+            patcher.read_backup(self.outdir, res['backup'], rec['backup_sha'])
         self.assertEqual(cm.exception.code, 'backup_corrupt')
-        self.assertEqual(raw(self.path), after)
 
     def test_edit_record_carries_hashes(self):
         res, code = self.apply(self.key, [{'id': 1}])
@@ -1152,6 +1146,9 @@ class TestManualPickNeedsIdentity(Env):
         self.assertEqual(it['anchor']['code'], 'line_mismatch')
         self.assertEqual(it['anchor'].get('manual_lines'), [])
         self.assertFalse(any('tokens' in ln for ln in d['lines']))
+        # ...and its message does not send the corrector to click anyway
+        self.assertNotIn('ידנית', it['anchor']['message'])
+        self.assertIn('לסרוק את הספר מחדש', it['anchor']['message'])
 
 
 class TestOpenIntents(FixerEnv):
