@@ -96,7 +96,7 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);  -- import timestamps, sour
 ## 3. HTTP API (JSON, UTF-8; server binds 127.0.0.1)
 
 - `GET /` and `/static/*` — SPA files.
-- `GET /api/meta` — { origins:[{name, hebrew, count, done_count}], errtypes:[{key, hebrew, explanation, count, pending_count}], statuses:[...], columns:[{key, hebrew, explanation}] }.
+- `GET /api/meta` — { origins:[{name, hebrew, count, done_count}], errtypes:[{key, hebrew, explanation, count, pending_count}], statuses:[...], columns:[{key, hebrew, explanation}], result_status (§9f) }.
 - `GET /api/books?origin=&q=` — books (source values) with counts + pending counts, sorted by count desc; q = substring filter.
 - `GET /api/findings?origin=&book=&errtype=&status=&verified=&min_rank=&q=&sort=rank|random|source|word&dir=&page=&page_size=` — paginated (default page_size 50, max 500). Returns rows with effective_status + total count. `q` searches word/suggestion/snippet/ref (LIKE).
 - `GET /api/finding/<id>` — full row incl. extra JSON, history entries for it.
@@ -106,7 +106,7 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);  -- import timestamps, sour
 - `GET /api/stats` — progress matrix: per origin × status counts, per errtype × status, per book (top N + filtered).
 - `POST /api/export/xlsx` — body {origin?} — export one/all origins; returns file paths + row counts.
 - `POST /api/export/fixes` — legacy `to_send/` export (see §7). Returns counts.
-- `POST /api/refresh` — re-run importer (after a new pipeline scan).
+- `POST /api/refresh` — re-run importer (after a new pipeline scan). Also returns `stale` and `result_status` (§9f); when the results it loaded are not the latest scan's, its message says so instead of reporting a completed refresh.
 - Errors: JSON {error: "<Hebrew message>"} with proper HTTP status; **all user-facing messages in Hebrew**.
 
 ## 4. Hebrew mappings (hebrew.py — the single source of truth; frontend fetches via /api/meta)
@@ -218,7 +218,7 @@ Origin (מאגר) display names: Sefaria→ספריא, DictaToOtzaria→דיקט
 ## 11. Module interface contracts (for parallel build)
 
 - `xlsx.write_workbook(path, sheets)` — pure, no DB access. `sheets` = list of dicts: `{"name": str, "headers": [str], "rows": iterable of lists (str|int|float|None)}`. Always: rightToLeft views, bold frozen header row, inline strings, XML-escaping + illegal-char stripping, streaming write. Raises `PermissionError` (with path in message) if the target is locked; caller turns that into the Hebrew error.
-- `db.py` public functions (server imports these): `import_all(outdir) -> dict counts`, `connect(outdir)`, `get_meta(con)`, `get_books(con, origin, q)`, `query_findings(con, filters, sort, page, page_size) -> (rows, total)`, `get_finding(con, id)`, `set_status(con, outdir, ids, status, note, custom_suggestion, scope) -> counts` (writes history + decisions.db sync), `undo(con, outdir)`, `get_history(con, limit)`, `get_stats(con)`, `get_fixlist(con, book, origin, statuses)`.
+- `db.py` public functions (server imports these): `import_all(outdir) -> dict counts`, `connect(outdir)`, `get_meta(con, outdir=None)` (with `outdir`: + `result_status`, §9f), `get_books(con, origin, q)`, `query_findings(con, filters, sort, page, page_size) -> (rows, total)`, `get_finding(con, id)`, `set_status(con, outdir, ids, status, note, custom_suggestion, scope) -> counts` (writes history + decisions.db sync), `undo(con, outdir)`, `get_history(con, limit)`, `get_stats(con)`, `get_fixlist(con, book, origin, statuses)`.
 - `export.py`: `export_xlsx(con, outdir, origin=None) -> [paths]`, `export_fixes(con, outdir) -> dict counts`.
 
 ## 9b. Scan lifecycle — not bound to one scan or to past decisions (user note #7)
@@ -336,6 +336,50 @@ Cost: seconds (measured: 2s for a 336-line book, 47s for a 22k-line one).
 99.6% of flagged words reproduced; the remainder are `missing_space` splits
 whose only evidence is corpus-scale. The book scan also surfaced correct
 findings the full scan missed.
+
+## 9f. Result status — never show an older scan's results as the latest
+
+**Problem.** A stage that fails never replaces its last good output, so after
+a failed, partial, cancelled or killed scan `report.db` still holds the
+previous run's results — complete and readable. The UI imported them on
+refresh, answered "הרענון הושלם", and the only sign of the failure was a toast
+that was gone after ten seconds or a server restart.
+
+- **Run record** — `magiah/runstate.py`, in `<out>/run_state/`: `scan.json`
+  for pipeline runs (CLI commands and UI scans), `book.json` for single-book
+  scans. Written atomically when a run starts, finalized when it ends
+  (`done` / `failed` / `partial` / `cancelled`); the run holds an OS file
+  lock (`<slot>.lock`) for its lifetime, so a `running` record whose lock is
+  free reads as `interrupted` (killed, crashed, power cut). For each stage of
+  the chain lexicon → detect → locate the record keeps the run that last
+  attempted or planned it; the results are stale while any of them was not
+  completed by its run. A `calibrate`- or `report`-only run cannot clear
+  that, and a failed `report` (CSV export) does not cause it.
+- **UI scans:** the scanner owns the run and its lock and passes the run id to
+  each stage subprocess (`MAGIAH_RUN_ID`); a stage that fails records its
+  reason in that run (the scanner only sees an exit code). A second pipeline
+  run on the same folder (e.g. a CLI scan while the UI scans) is refused.
+- **Single-book scans** have their own record and never touch the scan
+  record: they do not write the pipeline's outputs, and their merge is one
+  transaction, so a failed one leaves every finding as it was. It can neither
+  raise nor clear the full scan's warning; it gets its own, lower-level
+  notice, cleared by the next successful book scan.
+- **API:** `webui/result_status.py` builds `result_status = {stale,
+  results_at, notices:[{kind, level, stale, title, text, hint, details,
+  action, action_label}]}` for `/api/meta` and `/api/refresh`. Notices come
+  from a tuple of providers: `scan_incomplete` (error; from the run record,
+  or — for folders without one — from the coverage files the CLI already
+  refuses, `core.coverage_problem`), `refresh_needed` (info: `report.db` is
+  newer than the one imported, recorded as `meta.report_mtime`),
+  `book_scan_incomplete` (warning). A further warning about the results is
+  one more provider. Hebrew texts: `hebrew.RESULT_STATUS`.
+- **Frontend:** `#resultBanner`, above the view tabs in every view: one block
+  per notice (title, text, "מה לעשות", collapsible full reason, an action
+  button). Not dismissible; re-read on every `/api/meta` load and when a scan
+  ends. A refresh that loaded stale results shows a warning toast, not "ok".
+- **Older folders** (no `run_state/`, a `ui_review.db` without
+  `report_mtime`) behave as before: no notice unless their coverage files
+  record a partial read.
 
 ## 10. Non-goals
 

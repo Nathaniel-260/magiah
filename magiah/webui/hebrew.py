@@ -786,9 +786,8 @@ RESULT_STATUS = {
                  'תיעלם כשסריקת ספר בודד תסתיים בהצלחה.',
     # -- buttons and other wording --------------------------------------------
     'action_scan': 'ניהול סריקה',
+    'action_book_scan': 'סריקת ספר בודד',
     'action_refresh': 'רענון הממצאים',
-    'details': 'פרטים',
-    'hint': 'מה לעשות:',
     # /api/refresh when the results it loaded are not the latest scan's
     'refresh_stale': 'הממצאים נטענו מחדש, אבל הם מהסריקה הקודמת שהושלמה — '
                      'הסריקה האחרונה לא הושלמה (הפרטים בהודעה שבראש '

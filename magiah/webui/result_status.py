@@ -13,12 +13,13 @@ reload, and it disappears by itself once a scan succeeds.
     {'stale': bool,          # the results are not from the latest scan
      'results_at': str|None, # when the results shown were produced
      'notices': [{'kind', 'level', 'stale', 'title', 'text', 'hint',
-                  'details', 'action'}, ...]}
+                  'details', 'action', 'action_label'}, ...]}
 
 `level` is error / warning / info; `hint` says what to do (or None);
 `details` is the full reason (or None);
-`action` names the button the banner offers — 'scan' (open the scan panel),
-'refresh' (reload the findings) or None. Every notice comes from one provider
+`action` names the button the banner offers — 'scan' / 'book_scan' (open
+that part of the scan panel), 'refresh' (reload the findings) or None — and
+`action_label` is its text. Every notice comes from one provider
 in :data:`PROVIDERS`; another kind of warning about the results is one more
 provider, and the banner shows it with no further change.
 """
@@ -82,7 +83,8 @@ def _imported_mtime(con, outdir):
 def _notice(kind, level, title, text, hint=None, details=None, action=None,
             stale=False):
     return {'kind': kind, 'level': level, 'stale': stale, 'title': title,
-            'text': text, 'hint': hint, 'details': details, 'action': action}
+            'text': text, 'hint': hint, 'details': details, 'action': action,
+            'action_label': T[f'action_{action}'] if action else None}
 
 
 def _stage_he(stage):
@@ -153,11 +155,14 @@ def book_notice(con, outdir, ctx):
     p = runstate.book_problem(outdir)
     if not p:
         return None
+    # isolated: a book key is often a path, which the surrounding
+    # right-to-left text would otherwise scramble
     what = T['book_what'][p['state']].format(
-        book=p['title'] or p['key'], started=_minute(p['started_at']))
+        book='\u2068' + (p['title'] or p['key']) + '\u2069',
+        started=_minute(p['started_at']))
     return _notice('book_scan_incomplete', 'warning', T['book_title'],
                    what + ' ' + T['book_after'], T['book_todo'], p['reason'],
-                   'scan')
+                   'book_scan')
 
 
 PROVIDERS = (stale_notice, refresh_notice, book_notice)
