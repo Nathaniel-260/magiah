@@ -952,7 +952,8 @@ def locate(spec, cfg, out_dir):
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
     con = sqlite3.connect(tmp_path)
-    con.executescript('''
+    try:
+        con.executescript('''
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
         CREATE TABLE occurrences(word TEXT, unit TEXT, doc TEXT, ctx_hits INT,
@@ -964,42 +965,63 @@ def locate(spec, cfg, out_dir):
                                     snippet TEXT, evidence TEXT);
         CREATE TABLE tanach_errors(unit TEXT, word TEXT, canonical TEXT,
                                    snippet TEXT, evidence TEXT);
-    ''')
-    con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
-                    [(w, *v) for w, v in flagged.items()])
-    rows = []
-    for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
-        fr = flagged[w]
-        hits = 0
-        if fr[1].startswith('edit1') or fr[1] == 'spelling_variant':
-            sugg = fr[2]
-            hits = (ctx_counts.get((prev, sugg), 0)
-                    + ctx_counts.get((sugg, nxt), 0))
-        local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
-        tan, tsugg = tan_info[j] if tan_info else (0, '')
-        rows.append((w, uid, doc, hits, local,
-                     1 if w in repeat_words else 0, tan, tsugg, snip))
-    con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)', rows)
-    # OCR-profile findings: word-level entry + occurrence rows
-    for w, fw, sugg, fs, uid, doc, snip in all_ocr:
-        if w not in flagged:
-            con.execute('INSERT OR IGNORE INTO errors VALUES(?,?,?,?,?,?)',
-                        (w, fw, 'ocr_profile', sugg, fs,
-                         2 + math.log10(fs / max(fw, 1))))
-            con.execute('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)',
-                        (w, uid, doc, 0, 0, 0, 0, '', snip))
-    if all_ocr:
-        print(f'[locate] ocr-profile findings: {len(all_ocr):,}', flush=True)
-    con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?,?)',
-                    tanach_matches)
-    con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?,?)',
-                    tanach_errors_rows)
-    tanach.write_evidence(con, tanach_evidence)
-    con.executemany('INSERT INTO space_errors VALUES(?,?,?,?,?,?)', all_joins)
-    con.commit()
-    corpus.enrich(con)
-    con.close()
-    os.replace(tmp_path, db_path)
+        ''')
+        con.executemany('INSERT OR REPLACE INTO errors VALUES(?,?,?,?,?,?)',
+                        [(w, *v) for w, v in flagged.items()])
+        rows = []
+        for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
+            fr = flagged[w]
+            hits = 0
+            if fr[1].startswith('edit1') or fr[1] == 'spelling_variant':
+                sugg = fr[2]
+                hits = (ctx_counts.get((prev, sugg), 0)
+                        + ctx_counts.get((sugg, nxt), 0))
+            local = (local_counts.get((doc, fr[2]), 0)
+                     if fr[1] in LOCAL_TYPES else 0)
+            tan, tsugg = tan_info[j] if tan_info else (0, '')
+            rows.append((w, uid, doc, hits, local,
+                         1 if w in repeat_words else 0, tan, tsugg, snip))
+        con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)',
+                        rows)
+        # OCR-profile findings: word-level entry + occurrence rows
+        for w, fw, sugg, fs, uid, doc, snip in all_ocr:
+            if w not in flagged:
+                con.execute('INSERT OR IGNORE INTO errors '
+                            'VALUES(?,?,?,?,?,?)',
+                            (w, fw, 'ocr_profile', sugg, fs,
+                             2 + math.log10(fs / max(fw, 1))))
+                con.execute('INSERT INTO occurrences '
+                            'VALUES(?,?,?,?,?,?,?,?,?)',
+                            (w, uid, doc, 0, 0, 0, 0, '', snip))
+        if all_ocr:
+            print(f'[locate] ocr-profile findings: {len(all_ocr):,}',
+                  flush=True)
+        con.executemany('INSERT INTO tanach_matches VALUES(?,?,?,?,?)',
+                        tanach_matches)
+        con.executemany('INSERT INTO tanach_errors VALUES(?,?,?,?,?)',
+                        tanach_errors_rows)
+        tanach.write_evidence(con, tanach_evidence)
+        con.executemany('INSERT INTO space_errors VALUES(?,?,?,?,?,?)',
+                        all_joins)
+        con.commit()
+        corpus.enrich(con)
+        con.close()
+        try:
+            os.replace(tmp_path, db_path)
+        except PermissionError as e:
+            # Windows: report.db is held open (the review UI, a DB viewer);
+            # the last good report.db stays exactly as it was
+            raise StageError(
+                f'לא ניתן לעדכן את {db_path}: הקובץ פתוח בתוכנה אחרת '
+                '(למשל ממשק הסקירה). הקובץ הקודם נשאר כמות שהוא. '
+                'יש לסגור את התוכנה ולהריץ שוב את שלב "מיקום".') from e
+    except BaseException:
+        con.close()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     _write_coverage(out_dir, 'locate', lstats, passes=passes)
     print(f'[locate] occurrences={len(rows):,}  space_errors={len(all_joins):,}'
           f'  time={time.time()-t0:.0f}s -> {db_path}', flush=True)

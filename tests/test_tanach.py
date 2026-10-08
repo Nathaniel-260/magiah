@@ -661,6 +661,72 @@ class BibleBookShareTest(unittest.TestCase):
                 self.assertEqual(self._books(total * 9 // 10 - 1, total), [])
 
 
+class ReportWriteFailureTest(_DBCase):
+    """A failed report.db write leaves the last good report.db and no
+    report.db.tmp behind; a report.db held open is a Hebrew StageError."""
+
+    def setUp(self):
+        super().setUp()
+        self.out = os.path.join(self.dir, 'out')
+        os.makedirs(self.out)
+        lex = {w: 1000 for w in _fixture_words()}
+        for w in FLAGGED:
+            lex[w] = 1
+        with open(os.path.join(self.out, core.LEXICON_F), 'wb') as f:
+            pickle.dump(lex, f)
+        with open(os.path.join(self.out, core.FLAGGED_F), 'wb') as f:
+            pickle.dump({w: (1, et, s, 1000, 3.0)
+                         for w, (et, s) in FLAGGED.items()}, f)
+        self._run()
+        self.report = os.path.join(self.out, core.REPORT_DB_F)
+        with open(self.report, 'rb') as f:
+            self.before = f.read()
+
+    def _run(self):
+        spec = {'type': 'sqlite', 'path': self.db, 'table': 'line',
+                'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+        core.locate(spec, Config(workers=1, n_chunks=2), self.out)
+
+    def _assert_untouched(self):
+        with open(self.report, 'rb') as f:
+            self.assertEqual(f.read(), self.before)
+        self.assertFalse(os.path.exists(self.report + '.tmp'))
+
+    def test_failed_write_removes_tmp(self):
+        from unittest import mock
+        with mock.patch.object(core.tanach, 'write_evidence',
+                               side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self._run()
+        self._assert_untouched()
+
+    def test_report_in_use_is_a_hebrew_stage_error(self):
+        from unittest import mock
+        real = os.replace
+
+        def replace(src, dst):
+            if os.path.basename(dst) == core.REPORT_DB_F:
+                raise PermissionError(13, 'in use', dst)
+            return real(src, dst)
+        with mock.patch.object(core.os, 'replace', side_effect=replace):
+            with self.assertRaises(core.StageError) as cm:
+                self._run()
+        self.assertNotIsInstance(cm.exception, core.PartialRead)
+        self.assertIn('פתוח בתוכנה אחרת', str(cm.exception))
+        self._assert_untouched()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file locking')
+    def test_report_open_elsewhere_on_windows(self):
+        holder = sqlite3.connect(self.report)
+        try:
+            holder.execute('SELECT COUNT(*) FROM errors').fetchone()
+            with self.assertRaises(core.StageError):
+                self._run()
+        finally:
+            holder.close()
+        self._assert_untouched()
+
+
 class PartialTanachReadTest(_DBCase):
     """A Tanach index built from a partial read never feeds report.db."""
 
