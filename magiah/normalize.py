@@ -37,12 +37,28 @@ for _cp in range(0xFB1D, 0xFB50):
 _STRIP[0x00A0] = ' '
 _STRIP[0x05F3] = "'"                     # geresh
 _STRIP[0x05F4] = '"'                     # gershayim
+# Yiddish ligatures (װ ױ ײ) are single code points outside [א-ת]; spelled out
+# so a word like צװײ stays one token instead of breaking at the ligature.
+_STRIP[0x05F0] = 'וו'
+_STRIP[0x05F1] = 'וי'
+_STRIP[0x05F2] = 'יי'
+
+# Combining marks that belong to the letter before them (nikud, teamim, the
+# Judeo-Arabic dots, CGJ). Maqaf, paseq, sof pasuq and nun hafukha are in the
+# same block but separate words, so they are not marks.
+MARKS = frozenset(chr(c) for c in range(0x0591, 0x05C8)
+                  if c not in (0x05BE, 0x05C0, 0x05C3, 0x05C6)) \
+    | frozenset((chr(0x0307), chr(0x0323), chr(0x034F)))
+_JOINERS = frozenset((chr(0x200C), chr(0x200D)))      # ZWNJ, ZWJ
 
 # Inline formatting tags are removed with no space so they never split a word
 # (e.g. an enlarged first letter: <big>ב</big>ראשית). Structural tags become
 # a space so adjacent blocks never merge into one word.
-INLINE_TAG_RE = re.compile(r'</?(?:b|i|u|em|strong|big|small|font)(?:\s[^>]*)?>',
-                           re.IGNORECASE)
+# `span` is inline: it only styles, so ה<span>ע</span>ולם is one word. `sup`
+# is NOT: it carries footnote letters that would glue onto the next word.
+INLINE_TAG_RE = re.compile(
+    r'</?(?:b|i|u|em|strong|big|small|font|span)(?:\s[^>]*)?>',
+    re.IGNORECASE)
 TAG_RE = re.compile(r'<[^>]*>')
 TOKEN_RE = re.compile(r'[א-ת]+(?:["\'][א-ת]+)*')
 
@@ -209,12 +225,81 @@ def token_spans(text):
     along with the word, which is correct for a whole-word correction — and
     callers that would rather not touch markup can detect it by looking for
     '<' inside the returned slice.
+
+    The span also swallows the combining marks after the last letter (the
+    dagesh in ``אמרוּ``): they emit nothing in the clean text, so without this
+    a replacement would leave them orphaned on the following character.
     """
+    return [s[:3] for s in token_spans_full(text)[1]]
+
+
+def mark_end(text, j):
+    """Index past the marks that follow ``text[j-1]`` (joiners only between
+    marks, never trailing).
+
+    A mark still belongs to the letter when it is written as an entity
+    (``אמרו&#1468;``) or sits behind inline formatting tags, which clean()
+    drops without a space (``<b>אמרו</b>ּ``). The span takes those along:
+    left outside it, the mark would end up on the replacement's last letter.
+    (The fixer then refuses a span holding a tag, and asks for a vocalized
+    correction for one holding a mark.)
+    """
+    n, k = len(text), j
+    while k < n:
+        ch = text[k]
+        if ch in MARKS or ch in _JOINERS:
+            k += 1
+            if ch in MARKS:
+                j = k
+        elif ch == '&':
+            m = _ENTITY_RE.match(text, k)
+            dec = html.unescape(m.group()) if m else ''
+            if not m or dec == m.group() or not all(
+                    c in MARKS or c in _JOINERS for c in dec):
+                break
+            k = m.end()
+            if any(c in MARKS for c in dec):
+                j = k
+        elif ch == '<':
+            m = INLINE_TAG_RE.match(text, k)
+            if not m:
+                break
+            k = m.end()            # taken only if a mark follows it
+        else:
+            break
+    return j
+
+
+def token_spans_full(text):
+    """``(clean_text, [(token, raw_start, raw_end, clean_start, clean_end)])``
+    — :func:`token_spans` plus each token's position in the CLEAN text, which
+    is the coordinate system the scanner's snippets were cut in."""
     clean_text, omap, emap = clean_mapped(text)
     spans = []
     for m in TOKEN_RE.finditer(clean_text):
-        spans.append((m.group(), omap[m.start()], emap[m.end() - 1]))
-    return spans
+        spans.append((m.group(), omap[m.start()],
+                      mark_end(text, emap[m.end() - 1]),
+                      m.start(), m.end()))
+    return clean_text, spans
+
+
+def is_mark(ch):
+    return ch in MARKS
+
+
+def has_marks(text):
+    """True when `text` carries nikud/teamim, as marks (also written as
+    entities, ``&#1468;``) or presentation forms (U+FB1D-FB4E, except the
+    wide letters FB20-FB29 that carry none)."""
+    if '&' in text:
+        text = html.unescape(text)
+    for ch in text:
+        if ch in MARKS:
+            return True
+        cp = ord(ch)
+        if 0xFB1D <= cp <= 0xFB4E and not 0xFB20 <= cp <= 0xFB29:
+            return True
+    return False
 
 
 def phrase_spans(text, phrase):

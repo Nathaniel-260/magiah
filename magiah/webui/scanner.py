@@ -433,7 +433,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
             raise _Cancelled()
         with _lock:
             _state['book']['title'] = result.get('title')
-        counts = uidb.import_book_scan(outdir, result)
+        counts = uidb.merge_book_scan(outdir, result)
         merged = True
         emit(f"===== [book] נוספו {counts['added']:,} ממצאים, "
              f"הוחלפו {counts['replaced']:,}, "

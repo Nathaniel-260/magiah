@@ -63,6 +63,7 @@ import time
 from datetime import datetime
 
 from . import hebrew
+from ..corpus_hybrid import DEFAULT_LIBRARY
 # one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
 from ..textsource import sqlite_uri as _uri
 
@@ -71,6 +72,8 @@ REPORT_DB_F = 'report.db'
 DECISIONS_F = 'decisions.db'
 TOKDIAG_GLOB = '*tokdiag_source_he.csv'
 BACKUP_DIR = 'backups'
+# meta key: the library root (and scan time) of the report import_all imported
+IMPORT_SOURCE_KEY = 'import_source'
 
 # --- copied VERBATIM from magiah/core.py (keep in sync) --------------------
 RANK_SQL = '''score
@@ -340,6 +343,43 @@ def _clear_dropped_decisions(con, outdir, keys):
     return len(gone)
 
 
+def config_root_for_report(outdir):
+    """The configured library (run_config.json), standing in as the root of
+    a report.db that does not name its own (one written before scan_meta).
+
+    None when run_config.json was rewritten after report.db: a later scan
+    has been started since, so the setting may describe that scan instead.
+    """
+    from . import scanner
+    rc = os.path.join(outdir, scanner.RUN_CONFIG)
+    rep = os.path.join(outdir, REPORT_DB_F)
+    try:
+        if os.path.isfile(rc) and os.path.isfile(rep) \
+                and os.path.getmtime(rc) > os.path.getmtime(rep):
+            return None
+    except OSError:
+        return None
+    try:
+        lib = scanner.scan_config(outdir)['corpus'].get('library_dir')
+    except Exception:                       # config unreadable -> the default
+        lib = None
+    return os.path.abspath(lib or DEFAULT_LIBRARY)
+
+
+def _report_source(cur, outdir):
+    """The identity of the report.db attached as ``rep``: the library root
+    its scan read and when it was written, from its own scan_meta table."""
+    if cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                   "AND name='scan_meta'").fetchone():
+        meta = dict(cur.execute('SELECT key, value FROM rep.scan_meta'))
+        return {'root': meta.get('library_root') or None,
+                'scanned_at': meta.get('scanned_at') or None,
+                'basis': 'scan_meta'}
+    root = config_root_for_report(outdir)
+    return {'root': root, 'scanned_at': None,
+            'basis': 'run_config' if root else 'unknown'}
+
+
 def import_all(outdir, migrate_legacy=False):
     """(Re)build the findings table from report.db + the tokdiag CSV.
 
@@ -606,6 +646,13 @@ def import_all(outdir, migrate_legacy=False):
                     (_now(),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
+        # which library these rows were scanned from, committed with the rows
+        # themselves: the fixer reads it from here and never infers it from
+        # timestamps (a book-scan merge also moves last_import)
+        cur.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (IMPORT_SOURCE_KEY,
+                     json.dumps(_report_source(cur, outdir),
+                                ensure_ascii=False)))
         cur.execute('DROP TABLE imp')
         cur.execute('DROP TABLE imp2')
         cur.execute('DROP TABLE oldmap')
@@ -1425,29 +1472,27 @@ def get_fixer_items(con, key, statuses=None, origin=None):
 
     Rows are matched by the file part of `unit` (see the module note above),
     so two books sharing a filename never share a worklist.
+
+    Occurrence numbers are assigned over EVERY finding of the file, whatever
+    its status or origin, and only then is the list filtered. The writer
+    (fixer_api.apply) numbers them that way, and the page must agree with it:
+    numbered among the shown statuses only, a repeated word whose sibling is
+    'not_error' looked "count changed" on the page while apply accepted it.
     """
     from . import patcher
     if not statuses:
         statuses = ['approved']
     if isinstance(statuses, str):
         statuses = [s for s in statuses.split(',') if s]
-    sph = ','.join('?' * len(statuses))
-    params = list(statuses)
-    where = ''
-    if origin:
-        where = ' AND f.origin = ?'
-        params.append(origin)
     # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
     # each row by parsing its unit — LIKE alone could match a longer path
-    params.append(key + ':%')
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion
         FROM findings f {JOINS}
-        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
-          AND f.unit LIKE ?
+        WHERE f.unit LIKE ?
         ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
-        params).fetchall()
+        (key + ':%',)).fetchall()
     items = []
     for r in rows:
         d = _rowdict(r)
@@ -1460,7 +1505,9 @@ def get_fixer_items(con, key, statuses=None, origin=None):
         d['correction'] = d.get('custom_suggestion') or d.get('suggestion') or ''
         items.append(d)
     patcher.assign_occurrences(items)
-    return items
+    keep = set(statuses) | {'fixed'}
+    return [d for d in items if d['effective_status'] in keep
+            and (not origin or d.get('origin') == origin)]
 
 
 def get_fixer_mode(con, key, default='replace'):
@@ -1478,16 +1525,169 @@ def set_fixer_mode(con, key, mode):
     return mode
 
 
+# Fixer additions, applied lazily so existing databases upgrade in place:
+# file_edits gains journal_id (ties a row to its write-journal intent, which
+# makes recovery idempotent), backup_sha and source_root; fixer_sources holds
+# the library root each scan was made against ('report' or 'doc:<doc>') and,
+# for book scans, the fingerprint of the bytes the scan read (file_sha and
+# file_size, taken when the file was read — not when the result was merged).
+_FILE_EDIT_COLS = ('journal_id', 'backup_sha', 'source_root')
+_SOURCE_COLS = (('file_sha', 'TEXT'), ('file_size', 'INTEGER'))
+
+
+def _ensure_fixer_schema(con):
+    have = {r[1] for r in con.execute('PRAGMA table_info(file_edits)')}
+    missing = [c for c in _FILE_EDIT_COLS if c not in have]
+    src = {r[1] for r in con.execute('PRAGMA table_info(fixer_sources)')}
+    if not missing and all(c in src for c, _t in _SOURCE_COLS):
+        return
+    for col in missing:
+        try:
+            con.execute(f'ALTER TABLE file_edits ADD COLUMN {col} TEXT')
+        except sqlite3.OperationalError:
+            pass                       # another connection added it first
+    con.execute('''CREATE TABLE IF NOT EXISTS fixer_sources(
+        scope TEXT PRIMARY KEY, root TEXT NOT NULL, stamp TEXT,
+        recorded_at TEXT NOT NULL, file_sha TEXT, file_size INTEGER)''')
+    for col, typ in _SOURCE_COLS:
+        if src and col not in src:
+            try:
+                con.execute(f'ALTER TABLE fixer_sources ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
+    con.commit()
+
+
 def record_file_edit(con, path, book_key, backup, mode, finding_ids, detail,
-                     fp_before, fp_after):
+                     fp_before, fp_after, journal_id=None, backup_sha=None,
+                     source_root=None):
+    _ensure_fixer_schema(con)
     cur = con.execute(
         'INSERT INTO file_edits(ts, path, book_key, backup, mode, '
-        'finding_ids, detail, fp_before, fp_after, undone_at) '
-        'VALUES(?,?,?,?,?,?,?,?,?,NULL)',
+        'finding_ids, detail, fp_before, fp_after, undone_at, journal_id, '
+        'backup_sha, source_root) '
+        'VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?)',
         (_now(), path, book_key, backup, mode,
-         json.dumps(finding_ids), detail, fp_before, fp_after))
+         json.dumps(finding_ids), detail, fp_before, fp_after, journal_id,
+         backup_sha, source_root))
     con.commit()
     return cur.lastrowid
+
+
+def find_file_edit_by_journal(con, journal_id):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT id FROM file_edits WHERE journal_id = ?',
+                      (journal_id,)).fetchone()
+    return row[0] if row else None
+
+
+def get_live_edit_entries(con, key):
+    """``{finding_id: detail entry}`` of the newest live edit per finding."""
+    out = {}
+    for row in con.execute('SELECT detail FROM file_edits WHERE book_key = ? '
+                           'AND undone_at IS NULL ORDER BY id', (key,)):
+        try:
+            entries = json.loads(row[0])
+        except (ValueError, TypeError):
+            continue
+        for e in entries:
+            if isinstance(e, dict) and e.get('id') is not None:
+                out[e['id']] = e
+    return out
+
+
+def record_source_root(con, scope, root, stamp=None, file_sha=None,
+                       file_size=None):
+    _ensure_fixer_schema(con)
+    con.execute('INSERT OR REPLACE INTO fixer_sources(scope, root, stamp, '
+                'recorded_at, file_sha, file_size) VALUES(?,?,?,?,?,?)',
+                (scope, os.path.abspath(root) if root else '', stamp, _now(),
+                 file_sha, file_size))
+    con.commit()
+
+
+def get_source_root(con, scope):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT root, stamp, file_sha, file_size '
+                      'FROM fixer_sources WHERE scope = ?',
+                      (scope,)).fetchone()
+    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2],
+             'file_size': row[3]} if row else None)
+
+
+def advance_scan_file_sha(con, scope, old, new, new_size):
+    """The fixer's own write moved the file from `old` to `new` without
+    moving any line, so line numbers recorded at scan time stay valid.
+
+    Only a fingerprint taken when the scan READ the file (it has a size) is
+    carried forward; one recorded at merge time proves nothing to carry."""
+    _ensure_fixer_schema(con)
+    con.execute('UPDATE fixer_sources SET file_sha = ?, file_size = ? '
+                'WHERE scope = ? AND file_sha = ? AND file_size IS NOT NULL',
+                (new, new_size, scope, old))
+    con.commit()
+
+
+def get_import_source(con):
+    """What import_all recorded about the report it imported —
+    ``{'root', 'scanned_at', 'basis'}`` — or None for an import made by an
+    older version, which recorded nothing. A book-scan merge never changes
+    it: those rows carry their own source (``fixer_sources``)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (IMPORT_SOURCE_KEY,)).fetchone()
+    try:
+        src = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    return src if isinstance(src, dict) else None
+
+
+def full_import_stamp(con):
+    """A value that changes with every full import (import_all writes
+    import_counts; a book-scan merge does not), so a root pinned to an old
+    import can tell it is stale. NOT last_import: book-scan merges move it."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'import_counts'"
+                      ).fetchone()
+    return (row[0] if row else None) or ''
+
+
+def record_book_scan_source(outdir, result):
+    """Pin the library root a single-book scan read, under 'doc:<doc>',
+    with the fingerprint of the bytes the scan read.
+
+    The scan's library comes from the request, not from run_config.json, so
+    without this the fixer could only guess which folder the rows describe.
+    The fingerprint is the scan's own (``file_sha`` / ``file_size`` of the
+    result), never a hash of the file taken now: a book edited while it was
+    being scanned would then look unchanged, and its rows would skip the
+    identity checks that tell a line from its parallel twin.
+    """
+    if result.get('kind') not in ('library', 'file') \
+            or not result.get('doc') or not result.get('path'):
+        return None
+    root = None
+    if result['kind'] == 'library':
+        root = os.path.abspath(result['path'])
+        for _part in str(result['doc']).split('/'):
+            root = os.path.dirname(root)
+    sha, size = result.get('file_sha'), result.get('file_size')
+    if not sha or size is None:
+        sha = size = None              # an unproven read is never "unchanged"
+    con = connect(outdir)
+    try:
+        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha,
+                           file_size=size)
+    finally:
+        con.close()
+    return root
+
+
+def merge_book_scan(outdir, result):
+    """Merge a single-book scan and record where it came from — the one
+    path both the web UI and the CLI use, so neither can forget the root."""
+    counts = import_book_scan(outdir, result)
+    record_book_scan_source(outdir, result)
+    return counts
 
 
 def get_file_edits(con, key=None, limit=50, include_undone=True):
@@ -1527,6 +1727,10 @@ def get_file_edit(con, edit_id):
         d['finding_ids'] = json.loads(d['finding_ids'])
     except (ValueError, TypeError):
         d['finding_ids'] = []
+    try:
+        d['detail'] = json.loads(d['detail'])
+    except (ValueError, TypeError):
+        d['detail'] = []
     return d
 
 

@@ -595,6 +595,9 @@ def scan_book(out_dir, source, key, cfg=None, db_path=None, library_dir=None,
     return {
         'doc': book.doc, 'title': book.title, 'origin': book.origin,
         'kind': book.kind, 'path': book.path, 'lines': len(book),
+        # the bytes the rows above were read from (context verification can
+        # run for minutes; the file may change meanwhile)
+        'file_sha': book.file_sha, 'file_size': book.file_size,
         'ctx_scope': ctx_scope,
         'findings': rows, 'space_errors': space_rows,
         'seconds': round(time.time() - t0, 1),

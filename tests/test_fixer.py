@@ -53,6 +53,42 @@ def text_of(path):
         return f.read()
 
 
+def scan_snippet(line, word, k=0):
+    """The snippet as the scanner stores it: a +-45 char window of the CLEANED
+    line around the k-th occurrence (the whole line if there is none)."""
+    text = normalize.clean(line)
+    want = word.split()
+    toks = list(normalize.TOKEN_RE.finditer(text))
+    hits = [(toks[i].start(), toks[i + len(want) - 1].end())
+            for i in range(len(toks) - len(want) + 1)
+            if [m.group() for m in toks[i:i + len(want)]] == want]
+    if not 0 <= k < len(hits):
+        return text.strip()
+    s, e = hits[k]
+    return text[max(0, s - 45):e + 45].strip()
+
+
+def write_doc(doc, outdir):
+    """Test helper: the fixer's two write steps, backup first and then an
+    atomic replace, without the lock and journal fixer_api wraps them in
+    (tested in test_anchor_write). Production code has no such shortcut."""
+    with open(doc.path, 'rb') as f:
+        before = f.read()
+    backup, sha = patcher.write_backup(outdir, doc.path, before)
+    return {'backup': backup, 'backup_sha': sha,
+            'fingerprint': patcher.atomic_write(doc.path, doc.encode())}
+
+
+def plan_all(doc, findings, *a, **kw):
+    """patcher.plan_all with the scan-time snippet every real finding has."""
+    for f in findings:
+        n = f.get('lineno', -1)
+        if 'snippet' not in f and 0 <= n < len(doc.lines):
+            f['snippet'] = scan_snippet(doc.lines[n], f['word'],
+                                        f.get('occurrence') or 0)
+    return patcher.plan_all(doc, findings, *a, **kw)
+
+
 class TempCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='magiah_test_')
@@ -208,9 +244,9 @@ class TestPlanAndApply(TempCase):
     def test_only_the_span_changes(self):
         line = 'ויל<big>ך</big> משֶה אל יֹותבת־העיר וישב'
         doc = self.doc(line)
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'יותבת',
-                   'correction': 'יושבת'}])
+                   'correction': 'יֹושבת'}])
         self.assertEqual(failures, [])
         p = plans[0]
         self.assertEqual(line[p.start:p.end], 'יֹותבת')
@@ -223,7 +259,7 @@ class TestPlanAndApply(TempCase):
 
     def test_bracket_mode_exact_output(self):
         doc = self.doc('אל יָם הגדול')
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'ים', 'correction': 'ימה'}],
             default_mode=patcher.MODE_BRACKET)
         self.assertEqual(failures, [])
@@ -235,7 +271,7 @@ class TestPlanAndApply(TempCase):
     def test_bracket_keeps_the_original_nikud(self):
         # the DB's `word` is normalized; writing it back would strip vowels
         doc = self.doc('אל יָם הגדול')
-        plans, _ = patcher.plan_all(
+        plans, _ = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'ים', 'correction': 'ימה'}],
             default_mode=patcher.MODE_BRACKET)
         self.assertIn('יָם', plans[0].new_text)
@@ -249,7 +285,7 @@ class TestPlanAndApply(TempCase):
             {'id': 3, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
              'occurrence': 1, 'expected_count': 2}]
         doc = self.doc(line)
-        plans, failures = patcher.plan_all(doc, findings)
+        plans, failures = plan_all(doc, findings)
         self.assertEqual(failures, [])
         patcher.apply_edits(doc, plans)
         self.assertEqual(doc.lines[0],
@@ -270,7 +306,7 @@ class TestPlanAndApply(TempCase):
         for order in (findings, list(reversed(findings)),
                       [findings[1], findings[2], findings[0]]):
             doc = self.doc(line)
-            plans, _ = patcher.plan_all(doc, order)
+            plans, _ = plan_all(doc, order)
             patcher.apply_edits(doc, plans)
             results.append(doc.lines[0])
         self.assertEqual(len(set(results)), 1, results)
@@ -284,7 +320,7 @@ class TestPlanAndApply(TempCase):
         for mode in (patcher.MODE_REPLACE, patcher.MODE_BRACKET):
             with self.subTest(mode=mode):
                 doc = self.doc('ויל<big>ך</big> משה אל העיר')
-                _plans, failures = patcher.plan_all(
+                _plans, failures = plan_all(
                     doc, [{'id': 1, 'lineno': 0, 'word': 'וילך',
                            'correction': 'וילכו'}], default_mode=mode)
                 self.assertEqual([f['code'] for f in failures],
@@ -294,7 +330,7 @@ class TestPlanAndApply(TempCase):
         """The refusal is about the word, not the line: a normal word sharing
         a line with markup must still be correctable, tags intact."""
         doc = self.doc('ויל<big>ך</big> משה אל העיר')
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'משה',
                    'correction': 'מושה'}])
         self.assertEqual(failures, [])
@@ -306,7 +342,7 @@ class TestPlanAndApply(TempCase):
         so a line carrying three of them is the case where left-to-right
         application would drift furthest off."""
         doc = self.doc('אמר יותבת וגם מחורז ועוד יותבת בסוף')
-        plans, failures = patcher.plan_all(doc, [
+        plans, failures = plan_all(doc, [
             {'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
              'occurrence': 0, 'expected_count': 2},
             {'id': 2, 'lineno': 0, 'word': 'מחורז', 'correction': 'מחוז'},
@@ -323,7 +359,7 @@ class TestPlanAndApply(TempCase):
         """A per-book default with a per-finding override: one correction in
         brackets, the rest replaced outright, in a single write."""
         doc = self.doc('אמר יותבת וגם מחורז ועוד יותבת בסוף')
-        plans, failures = patcher.plan_all(doc, [
+        plans, failures = plan_all(doc, [
             {'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
              'occurrence': 0, 'expected_count': 2},
             {'id': 2, 'lineno': 0, 'word': 'מחורז', 'correction': 'מחוז'},
@@ -338,7 +374,7 @@ class TestPlanAndApply(TempCase):
 
     def test_extra_space_multi_token(self):
         doc = self.doc('והנה הבת ל קוחה מבית אביה')
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'ל קוחה',
                    'correction': 'לקוחה'}])
         self.assertEqual(failures, [])
@@ -347,7 +383,7 @@ class TestPlanAndApply(TempCase):
 
     def test_missing_space_one_token_to_two_words(self):
         doc = self.doc('אמר להם ולאדירה היא')
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'ולאדירה',
                    'correction': 'ולא דירה'}])
         self.assertEqual(failures, [])
@@ -358,7 +394,7 @@ class TestPlanAndApply(TempCase):
 
     def _code(self, findings, text='אמר רבי יותבת בן זומא'):
         doc = self.doc(text)
-        _plans, failures = patcher.plan_all(doc, findings)
+        _plans, failures = plan_all(doc, findings)
         return failures[0]['code'] if failures else None
 
     def test_token_not_found(self):
@@ -399,13 +435,14 @@ class TestPlanAndApply(TempCase):
         """
         self.assertEqual(self._code(
             [{'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'יושבת',
-              'occurrence': 1, 'expected_count': 2}],
+              'occurrence': 1, 'expected_count': 2,
+              'snippet': 'אמר יותבת וגם יותבת שוב'}],
             'אמר יושבת וגם יותבת שוב'), 'occurrence_count_changed')
 
     def test_findings_without_a_count_still_apply(self):
         """Older rows carry no expected_count; they must not become unusable."""
         doc = self.doc('אמר רבי יותבת בן זומא')
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'יותבת',
                    'correction': 'יושבת'}])
         self.assertEqual(failures, [])
@@ -413,7 +450,7 @@ class TestPlanAndApply(TempCase):
 
     def test_overlapping_edits(self):
         doc = self.doc('אמר יותבת שלום')
-        _plans, failures = patcher.plan_all(doc, [
+        _plans, failures = plan_all(doc, [
             {'id': 1, 'lineno': 0, 'word': 'יותבת', 'correction': 'א'},
             {'id': 2, 'lineno': 0, 'word': 'יותבת', 'correction': 'ב'}])
         self.assertTrue(any(f['code'] == 'overlapping_edits'
@@ -423,7 +460,9 @@ class TestPlanAndApply(TempCase):
         doc = self.doc('אמר רבי יותבת בן זומא')
         with self.assertRaises(patcher.PatchError) as cm:
             patcher.plan_edit(doc, {'id': 1, 'lineno': 0, 'word': 'יותבת',
-                                    'correction': 'x'}, explicit=(0, 3))
+                                    'correction': 'x',
+                                    'snippet': 'אמר רבי יותבת בן זומא'},
+                                    explicit=(0, 3))
         self.assertEqual(cm.exception.code, 'token_not_found')
 
     def test_db_unit_is_refused(self):
@@ -484,7 +523,7 @@ class TestDriftedLines(TempCase):
             patcher.plan_edit(d, {
                 'id': 1, 'lineno': 1, 'word': 'יותבת',
                 'correction': 'יושבת', 'snippet': 'אמר רבי יותבת בן זומא'})
-        self.assertEqual(cm.exception.code, 'token_not_found')
+        self.assertEqual(cm.exception.code, 'ambiguous_line')
 
     def test_refuses_without_a_snippet_to_corroborate(self):
         """With no snippet there is nothing to confirm the line with, so the
@@ -585,11 +624,11 @@ class TestWriteAndRestore(TempCase):
 
     def _apply(self):
         doc = patcher.read_doc(self.path)
-        plans, _ = patcher.plan_all(
+        plans, _ = plan_all(
             doc, [{'id': 1, 'lineno': 0, 'word': 'יותבת',
                    'correction': 'יושבת'}])
         patcher.apply_edits(doc, plans)
-        return patcher.write_doc(doc, self.outdir)
+        return write_doc(doc, self.outdir)
 
     def test_backup_holds_the_original(self):
         res = self._apply()
@@ -605,22 +644,12 @@ class TestWriteAndRestore(TempCase):
         leftovers = [x for x in os.listdir(self.lib) if x.endswith('.tmp')]
         self.assertEqual(leftovers, [])
 
-    def test_restore_brings_back_the_original(self):
+    def test_backup_restores_the_original_bytes(self):
         res = self._apply()
-        patcher.restore_backup(self.outdir, res['backup'], self.path,
-                               res['fingerprint'])
+        data = patcher.read_backup(self.outdir, res['backup'],
+                                   res['backup_sha'])
+        patcher.atomic_write(self.path, data)
         self.assertEqual(raw(self.path), self.orig.encode('utf-8'))
-
-    def test_restore_refuses_after_a_manual_edit(self):
-        """Restoring would silently destroy work the corrector did by hand in
-        another editor, so a changed file refuses instead."""
-        res = self._apply()
-        with open(self.path, 'a', encoding='utf-8') as f:
-            f.write('עריכה ידנית\n')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.restore_backup(self.outdir, res['backup'], self.path,
-                                   res['fingerprint'])
-        self.assertEqual(cm.exception.code, 'file_changed_since_edit')
 
     def test_backup_name_separates_same_named_books(self):
         other = write(os.path.join(self.lib, 'sub', 'ספר.txt'), 'טקסט')
@@ -630,12 +659,10 @@ class TestWriteAndRestore(TempCase):
 
     def test_fingerprint_detects_change(self):
         fp = patcher.fingerprint(self.path)
-        patcher.check_fingerprint(self.path, fp)          # no raise
+        self.assertEqual(patcher.fingerprint(self.path), fp)
         with open(self.path, 'a', encoding='utf-8') as f:
             f.write('x')
-        with self.assertRaises(patcher.PatchError) as cm:
-            patcher.check_fingerprint(self.path, fp)
-        self.assertEqual(cm.exception.code, 'file_changed')
+        self.assertNotEqual(patcher.fingerprint(self.path), fp)
 
 
 # ---------------------------------------------------------------------------
@@ -669,12 +696,12 @@ class TestNeverTouchesAnotherBook(TempCase):
         self.assertEqual(os.path.abspath(abspath),
                          os.path.abspath(self.paths[1]))
         doc = patcher.read_doc(abspath)
-        plans, failures = patcher.plan_all(
+        plans, failures = plan_all(
             doc, [{'id': 1, 'lineno': lineno, 'word': 'יותבת',
                    'correction': 'יושבת'}])
         self.assertEqual(failures, [])
         patcher.apply_edits(doc, plans)
-        patcher.write_doc(doc, self.outdir)
+        write_doc(doc, self.outdir)
 
         after = [raw(p) for p in self.paths]
         self.assertEqual(after[0], before[0], 'ספר ראשון was modified!')
@@ -704,12 +731,14 @@ class TestApi(TempCase):
         sql = ('INSERT INTO findings(id, family, errtype, word, suggestion, '
                'rank, verified, origin, source, ref, unit, doc, snippet) '
                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        lines = self.text.splitlines()
         for fid, word, sugg, unit in (
                 (1, 'יותבת', 'יושבת', 'file:ספר שני/פרק א.txt:1'),
                 (2, 'יותבת', 'יושבת', 'file:ספר ראשון/פרק א.txt:1'),
                 (3, 'מחורז', 'מחוז', 'file:ספר שני/פרק א.txt:2')):
+            snip = scan_snippet(lines[int(unit.rsplit(':', 1)[1])], word)
             con.execute(sql, (fid, 'error', 'edit1_sub', word, sugg, 5.0, 1,
-                              'testOrigin', 'פרק א', 'ref', unit, None, ''))
+                              'testOrigin', 'פרק א', 'ref', unit, None, snip))
         con.executemany(
             "INSERT INTO review VALUES(?,'approved',NULL,NULL,'t')",
             [(1,), (2,), (3,)])
@@ -809,7 +838,8 @@ class TestApi(TempCase):
             'rank, verified, origin, source, ref, unit, doc, snippet) '
             'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (4, 'error', 'edit1_sub', 'יותבת', 'יושבת', 5.0, 1, 'o',
-             'מנוקד', 'r', 'file:ספר ראשון/מנוקד.txt:0', None, ''))
+             'מנוקד', 'r', 'file:ספר ראשון/מנוקד.txt:0', None,
+             scan_snippet('<sup>1</sup> וְיֶהֱמוּ אל יֹותבת־העיר', 'יותבת')))
         con.execute("INSERT INTO review VALUES(4,'approved',NULL,NULL,'t')")
         con.commit()
         con.close()
@@ -836,6 +866,47 @@ class TestApi(TempCase):
                                {'edit_id': res['edit_id']})
         self.assertEqual(code, 200, res2)
         self.assertEqual(raw(self.paths[1]), before)
+
+    def test_a_locked_or_read_only_book_is_refused_in_hebrew(self):
+        """os.replace onto a read-only or locked book fails with
+        "[WinError 5] Access is denied: '<temp>' -> '<book>'"; the user is
+        told, in Hebrew, which book and why, and nothing is written."""
+        key = 'file:ספר שני/פרק א.txt'
+        _c, doc = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
+        before = raw(self.paths[1])
+        real = patcher.os.replace
+
+        def denied(src, dst):
+            raise PermissionError(13, 'Access is denied', src, None, dst)
+        patcher.os.replace = denied
+        try:
+            code, res = self.call('/api/fixer/apply', {
+                'key': key, 'fingerprint': doc['fingerprint'],
+                'items': [{'id': 1}]})
+        finally:
+            patcher.os.replace = real
+        self.assertEqual(code, 423, res)
+        self.assertEqual(res['code'], 'access_denied')
+        self.assertIn(self.paths[1], res['error'])
+        self.assertNotIn('Access is denied', res['error'])
+        self.assertNotIn('.tmp', res['error'])
+        self.assertEqual(raw(self.paths[1]), before)
+
+    def test_any_permission_error_is_reported_in_hebrew(self):
+        from magiah.webui import fixer_api
+        real = fixer_api.doc
+
+        def denied(*a, **kw):
+            raise PermissionError(13, 'Access is denied', r'C:\x\book.txt')
+        fixer_api.doc = denied
+        try:
+            code, res = self.call('/api/fixer/doc?key=' +
+                                  urllib.request.quote('file:x.txt'))
+        finally:
+            fixer_api.doc = real
+        self.assertEqual(code, 423, res)
+        self.assertIn(r'C:\x\book.txt', res['error'])
+        self.assertNotIn('Access is denied', res['error'])
 
     def test_mode_is_remembered_per_book(self):
         key = 'file:ספר שני/פרק א.txt'
