@@ -975,8 +975,10 @@ function renderDrawer(r, history) {
   if (typeof extra === "string" && extra) { try { extra = JSON.parse(extra); } catch (e) { extra = null; } }
   if (extra && typeof extra === "object") {
     for (const [k, v] of Object.entries(extra)) {
-      if (k === "alternatives" && Array.isArray(v)) {
-        dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
+      if (k === "alternatives") {
+        // null: the evidence names no alternative to the detector's suggestion
+        if (Array.isArray(v) && v.length)
+          dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
         continue;
       }
       const txt = (v && typeof v === "object") ? JSON.stringify(v)
