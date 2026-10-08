@@ -1115,7 +1115,8 @@ def _findings_where(filters):
         sts = filters['status']
         if isinstance(sts, str):
             sts = [s for s in sts.split(',') if s]
-        where.append(f'{EFF} IN (%s)' % ','.join('?' * len(sts)))
+        # not %-formatting: EFF itself holds a LIKE '%...%' pattern
+        where.append(f"{EFF} IN ({','.join('?' * len(sts))})")
         params.extend(sts)
     if filters.get('verified') not in (None, '', '0'):
         where.append('f.verified = 1')
