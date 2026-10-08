@@ -444,6 +444,14 @@ def _identify(line, word, snippet):
     return occs, [], None
 
 
+def _copies(text, word):
+    """How many times `word` (one token or several) occurs in `text`."""
+    want = word.split()
+    toks = normalize.tokenize(text or '')
+    return sum(1 for i in range(len(toks) - len(want) + 1)
+               if toks[i:i + len(want)] == want)
+
+
 def _clean_of(doc, n):
     c = doc._clean.get(n)
     if c is None:
@@ -760,8 +768,15 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             finding.get('trusted', False))
         line = doc.lines[lineno]
         total = len(spans)
-        if level == LEVEL_WINDOW and len(ident) == 1:
-            # the window pins the occurrence, whatever else changed
+        if level == LEVEL_WINDOW and len(ident) == 1 \
+                and _copies(finding.get('snippet'), word) == 1:
+            # The window pins the occurrence, whatever else changed — when
+            # the window holds this one copy only. A window holding several
+            # copies can equal the snippet around ANOTHER of them once the
+            # line shifts: on a short line every window is clipped at the
+            # line's ends, so a word typed at the start makes the last
+            # copy's window equal the old whole line. Then the scan's order
+            # must decide, with proof (_scanned_copy).
             occurrence, confidence = ident[0], 'exact'
         elif total == 1 and finding.get('expected_count') in (None, 1):
             # the one copy, on a line identified by its words: as scanned

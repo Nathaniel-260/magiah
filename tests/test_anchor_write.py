@@ -479,6 +479,30 @@ class TestLineIdentity(TempCase):
         line = d.lines[0]
         self.assertEqual(plan.start, line.rindex('שלם'))
 
+    def test_a_clipped_window_never_pins_another_copy(self):
+        """A short line with the word three times: every scan window is the
+        whole line. A word typed at the start makes the LAST copy's window
+        (clipped 45 characters back) equal that old line, so each finding
+        used to pin the last copy as 'exact'."""
+        w = 'לשמיס'
+        scanned = 'האומר והלכה רבו ולכן %s האומר %s צריך %s לפני' % (w, w, w)
+        now = 'והלכה ' + scanned
+        d = self.doc(now + '\n')
+        copies = [s[1] for s in normalize.token_spans(now) if s[0] == w]
+        for k in range(3):
+            with self.subTest(copy=k):
+                f = finding(scanned, w, 'לשמים', k=k, occurrence=k,
+                            expected_count=3)
+                if k < 2:
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, f)
+                    self.assertEqual(cm.exception.code,
+                                     'ambiguous_occurrence')
+                else:
+                    plan = patcher.plan_edit(d, f)
+                    self.assertEqual((plan.start, plan.confidence),
+                                     (copies[2], 'indexed'))
+
     def test_repeated_word_on_a_short_line_uses_the_original_order(self):
         line = 'שלם אמר שלם'
         f = finding(line, 'שלם', 'שלום', occurrence=1, expected_count=2)
@@ -1322,8 +1346,8 @@ class TestRepeatedWordNeedsProof(Env):
         import pickle
         from collections import Counter
         from magiah import book_scan, core
-        words = set(normalize.tokenize(
-            self.THREE + ' ' + self.TWO + ' פתיחה סוף הקובץ ' + self.FIX))
+        words = set(normalize.tokenize(' '.join(
+            (self.THREE, self.TWO, line, 'פתיחה סוף הקובץ', self.FIX))))
         freq = Counter({w: 10 ** 6 for w in words})
         freq[self.W] = 2
         with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
@@ -1403,6 +1427,28 @@ class TestRepeatedWordNeedsProof(Env):
 
     def test_separate_batches_still_apply_three_copies(self):
         self._one_batch_each(self.THREE, (1, 2, 0))
+
+    def test_a_word_typed_at_the_start_of_a_short_line(self):
+        """Window clipping, end to end: the last copy sits 45 characters in,
+        so once a word is typed at the start its window equals the old whole
+        line — the snippet of EVERY copy. Copy 0's finding was written onto
+        the last copy as 'exact'; main got this right."""
+        w, fix = 'כעבר', 'כעבד'
+        scanned = 'האומר והלכה רבו ולכן {w} האומר {w} צריך צר {w} לפני'
+        self.assertEqual(scanned.format(w=w).rindex(w), 45)
+        self.W, self.FIX = w, fix
+        ids = self.scan(scanned)
+        self.assertEqual(len(ids), 3)
+        self.by_hand('והלכה ' + scanned.format(w=w))
+        d = self.open_doc(self.key)
+        ok = {i['id']: i['anchor'].get('ok') for i in d['items']}
+        self.assertEqual([ok[i] for i in ids], [False, False, True])
+        for fid in ids[:2]:
+            self.refused(fid)
+        res, code = self.apply(self.key, [{'id': ids[2]}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.line(), 'והלכה ' + scanned.format(w=w)[:45]
+                         + fix + ' לפני')
 
 
 class TestManualPickNeedsIdentity(Env):
