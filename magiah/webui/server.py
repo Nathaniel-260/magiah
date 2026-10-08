@@ -140,6 +140,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        # an empty cursor means "first keyset page", not "no cursor"
+        if 'cursor' in urllib.parse.parse_qs(url.query,
+                                             keep_blank_values=True):
+            q.setdefault('cursor', '')
         path = url.path
         try:
             if not path.startswith('/api/'):
@@ -204,8 +208,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'books': books, 'rows': books, 'total': len(books)})
         elif path == '/api/findings':
             filters = {k: q.get(k) for k in
-                       ('origin', 'book', 'errtype', 'status', 'verified',
-                        'min_rank', 'q')}
+                       ('origin', 'book', 'book_key', 'errtype', 'status',
+                        'verified', 'min_rank', 'q')}
+            if 'cursor' in q:
+                # keyset paging (card queue): stable under status changes
+                rows, total, nxt = db.query_findings_page(
+                    con, filters, sort=q.get('sort', 'rank'),
+                    direction=q.get('dir', ''),
+                    page_size=q.get('page_size', 50),
+                    cursor=q.get('cursor'), seed=q.get('seed'),
+                    with_total=q.get('total') == '1')
+                self._json({'rows': rows, 'total': total,
+                            'next_cursor': nxt})
+                return
             rows, total = db.query_findings(
                 con, filters, sort=q.get('sort', 'rank'),
                 direction=q.get('dir', ''), page=q.get('page', 1),
@@ -230,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(db.get_stats(con))
         elif path == '/api/fixlist':
             self._json(db.get_fixlist(con, q.get('book'), q.get('origin'),
-                                      q.get('statuses')))
+                                      q.get('statuses'), q.get('book_key')))
         elif path == '/api/backups':
             self._json({'backups': db.list_backups(self.outdir)})
         elif path == '/api/fixer/books':
@@ -314,11 +329,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_post(self, path, body, con):
         if path == '/api/status':
-            res = db.set_status(
-                con, self.outdir, body.get('ids') or [],
-                body.get('status', ''), body.get('note'),
-                body.get('custom_suggestion'),
-                body.get('scope', 'occurrence'))
+            # a request is a human decision unless it declares otherwise
+            actor = 'agent' if body.get('actor') == 'agent' else 'human'
+            try:
+                res = db.set_status(
+                    con, self.outdir, body.get('ids') or [],
+                    body.get('status', ''), body.get('note'),
+                    body.get('custom_suggestion'),
+                    body.get('scope', 'occurrence'), decided_by=actor,
+                    expect_status=body.get('expect_status'))
+            except db.StatusConflict as e:
+                self._json({'error': str(e), 'code': 'status_conflict',
+                            'current': e.current}, 409)
+                return
             self._json({'ok': True, **res})
         elif path == '/api/undo':
             res = db.undo(con, self.outdir)

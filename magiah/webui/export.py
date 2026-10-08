@@ -7,15 +7,38 @@ sourced from the findings table directly, so book/ref/origin/snippet are
 never lost to a failed join (fix for defect §8.1).
 """
 import csv
+import json
 import os
 import re
 from datetime import datetime
 
 from . import hebrew
-from .db import EFF, JOINS, UNIT_ORDER
+from .db import EFF, EXT_JOIN, JOINS, UNIT_ORDER, WORD_DECIDER
 
+# the first 8 columns are the old byte format; consumers reading by name or
+# by position keep working, the decision's provenance is appended
 FIXES_HEADER = ['word', 'suggestion', 'errtype', 'book', 'ref', 'line_id',
-                'origin', 'snippet']
+                'origin', 'snippet', 'approved_suggestion', 'decided_by']
+OCC_HEADER = ['word', 'suggestion', 'unit', 'doc', 'source', 'ref', 'origin',
+              'scope', 'decided_by']
+REPL_HEADER = ['word', 'suggestion', 'decided_by', 'updated_at']
+CONV_HEADER = ['word', 'doc', 'source', 'decided_by', 'updated_at']
+# files this exporter wrote last time; only these may ever be removed
+MANIFEST_F = '.magiah_export_manifest.json'
+
+# who made the decision behind a finding's effective status: '' while it is
+# pending, 'unknown' for decisions recorded before this was tracked
+DECIDER = f'''CASE
+    WHEN r.status IS NOT NULL THEN COALESCE(x.decided_by, 'unknown')
+    WHEN rb.status IS NOT NULL THEN COALESCE(rb.decided_by, 'unknown')
+    WHEN rr.status IS NOT NULL THEN COALESCE(rr.decided_by, 'unknown')
+    WHEN w.status IS NOT NULL THEN COALESCE({WORD_DECIDER}, 'unknown')
+    ELSE '' END'''
+# what an approved finding is corrected to: the user's own correction, else
+# the suggestion as it was when approved (a re-scan may have changed it)
+APPROVED_FIX = ("COALESCE(NULLIF(r.custom_suggestion, ''), "
+                "x.approved_suggestion, f.suggestion, '')")
+ACTOR_HEBREW = {'human': 'אדם', 'agent': 'סוכן', 'unknown': 'לא ידוע'}
 
 # Excel sheet names: max 31 chars, no : \ / ? * [ ]
 _SHEET_BAD = re.compile(r'[:\\/?*\[\]]')
@@ -37,62 +60,146 @@ def _sheet_name(name, used):
 # §7B — legacy to_send/ export
 # ---------------------------------------------------------------------------
 
+def _read_manifest(send_dir):
+    try:
+        with open(os.path.join(send_dir, MANIFEST_F), encoding='utf-8') as f:
+            names = json.load(f)
+        return {n for n in names if isinstance(n, str)}
+    except (OSError, ValueError):
+        return set()
+
+
+def _own_old_file(path):
+    """A per-origin file from before the manifest existed: ours only when
+    its header row is exactly the one this exporter writes."""
+    try:
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            head = next(csv.reader(f), None)
+    except (OSError, UnicodeDecodeError):
+        return False
+    return head in (FIXES_HEADER, FIXES_HEADER[:8])
+
+
 def export_fixes(con, outdir):
-    """Write to_send/approved_fixes_all.csv + approved_fixes_<origin>.csv
-    (+ rejected_words.txt), old byte format, from the findings table.
+    """Write to_send/: approved_fixes_all.csv + approved_fixes_<origin>.csv
+    (old 8 columns + approved_suggestion, decided_by) and the rejections,
+    each in its own scope:
+
+    * rejected_words.txt — global exclusions only (word rules 'not_error');
+    * rejected_occurrences.csv — single occurrences marked not an error;
+    * rejected_replacements.csv — rejected (word -> suggestion) pairs;
+    * book_conventions.csv — words that are correct in one book.
 
     Fixes = findings whose effective status is approved or fixed; a user
-    custom_suggestion wins over the automatic suggestion. Rejected words =
-    word_rules 'not_error' + words of per-occurrence not_error findings.
+    custom_suggestion wins over the automatic suggestion. A per-origin file
+    this exporter wrote earlier but that now has no rows is removed (tracked
+    in a manifest, so files the user put in to_send/ are never touched).
     """
     send_dir = os.path.join(outdir, 'to_send')
     os.makedirs(send_dir, exist_ok=True)
     fixes = con.execute(f'''
-        SELECT f.word, COALESCE(NULLIF(r.custom_suggestion, ''),
-                                f.suggestion, '') AS suggestion,
+        SELECT f.word, {APPROVED_FIX} AS suggestion,
                COALESCE(f.errtype, ''), COALESCE(f.source, ''),
                COALESCE(f.ref, ''), COALESCE(f.unit, ''),
-               COALESCE(f.origin, ''), COALESCE(f.snippet, '')
-        FROM findings f {JOINS}
+               COALESCE(f.origin, ''), COALESCE(f.snippet, ''),
+               {APPROVED_FIX},
+               {DECIDER}
+        FROM findings f {JOINS} {EXT_JOIN}
         WHERE {EFF} IN ('approved', 'fixed')
         ORDER BY COALESCE(f.origin, ''), f.source,
                  ''' + UNIT_ORDER.format(u='f.unit') + '''
         ''').fetchall()
-    locked = []
+    # every file this export is responsible for, written or not (a file
+    # locked in Excel is still ours and must stay in the manifest)
+    locked, written = [], set()
 
-    def _write(path, rows):
+    def _write(name, header, rows):
+        path = os.path.join(send_dir, name)
+        written.add(name)
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 wr = csv.writer(f)
-                wr.writerow(FIXES_HEADER)
+                wr.writerow(header)
                 wr.writerows(rows)
         except PermissionError:
             locked.append(path)
 
-    _write(os.path.join(send_dir, 'approved_fixes_all.csv'), fixes)
+    _write('approved_fixes_all.csv', FIXES_HEADER, fixes)
     by_origin = {}
     for row in fixes:
         by_origin.setdefault(row[6] or 'Unknown', []).append(row)
     for org, rows in by_origin.items():
         safe = re.sub(r'[^\w.\-]+', '_', org)
-        _write(os.path.join(send_dir, f'approved_fixes_{safe}.csv'), rows)
+        _write(f'approved_fixes_{safe}.csv', FIXES_HEADER, rows)
 
-    rejected = sorted({r[0] for r in con.execute(
-        "SELECT word FROM word_rules WHERE status = 'not_error'")} |
-        {r[0] for r in con.execute('''
-            SELECT f.word FROM findings f
-            JOIN review v ON v.finding_id = f.id
-            WHERE v.status = 'not_error' AND f.word IS NOT NULL''')})
+    rejected = sorted(r[0] for r in con.execute(
+        "SELECT word FROM word_rules WHERE status = 'not_error'"))
     p2 = os.path.join(send_dir, 'rejected_words.txt')
+    written.add('rejected_words.txt')
     try:
         with open(p2, 'w', encoding='utf-8') as f:
             f.write('\n'.join(rejected))
     except PermissionError:
         locked.append(p2)
+    occ = con.execute(f'''
+        SELECT f.word, COALESCE(f.suggestion, ''), COALESCE(f.unit, ''),
+               COALESCE(f.doc, ''), COALESCE(f.source, ''),
+               COALESCE(f.ref, ''), COALESCE(f.origin, ''),
+               COALESCE(x.scope, 'occurrence'),
+               COALESCE(x.decided_by, 'unknown')
+        FROM findings f JOIN review r ON r.finding_id = f.id {EXT_JOIN}
+        WHERE r.status = 'not_error' AND f.word IS NOT NULL
+          AND COALESCE(x.scope, 'occurrence') = 'occurrence'
+        ORDER BY f.source, f.word, f.id''').fetchall()
+    _write('rejected_occurrences.csv', OCC_HEADER, occ)
+    repl = con.execute('''
+        SELECT word, suggestion, COALESCE(decided_by, 'unknown'), updated_at
+        FROM replacement_rules WHERE status = 'not_error'
+        ORDER BY word, suggestion''').fetchall()
+    _write('rejected_replacements.csv', REPL_HEADER, repl)
+    conv = con.execute('''
+        SELECT b.word, b.doc,
+               COALESCE((SELECT f.source FROM findings f
+                         WHERE f.doc = b.doc LIMIT 1),
+                        CASE WHEN b.doc LIKE 'src:%'
+                             THEN substr(b.doc, 5) ELSE '' END),
+               COALESCE(b.decided_by, 'unknown'), b.updated_at
+        FROM book_rules b WHERE b.status = 'not_error'
+        ORDER BY b.doc, b.word''').fetchall()
+    _write('book_conventions.csv', CONV_HEADER, conv)
+
+    # files we generated before that no longer have rows go away, so an
+    # undone fix never lingers in a stale per-origin file
+    if os.path.exists(os.path.join(send_dir, MANIFEST_F)):
+        previous = _read_manifest(send_dir)
+    else:
+        # first export since the manifest exists: our earlier per-origin
+        # files are recognised by name pattern and our own header row
+        previous = {n for n in os.listdir(send_dir)
+                    if n.startswith('approved_fixes_') and n.endswith('.csv')
+                    and _own_old_file(os.path.join(send_dir, n))}
+    for name in sorted(previous - written):
+        path = os.path.join(send_dir, name)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            locked.append(path)
+            written.add(name)          # still ours: retry on the next export
+    try:
+        with open(os.path.join(send_dir, MANIFEST_F), 'w',
+                  encoding='utf-8') as f:
+            json.dump(sorted(written), f, ensure_ascii=False)
+    except OSError:
+        pass
     if locked:
         raise PermissionError(hebrew.MESSAGES['file_locked'] +
                               ', '.join(locked))
     return {'fixes': len(fixes), 'rejected': len(rejected),
+            'rejected_occurrences': len(occ),
+            'rejected_replacements': len(repl),
+            'book_conventions': len(conv),
             'origins': sorted(by_origin), 'dir': send_dir}
 
 
@@ -102,13 +209,14 @@ def export_fixes(con, outdir):
 
 MAIN_HEADERS = ['ספר', 'מראה מקום', 'סוג שגיאה', 'המילה במקור',
                 'הצעת תיקון', 'ציון', 'מאומת', 'סטטוס', 'הערה',
-                'קטע מהטקסט', 'מזהה שורה']
+                'קטע מהטקסט', 'מזהה שורה', 'הוחלט ע״י']
 
 _ROW_SQL = f'''
     SELECT f.source, f.ref, f.errtype, f.word,
-           COALESCE(NULLIF(r.custom_suggestion, ''), f.suggestion),
-           f.rank, f.verified, {EFF}, r.note, f.snippet, f.unit
-    FROM findings f {JOINS}
+           {APPROVED_FIX},
+           f.rank, f.verified, {EFF}, r.note, f.snippet, f.unit,
+           {DECIDER}
+    FROM findings f {JOINS} {EXT_JOIN}
     WHERE f.origin = ?'''
 
 
@@ -120,7 +228,8 @@ def _fmt_row(r, with_errtype=True):
             r[5] if r[5] is not None else '',
             'כן' if r[6] else '',
             hebrew.status_hebrew(r[7]),
-            r[8] or '', r[9] or '', r[10] or '']
+            r[8] or '', r[9] or '', r[10] or '',
+            ACTOR_HEBREW.get(r[11], r[11] or '')]
     return out
 
 

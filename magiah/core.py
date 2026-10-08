@@ -762,6 +762,27 @@ def calibrate(cfg, out_dir):
           f'{n_pairs} systematic pairs -> {ppath}', flush=True)
 
 
+def load_review_rejections(out_dir):
+    """Words rejected in review with GLOBAL scope (decisions.db unit '*').
+
+    A rejection of one occurrence, of one suggested replacement or of a
+    book's own spelling is not a statement about the word elsewhere, so it
+    must never become a corpus-wide whitelist entry.
+    """
+    dec_path = os.path.join(out_dir, 'decisions.db')
+    if not os.path.exists(dec_path):
+        return set()
+    dcon = sqlite3.connect(dec_path, timeout=30.0)
+    try:
+        return {r[0] for r in dcon.execute(
+            "SELECT DISTINCT word FROM decisions "
+            "WHERE verdict='reject' AND unit='*'")}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        dcon.close()
+
+
 def detect(spec, cfg, out_dir):
     t0 = time.time()
     with open(_require(out_dir, LEXICON_F, 'איתור',
@@ -780,20 +801,12 @@ def detect(spec, cfg, out_dir):
     if whitelist:
         print(f'[detect] whitelist: {len(whitelist):,} words', flush=True)
 
-    # words the user rejected in the review interface are never flagged again
-    dec_path = os.path.join(out_dir, 'decisions.db')
-    if os.path.exists(dec_path):
-        dcon = sqlite3.connect(dec_path)
-        try:
-            rejected = {r[0] for r in dcon.execute(
-                "SELECT DISTINCT word FROM decisions WHERE verdict='reject'")}
-        except sqlite3.OperationalError:
-            rejected = set()
-        dcon.close()
-        if rejected:
-            whitelist |= rejected
-            print(f'[detect] review rejections honored: {len(rejected):,} '
-                  f'words', flush=True)
+    # words the user rejected EVERYWHERE in review are never flagged again
+    rejected = load_review_rejections(out_dir)
+    if rejected:
+        whitelist |= rejected
+        print(f'[detect] review rejections honored: {len(rejected):,} '
+              f'words', flush=True)
 
     # substitution weights learned by `magiah calibrate` (if it was run)
     learned = {}

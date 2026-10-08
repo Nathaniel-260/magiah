@@ -727,6 +727,34 @@ class LegacyTest(unittest.TestCase):
         finally:
             self.dir = base
 
+    def test_undo_of_an_earlier_step_does_not_reapprove_a_dropped_row(self):
+        """Undo restores the whole previous decision; when that decision is
+        an approval a refresh dropped afterwards (legacy_recheck), the row
+        comes back pending, and decisions.db gets no 'accept' again."""
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        con = uidb.connect(self.dir)
+        # approved -> approved with a note: a real step whose previous state
+        # is the approval
+        uidb.set_status(con, self.dir, [1], 'approved', note='נבדק')
+        con.close()
+        uidb.import_all(self.dir)
+        self.assertIsNone(self._ui_state()[0]['פרץ'])
+        con = uidb.connect(self.dir)
+        res = uidb.undo(con, self.dir)
+        con.close()
+        self.assertEqual([(e['word'], e['restored']) for e in res['entries']],
+                         [('פרץ', 'pending')])
+        self.assertTrue(res['entries'][0]['legacy_recheck'])
+        st, dec, _n, _ = self._ui_state()
+        self.assertIsNone(st['פרץ'])
+        self.assertNotIn(('פרץ', '7'), dec)
+        entries = self._undo_all()
+        self.assertNotIn('approved', [e['restored'] for e in entries])
+        st, dec, _n, _ = self._ui_state()
+        self.assertEqual(set(st.values()), {None})
+        self.assertEqual(dec, {})
+
     def test_import_legacy_does_not_approve_tanach_backed_rows(self):
         """An accept of the old tool (never owned by this UI) on a row backed
         by Tanach evidence comes in as 'unsure', without its suggestion."""
@@ -784,8 +812,14 @@ class LegacyTest(unittest.TestCase):
                     "ref, tanach, suggestion, source) VALUES(4, 'error', "
                     "'edit1_sub', 'קפץ', '10', 'ר', 2, 'קפה', 'ספר')")
         con.commit()
-        # "everywhere" decisions taken on the old evidence
-        uidb.set_status(con, self.dir, [1], 'approved', scope='word')
+        # "everywhere" decisions taken on the old evidence. set_status no
+        # longer makes a word-wide approval (a scoped approval is refused);
+        # one still exists in a database of an earlier version, which wrote
+        # word_rules positionally, as it wrote it there
+        uidb.set_status(con, self.dir, [1], 'approved')
+        con.execute("INSERT INTO word_rules VALUES('פרץ', 'approved', "
+                    "'2026-01-01T00:00:00')")
+        con.commit()
         uidb.set_status(con, self.dir, [4], 'not_error', scope='word')
         con.close()
         uidb.import_all(self.dir)
@@ -796,6 +830,43 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
         self.assertEqual(eff[('פרץ', '14')], 'approved')    # the word rule
         self.assertEqual(eff[('קפץ', '10')], 'not_error')   # judges the word
+
+    def test_scoped_rule_approval_does_not_reach_legacy_rows(self):
+        """A replacement-scope approval (the only approval a rule may carry
+        now) reaches the other findings of its (word, suggestion) pair, but
+        not a tanach_legacy row of the same pair; a book convention's
+        not_error still reaches it."""
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        # beside the legacy rows פרץ@7 and קפץ@10 (tanach = 2), rows of the
+        # same words in the same book that rest on no Tanach evidence
+        rep.executemany(
+            f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})',
+            [(w, 'edit1_sub', s, 2.0, 0, 0, 0, 0, 'ספר', 'ר', u, 's',
+              'Dicta', '3') for w, s, u in (('פרץ', 'פרח', '14'),
+                                            ('פרץ', 'פרח', '15'),
+                                            ('קפץ', 'קפה', '16'))])
+        rep.commit()
+        rep.close()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        ids = {(w, u): i for i, w, u in con.execute(
+            'SELECT id, word, unit FROM findings')}
+        uidb.set_status(con, self.dir, [ids[('פרץ', '14')]], 'approved',
+                        scope='replacement')
+        uidb.set_status(con, self.dir, [ids[('קפץ', '16')]], 'not_error',
+                        scope='book')
+        eff = {(w, u): s for w, u, s in con.execute(
+            f'SELECT f.word, f.unit, {uidb.EFF} FROM findings f {uidb.JOINS}')}
+        approved = {(w, u) for w, u in con.execute(
+            f'SELECT f.word, f.unit FROM findings f {uidb.JOINS} '
+            f"WHERE {uidb.EFF} IN ('approved', 'fixed')")}
+        con.close()
+        self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
+        self.assertEqual(eff[('פרץ', '14')], 'approved')    # its own row
+        self.assertEqual(eff[('פרץ', '15')], 'approved')    # the pair's rule
+        self.assertEqual(eff[('קפץ', '10')], 'not_error')   # the convention
+        self.assertEqual(approved, {('פרץ', '14'), ('פרץ', '15')})
 
     def test_status_filter_works_with_the_legacy_guard(self):
         """EFF carries a LIKE '%tanach_legacy%' pattern; the status filter
@@ -824,16 +895,24 @@ class LegacyTest(unittest.TestCase):
         from magiah.webui import db as uidb
         uidb.import_all(self.dir)
         con = uidb.connect(self.dir)
-        fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
-                          ).fetchone()[0]
         kid = con.execute("SELECT id FROM findings WHERE word = 'גשמ'"
                           ).fetchone()[0]
-        uidb.set_status(con, self.dir, [fid], 'approved', scope='word')
         uidb.set_status(con, self.dir, [kid], 'not_error', scope='word')
+        con.close()
+        # set_status no longer makes a word-wide approval; earlier versions
+        # of this UI mirrored one into decisions.db like this
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        dec.execute("INSERT INTO decisions VALUES('בייתה', '*', '', "
+                    "'accept', '', '', '')")
+        dec.commit()
+        dec.close()
+        con = uidb.connect(self.dir)
         uidb.migrate_legacy_decisions(con, self.dir)
         rules = dict(con.execute('SELECT word, status FROM word_rules'))
         con.close()
         self.assertEqual(rules, {'בייתה': 'approved', 'גשמ': 'not_error'})
+        # ...and only the global rejection feeds the detector's whitelist
+        self.assertEqual(core.load_review_rejections(self.dir), {'גשמ'})
 
 
 class BibleBookShareTest(unittest.TestCase):
