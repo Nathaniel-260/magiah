@@ -163,8 +163,13 @@ CREATE INDEX IF NOT EXISTS idx_fe_key ON file_edits(book_key);
 SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
                  'owned_decisions', 'file_edits'}
 
-# effective status: per-finding review wins, else the word rule, else pending
-EFF = "COALESCE(r.status, w.status, 'pending')"
+# effective status: per-finding review wins, else the word rule, else pending.
+# A word-wide approval does not reach a row marked tanach_legacy: such a row
+# needs its own re-check, like a dropped per-row approval (a word-wide
+# not_error / ignored judges the word itself and still applies).
+EFF = ("COALESCE(r.status, CASE WHEN w.status IN ('approved', 'fixed') AND "
+       "COALESCE(f.extra, '') LIKE '%tanach_legacy%' THEN NULL "
+       "ELSE w.status END, 'pending')")
 JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
          'LEFT JOIN word_rules w ON w.word = f.word')
 

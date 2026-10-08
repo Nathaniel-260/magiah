@@ -768,6 +768,35 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(rows['קפץ'][0], 'not_error')
         self.assertEqual((again['review'], again['recheck']), (0, 0))
 
+    def test_word_rule_approval_does_not_reach_legacy_rows(self):
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        rep.execute(f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})',
+                    ('פרץ', 'edit1_sub', 'פרח', 2.0, 0, 0, 0, 0, 'ספר', 'ר',
+                     '14', 's', 'Dicta', '3'))
+        rep.commit()
+        rep.close()
+        con = uidb.connect(self.dir)
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "ref, tanach, suggestion, source) VALUES(1, 'error', "
+                    "'edit1_sub', 'פרץ', '7', 'ר', 2, 'פרח', 'ספר')")
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "ref, tanach, suggestion, source) VALUES(4, 'error', "
+                    "'edit1_sub', 'קפץ', '10', 'ר', 2, 'קפה', 'ספר')")
+        con.commit()
+        # "everywhere" decisions taken on the old evidence
+        uidb.set_status(con, self.dir, [1], 'approved', scope='word')
+        uidb.set_status(con, self.dir, [4], 'not_error', scope='word')
+        con.close()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        eff = {(w, u): s for w, u, s in con.execute(
+            f'SELECT f.word, f.unit, {uidb.EFF} FROM findings f {uidb.JOINS}')}
+        con.close()
+        self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
+        self.assertEqual(eff[('פרץ', '14')], 'approved')    # the word rule
+        self.assertEqual(eff[('קפץ', '10')], 'not_error')   # judges the word
+
     def test_import_legacy_keeps_a_word_wide_approval_an_approval(self):
         """decisions.db mirrors a word-wide approval as (word, '*', accept);
         importing it back must not turn it into "not an error everywhere"."""
