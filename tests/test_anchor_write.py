@@ -370,6 +370,8 @@ class TestImportSource(Env):
         if len(drive) != 2:
             self.skipTest('temp dir is not on a drive letter')
         unc = '\\\\localhost\\' + drive[0] + '$' + rest
+        if not os.path.isdir(unc):
+            self.skipTest('no admin share for drive ' + drive)
         self.assertTrue(fixer_api._same_root(unc, self.lib))
         self.assertFalse(fixer_api._same_root(unc, self.libB))
         unc_book = os.path.join(unc, 'ספר', 'פרק.txt')

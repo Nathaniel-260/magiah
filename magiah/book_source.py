@@ -185,9 +185,10 @@ def _read_text_file(path, encoding='utf-8'):
             data = f.read()
     except OSError as e:
         raise BookNotFound(f'לא ניתן לקרוא את הקובץ: {path} ({e})')
-    # decoded as text mode with newline='' would: no newline translation.
-    # NOT str.splitlines(): it also breaks on U+2028 and friends, which would
-    # number lines differently from the full scan and from the patcher
+    # decoded the way text mode with newline='' decodes: no newline
+    # translation. NOT str.splitlines(): it also breaks on U+2028 and
+    # friends, which would number lines differently from the full scan and
+    # from the patcher
     return (split_lines(data.decode(encoding, errors='replace')),
             file_fingerprint(data), len(data))
 
