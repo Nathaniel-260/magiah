@@ -120,7 +120,7 @@ ERRTYPES = {
             'עיבודים של אותו מקור (למשל עם טעמים / עם ניקוד / אותיות בלבד) '
             'נספרים כמקור אחד. הבדלי קרי וכתיב והבדלי כתיב מלא/חסר אינם '
             'מדווחים. עמודת ההצעה מציגה את הנוסח המוסכם, ובפרטים מופיעים '
-            'העדים. ממצא שסומן tanach_legacy נוצר בשיטה הישנה ודורש בדיקה '
+            'העדים. ממצא שסומן "שיטה ישנה" נוצר בשיטה הישנה ודורש בדיקה '
             'מחדש.',
     },
     'tanach_match': {
@@ -402,6 +402,53 @@ FAMILIES = {
 }
 
 # ---------------------------------------------------------------------------
+# Tanach evidence (magiah.tanach): the evidence kinds and reason codes stored
+# in a finding's `extra`, and the `extra` keys themselves, as the finding
+# drawer shows them. Unknown codes are shown as-is.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_LABELS = {
+    'tanach_legacy': 'שיטה ישנה — דורש בדיקה מחדש',
+    'tanach_verse_variant': 'נוסח הפסוק זהה להצעת הגלאי',
+    'tanach_disagrees': 'נוסח הפסוק שונה מהצעת הגלאי — להכרעה ידנית',
+    'tanach_verse_match': 'המילה זהה לנוסח הפסוק',
+    'tanach_edition_variant': 'מהדורה חורגת מנוסח מוסכם',
+    'tanach_edition_unresolved': 'מחלוקת מהדורות שלא הוכרעה (לידיעה)',
+    'tanach_plene': 'הבדל כתיב מלא/חסר',
+    'tanach_qere_ketiv': 'קרי וכתיב',
+    'tanach_single_source': 'נוסח של מקור יחיד',
+    'tanach_disputed': 'המקורות הבלתי תלויים חלוקים',
+    'tanach_unrelated': 'מילה אחרת, לא שיבוש כתיב',
+    'tanach_ambiguous': 'ההקשר מתאים ליותר מפסוק אחד',
+    # reasons of an unresolved edition disagreement
+    'one_against_one': 'מקור אחד מול מקור אחד',
+    'no_majority': 'אין רוב של מקורות בלתי תלויים',
+    'intra_source': 'עיבודים של אותו מקור חלוקים ביניהם',
+    'plene': 'הבדל כתיב מלא/חסר',
+    'qere_ketiv': 'קרי וכתיב',
+    'unrelated': 'מילה אחרת, לא שיבוש כתיב',
+}
+
+EXTRA_LABELS = {
+    'evidence_kind': 'סוג הראיה',
+    'reason': 'סיבה',
+    'recheck': 'דורש בדיקה מחדש',
+    'canonical': 'הנוסח המוסכם',
+    'ref': 'מקום בתנ"ך',
+    'verse_line': 'מזהה שורת הפסוק',
+    'reading': 'נוסח הפסוק',
+    'readings': 'הגרסאות',
+    'aligned_tokens': 'מילים מיושרות',
+    'occurrences': 'מהדורות',
+    'works': 'ספרים',
+    'independent_sources': 'מקורות בלתי תלויים',
+    'witnesses': 'העדים',
+    'minority_source': 'מקור המיעוט',
+    'minority_editions': 'מהדורות המיעוט',
+    'source': 'מקור',
+}
+
+# ---------------------------------------------------------------------------
 # §9d — scan-from-UI: Hebrew label + explanation + default for every Config
 # threshold, for the pipeline stages, and for the corpus modes.
 # ---------------------------------------------------------------------------
@@ -665,6 +712,11 @@ MESSAGES = {
     'server_error': 'שגיאה פנימית בשרת',
     'legacy_decision_kept': 'החלטה ישנה נשמרה ולא נמחקה (היא לא נוצרה '
                             'בממשק זה) עבור המילה: ',
+    'decisions_locked': 'הקובץ decisions.db נעול בידי תוכנה אחרת (למשל כלי '
+                        'הסקירה הישן), ולכן טעינת הממצאים לא בוצעה ושום '
+                        'דבר לא השתנה. יש לסגור אותה ולנסות שוב.',
+    'legacy_accept_recheck': 'החלטה ישנה: אושר עם ההצעה "{sugg}", על סמך '
+                             'ראיית תנ"ך בשיטה הישנה — יש לבדוק מחדש',
     'import_done': 'הייבוא הושלם',
     'export_done': 'הייצוא הושלם',
 }

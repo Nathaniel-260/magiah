@@ -315,7 +315,8 @@ class Handler(BaseHTTPRequestHandler):
             res = db.migrate_legacy_decisions(con, self.outdir)
             self._json({'ok': True, **res,
                         'message': 'יובאו החלטות ישנות: '
-                                   f"{res['review']} ממצאים, "
+                                   f"{res['review']} ממצאים "
+                                   f"(מהם {res['recheck']} לבדיקה מחדש), "
                                    f"{res['word_rules']} כללי מילים"})
         elif path == '/api/reset':
             res = db.reset(con, self.outdir, body.get('scope', 'statuses'))

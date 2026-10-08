@@ -277,12 +277,16 @@ class HybridCorpus:
         _, lo, hi = chunk
         # the uncorrelated IN-subquery is materialized once by SQLite, so
         # non-Sefaria rows are filtered before their content is decoded
-        for uid, book_id, text in self._otzaria().iter_range(
-                lo, hi, self.stats,
-                book_ids_sql='SELECT b.id FROM book b JOIN source s '
-                             'ON s.id = b.sourceId WHERE s.name = ?',
+        sefaria = ('SELECT b.id FROM book b JOIN source s '
+                   'ON s.id = b.sourceId WHERE s.name = ?')
+        odb = self._otzaria()
+        for uid, book_id, text in odb.iter_range(
+                lo, hi, self.stats, book_ids_sql=sefaria,
                 params=(SEFARIA_SOURCE,)):
             yield str(uid), str(book_id), text
+        # same exclusion as the plain otzaria corpus, counted the same way
+        self.stats.version_lines_skipped += odb.count_version_lines(
+            lo, hi, book_ids_sql=sefaria, params=(SEFARIA_SOURCE,))
 
     # -- enrichment --------------------------------------------------------
     def enrich(self, con):
