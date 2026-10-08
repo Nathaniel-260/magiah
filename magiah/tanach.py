@@ -418,8 +418,15 @@ class TanachIndex:
 
     # -- building ------------------------------------------------------------
     @classmethod
-    def build(cls, db_path):
+    def build(cls, db_path, stats=None):
+        """Read the verified editions. Every line and version row read is
+        counted in `stats` (``idx.stats``): a row that could not be decoded,
+        or a ``line`` without its ``line_content`` row, is unread, and the
+        caller must not present an index built from a partial read as
+        complete. The database is released even when the build fails."""
         idx = cls()
+        if stats is not None:
+            idx.stats = stats
         with OtzariaDB(db_path) as odb:
             idx._build(odb)
         return idx
@@ -829,8 +836,8 @@ class TanachIndex:
         return rows, dict(st)
 
 
-def build_index(db_path):
-    return TanachIndex.build(db_path)
+def build_index(db_path, stats=None):
+    return TanachIndex.build(db_path, stats)
 
 
 # ---------------------------------------------------------------------------

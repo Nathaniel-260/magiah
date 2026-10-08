@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 """The seforim.db reader: layouts, zstd rows, versions, coverage, lines."""
+import contextlib
+import io
+import json
 import os
+import pickle
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from magiah import book_source, core
+from magiah import book_scan, book_source, cli, core, corpus as corpus_mod
 from magiah.config import Config
 from magiah.corpus import make_corpus
 from magiah.corpus_hybrid import HybridCorpus, LibraryCorpus
-from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError,
+from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
 
 try:
@@ -55,9 +60,10 @@ def _train_dict():
     return _zstd.train_dict(samples, 4096)
 
 
-def make_schema6_db(path, corrupt_id=None, plain_id=None):
+def make_schema6_db(path, corrupt_id=None, plain_id=None, missing_id=None):
     """Schema 6: text in line_content, zstd frames with a stored dict, and
-    one alternative version with its own reading."""
+    one alternative version with its own reading. `missing_id` gets a `line`
+    row but no `line_content` row."""
     zd = _train_dict()
     con = sqlite3.connect(path)
     _base_schema(con)
@@ -76,6 +82,8 @@ def make_schema6_db(path, corrupt_id=None, plain_id=None):
     for i, b, t in LINES:
         con.execute('INSERT INTO line VALUES(?,?,?,?,NULL,?)',
                     (i, b, i, f'ref {i}', len(t)))
+        if i == missing_id:
+            continue
         if i == plain_id:
             val = t                                  # stored uncompressed
         elif i == corrupt_id:
@@ -266,6 +274,424 @@ class LineSplittingTest(unittest.TestCase):
             b = book_source.load_book('library', 'MoreBooks/ב.txt',
                                       library_dir=lib)
             self.assertEqual(len(b), 1)
+
+
+BROKEN_FRAME = b'\x28\xb5\x2f\xfd' + b'\x00' * 9
+
+
+def _corrupt_row(db_path, line_id):
+    con = sqlite3.connect(db_path)
+    con.execute('UPDATE line_content SET content = ? WHERE id = ?',
+                (BROKEN_FRAME, line_id))
+    con.commit()
+    con.close()
+
+
+def _otzaria_spec(db_path):
+    return {'type': 'sqlite', 'path': db_path, 'table': 'line',
+            'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+
+
+def _read(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+def _coverage(out, stage):
+    with open(os.path.join(out, f'coverage_{stage}.json'),
+              encoding='utf-8') as f:
+        return json.load(f)
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class PartialOutputTest(unittest.TestCase):
+    """A stage that could not read its whole input must not replace its last
+    good output, and nothing downstream may consume output whose latest
+    build was partial."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+        self.out = os.path.join(self.tmp.name, 'out')
+        os.makedirs(self.out)
+        self.spec = _otzaria_spec(self.db)
+        self.cfg = Config(workers=1, n_chunks=2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_partial_lexicon_keeps_old_one_and_is_refused(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        lex_path = os.path.join(self.out, core.LEXICON_F)
+        good = _read(lex_path)
+        self.assertTrue(_coverage(self.out, 'lexicon')['complete'])
+        self.assertIsNotNone(book_scan.load_lexicon(self.out))
+
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        self.assertEqual(_read(lex_path), good)          # not replaced
+        self.assertFalse(os.path.exists(lex_path + '.tmp'))
+        self.assertFalse(_coverage(self.out, 'lexicon')['complete'])
+        # the stale lexicon is refused by every consumer
+        with self.assertRaises(book_scan.BookScanError) as cm:
+            book_scan.load_lexicon(self.out)
+        self.assertIn('מילון', str(cm.exception))
+        with self.assertRaises(core.PartialRead):
+            core.detect(self.spec, self.cfg, self.out)
+        with self.assertRaises(book_scan.BookScanError):
+            book_scan.scan_book(self.out, 'db', '2', db_path=self.db)
+
+    def test_first_partial_lexicon_writes_no_lexicon(self):
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, core.LEXICON_F)))
+
+    def test_partial_locate_keeps_old_report_and_is_refused(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        rep = os.path.join(self.out, core.REPORT_DB_F)
+        good = _read(rep)
+        core.report(self.cfg, self.out)                  # complete: accepted
+
+        _corrupt_row(self.db, 3)
+        with self.assertRaises(core.PartialRead):
+            core.locate(self.spec, self.cfg, self.out)
+        self.assertEqual(_read(rep), good)               # not replaced
+        self.assertFalse(os.path.exists(rep + '.tmp'))
+        cov = _coverage(self.out, 'locate')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['unread'], 1)
+        with self.assertRaises(core.PartialRead) as cm:
+            core.report(self.cfg, self.out)
+        self.assertIn('מיקום', str(cm.exception))
+        # calibrate only learns from the last complete report, and must not
+        # block the rescan that repairs it
+        core.calibrate(self.cfg, self.out)
+
+    def test_failed_lexicon_also_blocks_the_older_report(self):
+        # report.db is derived from the lexicon: once the latest lexicon
+        # build is partial, the report from an earlier run is refused too
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        _corrupt_row(self.db, 2)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(self.spec, self.cfg, self.out)
+        with self.assertRaises(core.PartialRead) as cm:
+            core.report(self.cfg, self.out)
+        self.assertIn('מילון', str(cm.exception))
+        # a complete rebuild clears it
+        make_schema6_db(os.path.join(self.tmp.name, 'fixed.db'))
+        os.replace(os.path.join(self.tmp.name, 'fixed.db'), self.db)
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.report(self.cfg, self.out)
+
+    def test_tanach_pass_failure_is_recorded_in_hebrew(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+
+        def broken_index(db_path, stats):
+            stats.decode_errors += 2
+            return {}
+        with mock.patch.object(core, '_build_verse_index', broken_index):
+            with self.assertRaises(core.PartialRead) as cm:
+                core.locate(self.spec, self.cfg, self.out)
+        self.assertIn('לא הצליח לקרוא 2 שורות', str(cm.exception))
+        cov = _coverage(self.out, 'locate')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['passes']['tanach_index']['decode_errors'], 2)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.out, core.REPORT_DB_F)))
+
+    def test_output_without_coverage_file_is_accepted(self):
+        # outputs written before coverage was recorded keep working
+        self.assertIsNone(core.coverage_problem(self.out, 'lexicon'))
+
+    def test_cli_report_exits_nonzero_on_refused_report(self):
+        core.build_lexicon(self.spec, self.cfg, self.out)
+        core.detect(self.spec, self.cfg, self.out)
+        core.locate(self.spec, self.cfg, self.out)
+        _corrupt_row(self.db, 3)
+        with self.assertRaises(core.PartialRead):
+            core.locate(self.spec, self.cfg, self.out)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['report', '--otzaria', '--db', self.db,
+                           '--out', self.out])
+        self.assertEqual(rc, 1)
+        self.assertIn('מיקום', err.getvalue())
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class MissingContentRowTest(unittest.TestCase):
+    """A `line` row without its `line_content` row is unread, not absent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db, missing_id=3)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_range_read_counts_missing_row(self):
+        with OtzariaDB(self.db) as odb:
+            st = ReadStats()
+            got = [lid for lid, _, _ in odb.iter_range(1, 5, st)]
+        self.assertEqual(got, [1, 2, 4])
+        self.assertEqual(st.missing, 1)
+        self.assertEqual(st.unread(), 1)
+
+    def test_stage_with_missing_row_is_partial(self):
+        out = os.path.join(self.tmp.name, 'out')
+        os.makedirs(out)
+        with self.assertRaises(core.PartialRead):
+            core.build_lexicon(_otzaria_spec(self.db),
+                               Config(workers=1, n_chunks=2), out)
+        cov = _coverage(out, 'lexicon')
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['missing'], 1)
+
+    def test_book_with_missing_row_is_refused(self):
+        with self.assertRaises(book_source.BookNotFound):
+            book_source.load_book('db', '2', db_path=self.db)
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class OpenFailureTest(unittest.TestCase):
+    """A database that fails to open is released and reported in Hebrew."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _set_dict(self, value):
+        con = sqlite3.connect(self.db)
+        if value is None:
+            con.execute('DELETE FROM zstd_dict')
+        else:
+            con.execute('UPDATE zstd_dict SET dict = ?', (value,))
+        con.commit()
+        con.close()
+
+    def _assert_released(self):
+        # on Windows a leaked connection keeps the file locked (WinError 32)
+        os.remove(self.db)
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_empty_dictionary_table(self):
+        self._set_dict(None)
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_bad_dictionary_is_text_source_error(self):
+        self._set_dict(b'not a zstd dictionary at all')
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_missing_decoder(self):
+        def no_decoder(_):
+            raise TextSourceError('אין מפענח zstd')
+        with mock.patch('magiah.textsource._make_decoder', no_decoder):
+            with self.assertRaises(TextSourceError):
+                OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_not_a_database(self):
+        with open(self.db, 'wb') as f:
+            f.write(b'this is not sqlite' * 100)
+        with self.assertRaises(TextSourceError):
+            OtzariaDB(self.db)
+        self._assert_released()
+
+    def test_cli_prints_hebrew_not_traceback(self):
+        out = os.path.join(self.tmp.name, 'out')
+        missing = os.path.join(self.tmp.name, 'nope.db')
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main(['lexicon', '--otzaria', '--db', missing,
+                           '--out', out])
+        self.assertEqual(rc, 1)
+        self.assertIn('לא נמצא', err.getvalue())
+        self.assertNotIn('Traceback', err.getvalue())
+        self.assertFalse(os.path.exists(missing))
+
+
+@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+class ReadStatsCountedTest(unittest.TestCase):
+    """Every pass that reads the corpus counts what it could not read."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db, corrupt_id=2)
+        con = sqlite3.connect(self.db)
+        con.execute('UPDATE book SET hasTeamim = 1 WHERE id = 1')
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_bible_book(self):
+        """Book 1 becomes a verified Bible book (category + title + heRefs);
+        its line 2 is the corrupt row."""
+        con = sqlite3.connect(self.db)
+        con.executescript('''
+            CREATE TABLE category(id INTEGER PRIMARY KEY, parentId INT,
+                                  title TEXT, level INT);
+            INSERT INTO category VALUES(1, NULL, 'תנ"ך', 0), (2, 1, 'תורה', 1);
+            ALTER TABLE book ADD COLUMN categoryId INT;
+            UPDATE book SET title = 'בראשית', categoryId = 2 WHERE id = 1;
+            UPDATE line SET heRef = 'בראשית, א, א' WHERE id = 1;
+            UPDATE line SET heRef = 'בראשית, א, ב' WHERE id = 2;
+        ''')
+        con.commit()
+        con.close()
+
+    def test_tanach_passes_count_and_release_the_db(self):
+        # hasTeamim alone does not make a Bible edition: nothing is read
+        st = ReadStats()
+        core._build_verse_index(self.db, st)
+        self.assertEqual((st.lines, st.decode_errors), (0, 0))
+        # a verified Bible book with an unreadable row: counted
+        self._make_bible_book()
+        st = ReadStats()
+        vidx = core._build_verse_index(self.db, st)
+        self.assertEqual(st.decode_errors, 1)
+        self.assertEqual(st.unread(), 1)
+        os.remove(self.db)                      # closed: not locked
+        # the edition comparison works on the index alone — it does not read
+        # (or reopen) the database, so it has nothing further to count
+        rows = core._tanach_edition_errors(vidx)
+        self.assertEqual(rows, [])
+
+    def test_tanach_index_counts_missing_line_content(self):
+        self._make_bible_book()
+        con = sqlite3.connect(self.db)
+        con.execute('DELETE FROM line_content WHERE id = 1')
+        con.commit()
+        con.close()
+        st = ReadStats()
+        core._build_verse_index(self.db, st)
+        self.assertEqual(st.missing, 1)
+        self.assertEqual(st.unread(), 2)        # + the corrupt row 2
+
+    def test_book_context_verification_refuses_partial_pass(self):
+        with self.assertRaises(book_scan.BookScanError):
+            book_scan.verify_context(
+                _otzaria_spec(self.db), Config(workers=1, n_chunks=2),
+                {('בראשית', 'ברא')}, {})
+
+    def test_hybrid_counts_skipped_version_lines(self):
+        db = os.path.join(self.tmp.name, 'clean.db')
+        make_schema6_db(db)
+        lib = os.path.join(self.tmp.name, 'lib')
+        os.makedirs(lib)
+        corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': db})
+        for ch in corpus.chunks(2):
+            list(corpus.iter_texts_docs(ch))
+        corpus.close()
+        # the version row belongs to book 1 (Sefaria), so hybrid skips it too
+        self.assertEqual(corpus.stats.version_lines_skipped, 1)
+
+
+class ReadOnlyUriTest(unittest.TestCase):
+    """UNC paths, and paths with Hebrew, spaces, '#' and '%'."""
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_unc_uri_keeps_server_and_share(self):
+        self.assertEqual(ro_uri(r'\\server\share\a b\seforim.db'),
+                         'file:////server/share/a%20b/seforim.db?mode=ro')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows paths')
+    def test_drive_uri(self):
+        self.assertEqual(ro_uri(r'C:\ספרים\a#b%c\seforim.db'),
+                         'file:///C:/%D7%A1%D7%A4%D7%A8%D7%99%D7%9D/'
+                         'a%23b%25c/seforim.db?mode=ro')
+
+    def test_awkward_local_path_opens_read_only(self):
+        with tempfile.TemporaryDirectory(prefix='ספר # 100% ') as d:
+            p = os.path.join(d, 'seforim.db')
+            make_inline_db(p)
+            with OtzariaDB(p) as odb:
+                self.assertEqual(len(list(odb.iter_range(1, 5,
+                                                         ReadStats()))), 4)
+                with self.assertRaises(sqlite3.OperationalError):
+                    odb.con.execute('DELETE FROM line')
+            missing = os.path.join(d, 'nope.db')
+            with self.assertRaises(TextSourceError):
+                OtzariaDB(missing)
+            self.assertFalse(os.path.exists(missing))
+
+    @unittest.skipUnless(os.name == 'nt' and os.path.isdir(r'\\localhost\C$'),
+                         'needs the \\\\localhost\\C$ admin share')
+    def test_unc_path_opens(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'seforim.db')
+            make_inline_db(p)
+            drive, rest = os.path.splitdrive(os.path.abspath(p))
+            if len(drive) != 2:
+                self.skipTest('temp dir is not on a drive letter')
+            unc = '\\\\localhost\\' + drive[0] + '$' + rest
+            with OtzariaDB(unc) as odb:
+                self.assertEqual(odb.layout, 'inline')
+
+
+class LibraryPathFileTest(unittest.TestCase):
+    """%APPDATA%\\otzaria\\library_path.txt in any encoding must not stop the
+    tool from starting (it is read at import time)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.appdata = self.tmp.name
+        os.makedirs(os.path.join(self.appdata, 'otzaria'))
+        self.lib = os.path.join(self.tmp.name, 'ספריית אוצריא')
+        os.makedirs(self.lib)
+        open(os.path.join(self.lib, 'seforim.db'), 'wb').close()
+        self.want = os.path.join(self.lib, 'seforim.db')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _resolve(self, data):
+        with open(os.path.join(self.appdata, 'otzaria', 'library_path.txt'),
+                  'wb') as f:
+            f.write(data)
+        with mock.patch.dict(os.environ, {'APPDATA': self.appdata}):
+            return corpus_mod.default_otzaria_db()
+
+    def test_utf8_with_bom(self):
+        self.assertEqual(self._resolve(self.lib.encode('utf-8-sig')),
+                         self.want)
+
+    def test_utf16_with_bom(self):
+        self.assertEqual(self._resolve(self.lib.encode('utf-16')), self.want)
+
+    def test_quotes_and_extra_lines(self):
+        data = f'\r\n  "{self.lib}"  \r\nsecond line\r\n'.encode('utf-8')
+        self.assertEqual(self._resolve(data), self.want)
+
+    def test_cp1255_falls_back_instead_of_crashing(self):
+        self.assertEqual(self._resolve(self.lib.encode('cp1255')),
+                         corpus_mod.LEGACY_OTZARIA_DB)
+
+    def test_garbage_falls_back(self):
+        self.assertEqual(self._resolve(b'\xff\x00\x81\x00\xfe'),
+                         corpus_mod.LEGACY_OTZARIA_DB)
 
 
 if __name__ == '__main__':

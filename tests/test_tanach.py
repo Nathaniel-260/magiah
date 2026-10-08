@@ -516,6 +516,54 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(st[0], 'not_error')
 
 
+class PartialTanachReadTest(_DBCase):
+    """A Tanach index built from a partial read never feeds report.db."""
+
+    def _run(self, out):
+        spec = {'type': 'sqlite', 'path': self.db, 'table': 'line',
+                'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+        core.locate(spec, Config(workers=1, n_chunks=2), out)
+
+    def test_unreadable_version_row_stops_locate_and_keeps_report(self):
+        out = os.path.join(self.dir, 'out')
+        os.makedirs(out)
+        lex = {w: 1000 for w in _fixture_words()}
+        for w in FLAGGED:
+            lex[w] = 1
+        with open(os.path.join(out, core.LEXICON_F), 'wb') as f:
+            pickle.dump(lex, f)
+        with open(os.path.join(out, core.FLAGGED_F), 'wb') as f:
+            pickle.dump({w: (1, et, s, 1000, 3.0)
+                         for w, (et, s) in FLAGGED.items()}, f)
+        self._run(out)
+        report = os.path.join(out, core.REPORT_DB_F)
+        with open(report, 'rb') as f:
+            before = f.read()
+        # a version row only the Tanach index reads (the main pass skips
+        # versions): a BLOB in a database without a zstd dictionary
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE version_line SET content = X'00FF' "
+                    "WHERE versionId = 2 AND content IS NOT NULL "
+                    "AND lineId = (SELECT MIN(lineId) FROM version_line "
+                    "WHERE versionId = 2 AND content IS NOT NULL)")
+        con.commit()
+        con.close()
+        with self.assertRaises(core.PartialRead) as cm:
+            self._run(out)
+        self.assertIn('לא הצליח לקרוא 1 שורות', str(cm.exception))
+        with open(report, 'rb') as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(report + '.tmp'))
+        with open(os.path.join(out, core.COVERAGE_F.format(stage='locate')),
+                  encoding='utf-8') as f:
+            cov = json.load(f)
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['passes']['tanach_index']['decode_errors'], 1)
+        # ...and the consumers refuse the older report.db
+        with self.assertRaises(core.PartialRead):
+            core.report(Config(), out)
+
+
 class EditionRankTest(unittest.TestCase):
     def test_only_resolved_edition_variants_rank(self):
         from magiah.webui import db as uidb
