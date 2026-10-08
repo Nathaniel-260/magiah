@@ -174,6 +174,9 @@ magiah all --otzaria --out results --allow-unread 3
   counts once). The default, `0`, skips none, and there is no "unlimited".
   With more than N unreadable rows the stage stops as before, so a database
   that degrades further is not let through.
+* With a folder of text files (`--textdir`, or the library of a hybrid scan)
+  an unreadable *file* counts as one row, and the review UI's notice speaks
+  of files, not of the database.
 * Skipped rows are not scanned: errors in them are not found, and their
   words are missing from the lexicon frequencies. Every output built this way
   is marked partial, never complete: `coverage_<stage>.json` keeps

@@ -711,7 +711,7 @@ def _gap_summary(rec):
     """What the UI needs of a coverage record (core.gap_record): not the row
     ids, which may run to thousands."""
     return {k: rec[k] for k in ('unread_rows', 'allow_unread', 'unread_refs',
-                                'inherited') if k in rec}
+                                'inherited', 'unread_kind') if k in rec}
 
 
 def _report_coverage(con):

@@ -21,7 +21,7 @@ from unittest import mock
 from magiah import book_scan, book_source, cli, core
 from magiah.config import Config
 from magiah.textsource import OtzariaDB, ReadStats
-from magiah.webui import db as uidb, scanner, server
+from magiah.webui import db as uidb, hebrew, scanner, server
 
 from test_tanach import BIBLE, make_bible_db
 from test_textsource import (_corrupt_row, _coverage, _otzaria_spec, _zstd,
@@ -610,8 +610,11 @@ class ReviewUiTest(_Case):
         n = self.notice()
         self.assertEqual((n['kind'], n['level'], n['stale'], n['action']),
                          ('accepted_partial', 'warning', False, None))
-        self.assertIn('2 שורות', n['text'])
+        self.assertIn('2 שורות במסד הנתונים', n['text'])
         self.assertIn('--allow-unread 2', n['text'])
+        self.assertIn('מסד הנתונים', n['title'])
+        # the lexicon was built without them too
+        self.assertIn(hebrew.COVERAGE_NOTICE['scan_lexicon'], n['text'])
         self.assertEqual(n['details'].split('\n'),
                          ['ספר א, ref 2 (מזהה שורה 2)',
                           'ספר ב, ref 4 (מזהה שורה 4)'])
@@ -621,6 +624,36 @@ class ReviewUiTest(_Case):
         self.repair_db()
         self.full_scan(0)
         self.assertIsNone(self.notice())
+
+    def test_text_folder_scan_speaks_of_files_not_the_database(self):
+        lib = os.path.join(self.tmp.name, 'lib')
+        os.makedirs(os.path.join(lib, 'שבור.txt'))     # cannot be opened
+        with open(os.path.join(lib, 'ספר.txt'), 'w', encoding='utf-8') as f:
+            f.write('בראשית ברא אלהים את השמים ואת הארץ\n' * 20)
+        self.spec = {'type': 'textdir', 'path': lib}
+        self.full_scan(1)
+        n = self.notice()
+        C = hebrew.COVERAGE_NOTICE
+        self.assertEqual(n['title'], C['title']['files'])
+        self.assertEqual(n['hint'], C['hint']['files'])
+        self.assertIn('1 קובצי טקסט', n['text'])
+        self.assertNotIn('מסד', n['title'] + n['text'] + n['hint'])
+        self.assertIn('שבור.txt', n['details'])
+
+    def test_a_record_that_does_not_say_is_worded_generally(self):
+        self.full_scan(2)
+        con = sqlite3.connect(os.path.join(self.out, uidb.UI_DB_F))
+        cov = json.loads(con.execute(
+            "SELECT value FROM meta WHERE key = 'coverage'").fetchone()[0])
+        del cov['unread_kind']
+        con.execute("UPDATE meta SET value = ? WHERE key = 'coverage'",
+                    (json.dumps(cov),))
+        con.commit()
+        con.close()
+        n = self.notice()
+        self.assertEqual(n['title'],
+                         hebrew.COVERAGE_NOTICE['title']['input'])
+        self.assertIn('2 שורות קלט', n['text'])
 
     def test_served_by_api_meta(self):
         self.full_scan(2)

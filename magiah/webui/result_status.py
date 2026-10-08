@@ -173,16 +173,30 @@ def coverage_notice(con, outdir, ctx):
         value = count(rec, key)
         return '?' if value is None else f'{value:,}'
 
+    def kind(rec):
+        k = rec.get('unread_kind')
+        return k if k in ('db', 'files', 'mixed') else 'input'
+
+    def what(rec):
+        return C['what'][kind(rec)].format(rows=num(rec, 'unread_rows'))
+
     text, refs, listed_all = [], [], True
     if scan:
-        text.append(C['scan'].format(rows=num(scan, 'unread_rows'),
-                                     limit=num(scan, 'allow_unread')))
+        inherited = scan.get('inherited')
+        text.append(C['scan'].format(what=what(scan), why=C['why'][kind(scan)],
+                                     limit=num(scan, 'allow_unread'))
+                    + (C['scan_lexicon'] if isinstance(inherited, dict)
+                       and 'lexicon' in inherited else ''))
     for doc, b in sorted(books.items(),
                          key=lambda kv: str(kv[1].get('title') or kv[0])):
         text.append(C['book_lexicon' if b.get('inherited') else 'book']
-                    .format(title=b.get('title') or doc,
-                            rows=num(b, 'unread_rows'),
+                    .format(title=b.get('title') or doc, what=what(b),
                             limit=num(b, 'allow_unread')))
+    # titled and advised by what was skipped, across every record
+    kinds = set()
+    for rec in ([scan] if scan else []) + list(books.values()):
+        kinds |= {'mixed': {'db', 'files'}}.get(kind(rec), {kind(rec)})
+    overall = kinds.pop() if len(kinds) == 1 else 'input'
     for rec in ([scan] if scan else []) + list(books.values()):
         got = [r for r in rec.get('unread_refs') or () if isinstance(r, dict)]
         refs += got
@@ -195,8 +209,9 @@ def coverage_notice(con, outdir, ctx):
             lines.append(core.ref_text(r))
     if not listed_all:
         lines.append(C['more'])
-    return _notice('accepted_partial', 'warning', C['title'], ' '.join(text),
-                   C['hint'], '\n'.join(lines) or None)
+    return _notice('accepted_partial', 'warning', C['title'][overall],
+                   ' '.join(text), C['hint'][overall],
+                   '\n'.join(lines) or None)
 
 
 def refresh_notice(con, outdir, ctx):

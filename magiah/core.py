@@ -271,6 +271,17 @@ def _missing_rows(passes, inherited=None):
             + sum(g['unread_rows'] for g in inherited.values())), units
 
 
+def _unread_kind(units):
+    """What the unread `units` are, for wording: 'db' (database rows, by
+    id), 'files' (text files, by path — an unreadable file is one unit),
+    'mixed', or None when no unit is known."""
+    kinds = {'db' if _line_id(str(u)) is not None else 'files'
+             for u in units}
+    if len(kinds) > 1:
+        return 'mixed'
+    return kinds.pop() if kinds else None
+
+
 def gap_record(passes, inherited, limit, db_path):
     """What an output is missing, for its coverage record — None if nothing.
 
@@ -286,6 +297,9 @@ def gap_record(passes, inherited, limit, db_path):
            'unread_rows': rows,
            'unread_refs': _unread_refs(samples, db_path, prior),
            'unread_units': sorted(units)[:ReadStats.UNITS_CAP]}
+    kind = _unread_kind(units)
+    if kind:
+        rec['unread_kind'] = kind
     if inherited:
         rec['inherited'] = {st: g['unread_rows']
                             for st, g in inherited.items()}

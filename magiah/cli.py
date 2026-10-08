@@ -197,7 +197,8 @@ def main(argv=None):
     ap.add_argument('--allow-unread', type=_non_negative, default=0,
                     metavar='N',
                     help='go on when at most N input rows cannot be read '
-                         '(corrupt or missing in seforim.db): they are '
+                         '(corrupt or missing in the database; with text '
+                         'files, each file that cannot be read): they are '
                          'skipped and every output built on them is marked '
                          'partial. Also needed to USE such outputs in a '
                          'later run. Default 0: any unreadable row stops the '
