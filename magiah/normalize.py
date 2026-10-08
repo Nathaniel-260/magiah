@@ -235,12 +235,38 @@ def token_spans(text):
 
 def mark_end(text, j):
     """Index past the marks that follow ``text[j-1]`` (joiners only between
-    marks, never trailing)."""
+    marks, never trailing).
+
+    A mark still belongs to the letter when it is written as an entity
+    (``אמרו&#1468;``) or sits behind inline formatting tags, which clean()
+    drops without a space (``<b>אמרו</b>ּ``). The span takes those along:
+    left outside it, the mark would end up on the replacement's last letter.
+    (The fixer then refuses a span holding a tag, and asks for a vocalized
+    correction for one holding a mark.)
+    """
     n, k = len(text), j
-    while k < n and (text[k] in MARKS or text[k] in _JOINERS):
-        k += 1
-        if text[k - 1] in MARKS:
-            j = k
+    while k < n:
+        ch = text[k]
+        if ch in MARKS or ch in _JOINERS:
+            k += 1
+            if ch in MARKS:
+                j = k
+        elif ch == '&':
+            m = _ENTITY_RE.match(text, k)
+            dec = html.unescape(m.group()) if m else ''
+            if not m or dec == m.group() or not all(
+                    c in MARKS or c in _JOINERS for c in dec):
+                break
+            k = m.end()
+            if any(c in MARKS for c in dec):
+                j = k
+        elif ch == '<':
+            m = INLINE_TAG_RE.match(text, k)
+            if not m:
+                break
+            k = m.end()            # taken only if a mark follows it
+        else:
+            break
     return j
 
 
@@ -262,8 +288,11 @@ def is_mark(ch):
 
 
 def has_marks(text):
-    """True when `text` carries nikud/teamim, as marks or presentation forms
-    (U+FB1D-FB4E, except the wide letters FB20-FB29 that carry none)."""
+    """True when `text` carries nikud/teamim, as marks (also written as
+    entities, ``&#1468;``) or presentation forms (U+FB1D-FB4E, except the
+    wide letters FB20-FB29 that carry none)."""
+    if '&' in text:
+        text = html.unescape(text)
     for ch in text:
         if ch in MARKS:
             return True

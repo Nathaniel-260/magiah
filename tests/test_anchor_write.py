@@ -489,6 +489,45 @@ class TestUnicodeSpans(TempCase):
             patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
         self.assertEqual(cm.exception.code, 'needs_vocalization')
 
+    def test_a_mark_written_as_an_entity_belongs_to_the_word(self):
+        line = 'ויאמר אמרו&#1468; דבר אל העם'
+        tok = [s for s in normalize.token_spans(line) if s[0] == 'אמרו'][0]
+        self.assertEqual(line[tok[1]:tok[2]], 'אמרו&#1468;')
+        self.assertTrue(normalize.has_marks('אמרו&#1468;'))
+        d = self.doc(line)
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
+        self.assertEqual(cm.exception.code, 'needs_vocalization')
+        for mode, corr, want in (
+                (patcher.MODE_BRACKET, 'אמר',
+                 'ויאמר (אמר) [אמרו&#1468;] דבר אל העם'),
+                (patcher.MODE_REPLACE, 'אָמַר', 'ויאמר אָמַר דבר אל העם')):
+            with self.subTest(mode=mode):
+                d = self.doc(line)
+                plan = patcher.plan_edit(d, finding(line, 'אמרו', corr),
+                                         mode=mode)
+                patcher.apply_edits(d, [plan])
+                self.assertEqual(d.lines[0], want)
+
+    def test_a_mark_behind_an_inline_tag_is_never_orphaned(self):
+        for line in ('ויאמר אמרו<b>ּ</b> דבר אל העם',
+                     'ויאמר <b>אמרו</b>ּ דבר אל העם',
+                     'ויאמר <span>אמרו</span>ּ דבר אל העם'):
+            d = self.doc(line)
+            for mode in patcher.MODES:
+                with self.subTest(line=line, mode=mode):
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'),
+                                          mode=mode, check_vocalization=False)
+                    self.assertEqual(cm.exception.code, 'word_spans_markup')
+
+    def test_a_tag_with_no_mark_after_it_stays_outside(self):
+        line = 'ויאמר <b>אמרו</b> דבר&nbsp;ּ אל'
+        d = self.doc(line)
+        plan = patcher.plan_edit(d, finding(line, 'אמרו', 'אמר'))
+        patcher.apply_edits(d, [plan])
+        self.assertEqual(d.lines[0], 'ויאמר <b>אמר</b> דבר&nbsp;ּ אל')
+
     def test_span_tag_does_not_split_a_word(self):
         line = 'ה<span class="x">ע</span>ולם הזה'
         self.assertEqual(normalize.tokenize(line), ['העולם', 'הזה'])
