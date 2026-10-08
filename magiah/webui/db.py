@@ -908,6 +908,8 @@ def get_meta(con):
     total = sum(o['count'] for o in origins)
     return {'origins': origins, 'errtypes': errtypes, 'statuses': statuses,
             'columns': columns, 'total': total,
+            'evidence_labels': hebrew.EVIDENCE_LABELS,
+            'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
             'last_import': last_import[0] if last_import else None}

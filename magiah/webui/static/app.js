@@ -877,6 +877,13 @@ function altList(word, alts) {
   return box;
 }
 
+// Hebrew label of a Tanach evidence kind / reason code (from /api/meta);
+// anything unknown — a user's own note included — is shown as-is.
+function evLabel(code) {
+  const m = (S.meta && S.meta.evidence_labels) || {};
+  return (typeof code === "string" && m[code]) || code;
+}
+
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
@@ -972,8 +979,11 @@ function renderDrawer(r, history) {
         dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
         continue;
       }
-      const txt = (v && typeof v === "object") ? JSON.stringify(v) : String(v);
-      dl.append(el("dt", null, "פרטים: " + k), el("dd", null, el("bdi", null, txt)));
+      const txt = (v && typeof v === "object") ? JSON.stringify(v)
+        : typeof v === "boolean" ? (v ? "כן" : "לא")
+        : (k === "evidence_kind" || k === "reason") ? String(evLabel(v)) : String(v);
+      const kl = ((S.meta && S.meta.extra_labels) || {})[k];
+      dl.append(el("dt", null, kl || ("פרטים: " + k)), el("dd", null, el("bdi", null, txt)));
     }
   }
   fSec.append(dl);
@@ -985,7 +995,7 @@ function renderDrawer(r, history) {
     const from = h.old_status ? statusInfo(h.old_status).hebrew : "—";
     const to = h.new_status ? statusInfo(h.new_status).hebrew : "—";
     hSec.append(el("div", { class: "h-item" },
-      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + h.note : ""));
+      el("time", null, h.ts || ""), " · ", from + " ← " + to, h.note ? " · " + evLabel(h.note) : ""));
   }
   body.append(hSec);
 }
