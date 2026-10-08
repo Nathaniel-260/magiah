@@ -604,9 +604,20 @@ class TestGeresh(TempCase):
 
 
 class TestKetivQere(TempCase):
-    """'(x) [word]' is the layout of the fixer's bracket mode AND of ketiv/
-    qere in the books. Only the fixer's own output is 'already applied'."""
+    """'(x) [word]' is the layout of the fixer's bracket mode AND of a plain
+    ketiv/qere pair, and the text cannot tell them apart (a ketiv may even be
+    the very correction). History does: a record of the fixer's edit, or the
+    layout already being in the scan's snippet."""
     LINE = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
+
+    def bracketed(self, orig, word, corr, lineno=0):
+        """The fixer's own bracket output for a word the scan saw plainly:
+        ``(doc, finding as scanned, the edit's record)``."""
+        d = self.doc(orig)
+        f = finding(orig, word, corr, lineno=lineno)
+        plan = patcher.plan_edit(d, f, mode=patcher.MODE_BRACKET)
+        patcher.apply_edits(d, [plan])
+        return d, f, plan.to_dict()
 
     def test_a_typo_in_the_qere_is_corrected(self):
         d = self.doc(self.LINE)
@@ -623,30 +634,60 @@ class TestKetivQere(TempCase):
         self.assertEqual((plan.start, plan.end, plan.confidence),
                          (a, b, 'manual'))
 
-    def test_the_fixers_own_output_is_already_applied(self):
-        for line, word, corr in (
-                ('אמר רבי (יושבת) [יותבת] בן זומא', 'יותבת', 'יושבת'),
-                # bracket mode carries the original's geresh onto the fix
-                ('אמר (רבי׳) [רבך׳] שלום', 'רבך', 'רבי')):
-            with self.subTest(line=line):
-                d = self.doc(line)
-                for mode in patcher.MODES:
-                    with self.assertRaises(patcher.PatchError) as cm:
-                        patcher.plan_edit(d, finding(line, word, corr),
-                                          mode=mode)
-                    self.assertEqual(cm.exception.code, 'already_applied')
-
-    def test_a_recorded_bracket_edit_is_ours_whatever_the_correction(self):
-        orig = 'אמר רבי יותבת בן זומא'
-        d = self.doc(orig)
-        plan = patcher.plan_edit(d, finding(orig, 'יותבת', 'יושבת'),
-                                 mode=patcher.MODE_BRACKET)
+    def test_a_correction_equal_to_the_ketiv_is_written(self):
+        """The detector may suggest the ketiv itself; the pair was in the
+        book when it was scanned, so this is not the fixer's output."""
+        d = self.doc(self.LINE)
+        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנער'))
         patcher.apply_edits(d, [plan])
-        # re-applied with another correction once the finding's id changed
-        # (a re-scan): only the record says these brackets are ours
-        f = finding(orig, 'יותבת', 'ישבת', fid=2)
+        self.assertEqual(d.lines[0], 'ויצא (הנער) [הנער] אל השדה ותקח את הכד')
+
+    def test_the_fixers_recorded_output_is_already_applied(self):
+        for orig, word, corr in (
+                ('אמר רבי יותבת בן זומא', 'יותבת', 'יושבת'),
+                # bracket mode carries the original's geresh onto the fix
+                ('אמר רבך׳ שלום', 'רבך', 'רבי')):
+            with self.subTest(orig=orig):
+                d, f, rec = self.bracketed(orig, word, corr)
+                for mode in patcher.MODES:
+                    for other in (corr, 'ישבת'):
+                        with self.assertRaises(patcher.PatchError) as cm:
+                            patcher.plan_edit(d, dict(f, correction=other),
+                                              mode=mode, own_edits=[rec])
+                        self.assertEqual(cm.exception.code,
+                                         'already_applied')
+
+    def test_brackets_added_after_the_scan_are_never_nested_into(self):
+        """The record is gone (ids changed, database rebuilt): the scan saw
+        the plain word, so these brackets came later. Correcting inside them
+        would nest or overwrite the original, with the same correction or a
+        new one alike."""
+        d, f, _rec = self.bracketed('אמר רבי יותבת בן זומא', 'יותבת',
+                                    'יושבת')
+        before = d.lines[0]
+        for mode in patcher.MODES:
+            for other in ('יושבת', 'ישבת'):
+                with self.subTest(mode=mode, correction=other):
+                    with self.assertRaises(patcher.PatchError) as cm:
+                        patcher.plan_edit(d, dict(f, correction=other),
+                                          mode=mode)
+                    self.assertEqual(cm.exception.code, 'already_bracketed')
+        self.assertEqual(d.lines[0], before)
+
+    def test_a_record_proves_only_its_own_line(self):
+        """An identical twin line with the same layout, which the book had
+        when it was scanned, is not the fixer's output."""
+        out = 'אמר רבי (יושבת) [יותבת] בן זומא'
+        d = self.doc(out + '\n' + out + '\n')
+        rec = {'id': 9, 'lineno': 0, 'old': 'יותבת', 'new': '(יושבת) [יותבת]',
+               'post_start': 8, 'ctx_l': 'אמר רבי ', 'ctx_r': ' בן זומא'}
+        # trusted (an unchanged book-scan row): the line number decides
+        # between the twins, so only the record's scope is under test
+        twin = finding(out, 'יותבת', 'ישבת', lineno=1, trusted=True)
+        plan = patcher.plan_edit(d, twin, own_edits=[rec])
+        self.assertEqual(plan.lineno, 1)
         with self.assertRaises(patcher.PatchError) as cm:
-            patcher.plan_edit(d, f, own_edits=[plan.to_dict()])
+            patcher.plan_edit(d, dict(twin, lineno=0), own_edits=[rec])
         self.assertEqual(cm.exception.code, 'already_applied')
 
 
@@ -941,6 +982,9 @@ class TestIdempotency(FixerEnv):
         self.assertEqual(raw(self.path), once)
 
     def test_reapplying_after_the_record_is_lost_does_not_nest(self):
+        """The scan saw the plain word; the brackets around it came later and
+        nothing records them. Re-applied — with the same correction, or a
+        new custom one — it must neither nest nor overwrite the original."""
         res, code = self.apply(self.key, [{'id': 1}], default_mode='bracket')
         self.assertEqual(code, 200, res)
         once = raw(self.path)
@@ -948,12 +992,19 @@ class TestIdempotency(FixerEnv):
         con.execute('DELETE FROM file_edits')
         con.commit()
         con.close()
-        self._reapprove(1)
-        res, code = self.apply(self.key, [{'id': 1}], default_mode='bracket')
-        self.assertEqual(code, 409, res)
-        self.assertEqual([f['code'] for f in res['failed']],
-                         ['already_applied'])
-        self.assertEqual(raw(self.path), once)
+        for corr in (None, 'ישבה'):
+            for mode in patcher.MODES:
+                with self.subTest(correction=corr, mode=mode):
+                    self._reapprove(1)
+                    item = {'id': 1}
+                    if corr:
+                        item['correction'] = corr
+                    res, code = self.apply(self.key, [item],
+                                           default_mode=mode)
+                    self.assertEqual(code, 409, res)
+                    self.assertEqual([f['code'] for f in res['failed']],
+                                     ['already_bracketed'])
+                    self.assertEqual(raw(self.path), once)
 
     def test_ketiv_qere_is_written_through_the_api(self):
         line = 'ויצא (הנער) [הנערח] אל השדה'
@@ -1110,6 +1161,76 @@ class TestRepeatedWordInSeparateBatches(Env):
         self.assertEqual([f['code'] for f in res['failed']],
                          ['occurrence_count_changed'])
         self.assertEqual(raw(self.path), before)
+
+
+class TestBracketHistory(Env):
+    """Through the real book-scan -> apply path: a ketiv/qere pair the book
+    has, and the fixer's own bracket output that is letter for letter the
+    same text, are told apart by what the scan saw — not by the text."""
+    KQ = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
+    PLAIN = 'וישב משה הנערח בבית אביו'
+    REL = 'מקור/כתיב.txt'
+
+    def setUp(self):
+        super().setUp()
+        import pickle
+        from collections import Counter
+        from magiah import book_scan, core
+        words = set(normalize.tokenize(self.KQ + ' ' + self.PLAIN +
+                                       ' פתיחה סוף'))
+        freq = Counter({w: 10 ** 6 for w in words})
+        freq['הנערח'] = 2            # the detector's suggestion: the ketiv
+        with open(os.path.join(self.outdir, core.LEXICON_F), 'wb') as f:
+            pickle.dump(freq, f)
+        self.path = write(os.path.join(self.lib, *self.REL.split('/')),
+                          'פתיחה\n%s\n%s\nסוף\n' % (self.KQ, self.PLAIN))
+        self.key = 'file:' + self.REL
+        db.merge_book_scan(self.outdir, book_scan.scan_book(
+            self.outdir, 'library', self.REL, library_dir=self.lib))
+        con = self.con()
+        try:
+            self.ids = {r[1].rsplit(':', 1)[1]: r[0] for r in con.execute(
+                "SELECT id, unit FROM findings WHERE word = 'הנערח'")}
+            self.sugg = {r[0] for r in con.execute(
+                "SELECT suggestion FROM findings WHERE word = 'הנערח'")}
+            db.set_status(con, self.outdir, list(self.ids.values()),
+                          'approved')
+        finally:
+            con.close()
+
+    def lines(self):
+        return raw(self.path).decode('utf-8').splitlines()
+
+    def test_qere_corrected_to_the_ketiv_and_own_brackets_refused(self):
+        self.assertEqual((sorted(self.ids), self.sugg), (['1', '2'], {'הנער'}))
+        # the book's own ketiv/qere: corrected, even to the ketiv itself
+        res, code = self.apply(self.key, [{'id': self.ids['1']}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.lines()[1],
+                         'ויצא (הנער) [הנער] אל השדה ותקח את הכד')
+        # the fixer brackets the plain line: the very same "(הנער) [הנערח]"
+        res, code = self.apply(self.key, [{'id': self.ids['2']}],
+                               default_mode='bracket')
+        self.assertEqual(code, 200, res)
+        self.assertEqual(self.lines()[2], 'וישב משה (הנער) [הנערח] בבית אביו')
+        once = raw(self.path)
+        # its record is lost; a new custom correction must not nest into
+        # the brackets nor overwrite the original half
+        con = self.con()
+        con.execute('DELETE FROM file_edits')
+        con.execute("UPDATE review SET status = 'approved' "
+                    'WHERE finding_id = ?', (self.ids['2'],))
+        con.commit()
+        con.close()
+        for mode in patcher.MODES:
+            with self.subTest(mode=mode):
+                res, code = self.apply(self.key, [{
+                    'id': self.ids['2'], 'correction': 'הנערה'}],
+                    default_mode=mode)
+                self.assertEqual(code, 409, res)
+                self.assertEqual([f['code'] for f in res['failed']],
+                                 ['already_bracketed'])
+                self.assertEqual(raw(self.path), once)
 
 
 class TestRepeatedWordNeedsProof(Env):

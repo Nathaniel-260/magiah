@@ -69,8 +69,8 @@ CONFLICT_CODES = frozenset((
     'occurrence_count_changed', 'ambiguous_occurrence', 'overlapping_edits',
     'unit_mismatch', 'file_changed_since_edit', 'word_spans_markup',
     'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
-    'source_unknown', 'file_busy', 'already_applied', 'backup_corrupt',
-    'journal_conflict', 'journal_pending',
+    'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
+    'backup_corrupt', 'journal_conflict', 'journal_pending',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -546,31 +546,37 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
 # quotes AFTER a word are closing quotation marks, never part of the word.
 _GERESH = "'’׳"
 
-# "(x) [" right before the span and "]" after it. That is the layout of the
-# fixer's own bracket-mode output — editing its original half would nest — but
-# also of ketiv/qere in the books themselves, "(הנער) [הנערה]", where the
-# bracketed word is ordinary text that may well need a correction.
+# "(x) [" right before the span and "]" after it: the exact layout the fixer's
+# bracket mode writes, "(correction) [original]". A plain ketiv/qere pair,
+# "(הנער) [הנערה]", looks the same, while Otzaria's Tanach writes ketiv/qere
+# inside mam-kq spans or as "ketiv [qere]", neither of which matches here.
 _BRACKETED_RE = re.compile(r'\([^()\[\]]*\) \[$')
 
 
-def _own_bracket(line, a, b, end, correction, own_edits):
-    """Is ``line[a:b]`` — "(x) [word]" — the fixer's own bracket output?
+def _bracket_origin(line, lineno, a, b, snippet, own_edits):
+    """Where ``line[a:b]`` — "(x) [word]" — came from.
 
-    Yes when a recorded live edit of this book sits exactly there, or when
-    the parenthesized text is this finding's correction as bracket mode
-    writes it (geresh carried over), which is what a re-apply finds once the
-    record is gone. A ketiv/qere pair is neither, and is corrected normally.
+    The text cannot tell the fixer's output from a ketiv/qere pair (a
+    ketiv may even equal the correction), so its history decides:
+
+    * ``'record'``: a live recorded edit of THIS line sits exactly there —
+      the fixer's own output;
+    * ``'scanned'``: the scan's snippet already shows the layout around the
+      word — the book's own text when it was scanned (ketiv/qere), which is
+      corrected like any other word;
+    * None: the brackets came after the scan and nothing records them — the
+      fixer's output whose record is gone, or a hand edit. A correction there
+      would nest the brackets or overwrite the original half.
     """
     text = line[a:b]
     for e in own_edits or ():
-        if e.get('new') == text and _locate_entry(line, e) == a:
-            return True
-    paren = text[1:text.index(') [')]
-    corr = correction.strip()
-    if paren == corr:
-        return True
-    tail = line[end:end + 1]
-    return bool(tail) and tail in _GERESH and paren == corr + tail
+        if e.get('lineno') == lineno and e.get('new') == text \
+                and _locate_entry(line, e) == a:
+            return 'record'
+    layout = normalize.clean(text).strip()
+    if snippet and layout and layout in snippet:
+        return 'scanned'
+    return None
 
 
 def _as_scanned(line, lineno, own_edits):
@@ -752,10 +758,15 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
 
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
     opened = _BRACKETED_RE.search(line[:start])
-    if opened and line[close:close + 1] == ']' and _own_bracket(
-            line, opened.start(), close + 1, end, correction, own_edits):
-        raise PatchError('already_applied', _msg('already_applied',
-                                                 n=lineno + 1), id=fid)
+    if opened and line[close:close + 1] == ']':
+        origin = _bracket_origin(line, lineno, opened.start(), close + 1,
+                                 finding.get('snippet'), own_edits)
+        if origin == 'record':
+            raise PatchError('already_applied', _msg('already_applied',
+                                                     n=lineno + 1), id=fid)
+        if origin is None:
+            raise PatchError('already_bracketed', _msg(
+                'already_bracketed', word=word, n=lineno + 1), id=fid)
 
     # A trailing geresh belongs to the abbreviation. It stays attached to the
     # correction; a correction that brings its own replaces it (never two).
