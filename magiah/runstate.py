@@ -59,6 +59,7 @@ Folders written before this module existed have no ``run_state/``: nothing
 is known about their runs and nothing is reported (the coverage files still
 are — see webui/result_status.py).
 """
+import errno
 import json
 import os
 import sys
@@ -87,16 +88,21 @@ class RunBusy(core.StageError):
     """Another run of the same kind already holds this output folder."""
 
 
+class LockUnsupported(OSError):
+    """The file system cannot lock files (some network or FUSE mounts)."""
+
+
+# what a lock attempt raises when another handle holds the lock; anything
+# else means the file system cannot lock at all
+_CONTENDED = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
+              getattr(errno, 'EDEADLK', None)} - {None}
+
 if os.name == 'nt':
     import msvcrt
 
-    def _try_lock(fd):
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
+    def _lock_once(fd):
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
     def _unlock(fd):
         os.lseek(fd, 0, os.SEEK_SET)
@@ -104,15 +110,26 @@ if os.name == 'nt':
 else:
     import fcntl
 
-    def _try_lock(fd):
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except OSError:
-            return False
+    def _lock_once(fd):
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def _unlock(fd):
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _try_lock(fd):
+    """True: locked; False: another handle holds the lock. Raises
+    LockUnsupported when the file system cannot lock — which must not read
+    as "held" (every run would be refused as busy) nor as "free" (every run
+    in progress would read as interrupted)."""
+    try:
+        _lock_once(fd)
+        return True
+    except OSError as e:
+        if e.errno in _CONTENDED:
+            return False
+        raise LockUnsupported(e.errno, f'cannot lock {e.filename or fd}: '
+                                       f'{e.strerror or e}') from e
 
 
 def _now():
@@ -124,6 +141,8 @@ class _Broken:
 
 
 BROKEN = _Broken()
+# how a run the results answer to can have ended without completing them
+STATES = ('failed', 'partial', 'cancelled', 'interrupted')
 
 
 class _Slot:
@@ -164,14 +183,25 @@ class _Slot:
     def hold(self, busy_message):
         """Take the slot's lock for the caller's lifetime; returns the fd.
 
-        Retries briefly: a reader probing the lock holds it for a moment.
+        Retries briefly: a reader probing the lock holds it for a moment. On
+        a file system that cannot lock, the run goes on unlocked (and says
+        so): it then cannot refuse a concurrent run, nor be told from a dead
+        one — but refusing every run would be worse.
         """
         os.makedirs(self.dir, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        for _ in range(_RETRIES):
-            if _try_lock(fd):
-                return fd
-            time.sleep(_RETRY_S)
+        try:
+            for _ in range(_RETRIES):
+                if _try_lock(fd):
+                    return fd
+                time.sleep(_RETRY_S)
+        except LockUnsupported as e:
+            print(f'[run_state] {e}', file=sys.stderr, flush=True)
+            os.close(fd)
+            return None
+        except BaseException:
+            os.close(fd)
+            raise
         os.close(fd)
         raise RunBusy(busy_message)
 
@@ -181,13 +211,26 @@ class _Slot:
         data = self.load()
         if not isinstance(data, dict) or not _running(data):
             return data
+        fd = None
+        # read-write first (NFS emulates flock with fcntl locks, which an
+        # exclusive probe needs a writable handle for), read-only for a
+        # folder the reader may not write to
+        for mode in (os.O_RDWR, os.O_RDONLY):
+            try:
+                fd = os.open(self.lock_path, mode)
+                break
+            except FileNotFoundError:    # no lock file: nobody holds it
+                return _interrupted(data)
+            except OSError:
+                continue
+        if fd is None:                   # cannot tell: assume it runs
+            return data
         try:
-            fd = os.open(self.lock_path, os.O_RDWR)
-        except OSError:                  # no lock file: nobody holds it
-            return _interrupted(data)
-        try:
-            if not _try_lock(fd):
-                return data              # the owner is alive: in progress
+            try:
+                if not _try_lock(fd):
+                    return data          # the owner is alive: in progress
+            except LockUnsupported:
+                return data              # cannot tell: assume it runs
             try:
                 # re-read under the lock: the owner may have finished between
                 # the first read and the probe — and no run can start now
@@ -203,9 +246,11 @@ def _runs(data):
     """The run records of a slot's data (scan: many, book: one)."""
     if 'runs' in data:
         runs = data.get('runs')
-        return list(runs.values()) if isinstance(runs, dict) else []
-    run = data.get('run')
-    return [run] if isinstance(run, dict) else []
+        runs = list(runs.values()) if isinstance(runs, dict) else []
+    else:
+        runs = [data.get('run')]
+    # a hand-edited or damaged entry is skipped, never a crash
+    return [r for r in runs if isinstance(r, dict)]
 
 
 def _running(data):
@@ -331,8 +376,11 @@ class ScanRun(_Run):
 
     @staticmethod
     def _valid(data):
-        return (isinstance(data.get('runs'), dict)
-                and isinstance(data.get('stages'), dict))
+        runs, stages = data.get('runs'), data.get('stages')
+        # damaged entries would break the bookkeeping below: start afresh
+        return (isinstance(runs, dict) and isinstance(stages, dict)
+                and all(isinstance(r, dict) for r in runs.values())
+                and all(isinstance(v, str) for v in stages.values()))
 
     def _mine(self, data):
         return data['runs'].get(self.id)
@@ -360,10 +408,20 @@ class ScanRun(_Run):
             run = self._mine(data)
             if run is not None and run.get('state') == 'running':
                 run['stage'] = stage
-        self._update(change)
+        try:
+            self._update(change)
+        except OSError as e:
+            # bookkeeping must not stop the scan; the stage is recorded
+            # again if the run ends without completing
+            print(f'[run_state] {e}', file=sys.stderr, flush=True)
 
     def done(self, **fields):
         self._finish('done', stage=None, **fields)
+
+    def _finish(self, state, **fields):
+        if state != 'done' and self.stage:
+            fields.setdefault('stage', self.stage)
+        super()._finish(state, **fields)
 
 
 class _ChildRun:
@@ -517,7 +575,9 @@ def _completed(run, stage):
     state = run.get('state')
     if state in ('done', 'running'):
         return True
-    stages, stop = run.get('stages') or [], run.get('stage')
+    stages, stop = run.get('stages'), run.get('stage')
+    if not isinstance(stages, list):
+        stages = []
     if stage in stages and stop in stages:
         return stages.index(stage) < stages.index(stop)
     return False
@@ -544,10 +604,13 @@ def scan_problem(out_dir):
                 'started_at': None, 'finished_at': None, 'id': None,
                 'reason': None, 'path': slot.path}
     for st in RESULT_CHAIN:
-        run = runs.get(owners.get(st))
+        owner = owners.get(st)
+        run = runs.get(owner) if isinstance(owner, str) else None
         if isinstance(run, dict) and not _completed(run, st):
-            stages = list(run.get('stages') or [])
-            return {'state': run.get('state'),
+            stages = run.get('stages')
+            stages = list(stages) if isinstance(stages, list) else []
+            state = run.get('state')
+            return {'state': state if state in STATES else 'unknown',
                     'stage': run.get('stage') or (stages[0] if stages
                                                   else st),
                     'stages': stages,

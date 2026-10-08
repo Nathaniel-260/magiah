@@ -7,6 +7,7 @@ Every test runs the real pipeline (or the real CLI) over a small folder of
 text files; the only things simulated are the failures themselves.
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -282,6 +283,41 @@ class PipelineRunTest(RunStateCase):
         self.assertTrue(seen)
         # in progress or done — never "unknown" (a torn read) nor a crash
         self.assertEqual({p and p['state'] for p in seen}, {None})
+
+
+    def test_damaged_entries_read_as_unknown_and_are_replaced(self):
+        self.start_from_good_scan()
+        path = os.path.join(self.out, runstate.STATE_DIR, 'scan.json')
+        rec = scan_record(self.out)
+        owner = rec['stages']['detect']
+        rec['runs'][owner]['state'] = 'exploded'
+        rec['runs']['junk'] = 5
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(rec, f)
+        self.assertEqual(runstate.scan_problem(self.out)['state'], 'unknown')
+        rec['stages']['locate'] = ['not', 'an', 'id']
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(rec, f)
+        runstate.scan_problem(self.out)              # no crash
+        self.good_scan()                             # nor for the next run
+
+    def test_file_system_without_locks_neither_blocks_nor_alarms(self):
+        # some network / FUSE mounts cannot lock: that must not read as
+        # "another scan holds the folder" (nothing could ever run) nor as
+        # "the run died" (every run in progress would be reported broken)
+        self.start_from_good_scan()
+
+        def no_locks(fd):
+            raise OSError(errno.ENOLCK, 'No locks available')
+        with mock.patch.object(runstate, '_lock_once', no_locks),                 contextlib.redirect_stderr(io.StringIO()):
+            run = runstate.ScanRun(self.out, ['lexicon'])
+            try:
+                run.enter('lexicon')
+                self.assertIsNone(runstate.scan_problem(self.out))
+                run.done()
+            finally:
+                run.close()
+        self.assertIsNone(runstate.scan_problem(self.out))
 
 
 class BookRunTest(RunStateCase):
