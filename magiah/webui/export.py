@@ -168,7 +168,12 @@ def export_fixes(con, outdir):
                COALESCE((SELECT f.source FROM findings f
                          WHERE f.doc = b.doc LIMIT 1),
                         CASE WHEN b.doc LIKE 'src:%'
-                             THEN substr(b.doc, 5) ELSE '' END),
+                             THEN substr(b.doc, 5)
+                             WHEN b.doc LIKE 'line:%'
+                             THEN (SELECT f.source FROM findings f
+                                   WHERE f.unit = substr(b.doc, 6)
+                                     AND COALESCE(f.doc, '') = '' LIMIT 1)
+                             ELSE '' END, ''),
                COALESCE(b.decided_by, 'unknown'), b.updated_at
         FROM book_rules b WHERE b.status = 'not_error'
         ORDER BY b.doc, b.word''').fetchall()

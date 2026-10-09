@@ -20,8 +20,8 @@ sys.path.insert(0, HERE)
 
 from magiah import book_scan, core                              # noqa: E402
 from magiah.webui import db, export, hebrew                     # noqa: E402
-from test_review_state import (Case, ServerCase, make_report,   # noqa: E402
-                               whitelist_cfg)
+from test_review_state import (Case, ServerCase, book_result,   # noqa: E402
+                               make_report, whitelist_cfg)
 
 
 def hold(path, mode='BEGIN EXCLUSIVE'):
@@ -440,6 +440,153 @@ class TestUpgradeBinding(unittest.TestCase):
             ).fetchone()[0], 'approved')
         finally:
             con.close()
+
+
+# ---------------------------------------------------------------------------
+# doc-less rows on DB lines: a book key of their own book, never the title
+# ---------------------------------------------------------------------------
+
+# two books titled ספר: doc 1 on lines 100-110, doc 2 on lines 200-210;
+# extra-space rows (report.db gives them no doc) inside each span and one
+# on line 300, outside both
+SAME_TITLE_OCC = [('בית', 'ביתו', '100', '1', 'ספר'),
+                  ('בית', 'ביתו', '110', '1', 'ספר'),
+                  ('שלם', 'שלום', '200', '2', 'ספר'),
+                  ('שלם', 'שלום', '210', '2', 'ספר')]
+SAME_TITLE_SPACE = [('ב', 'ית', '105', 'ספר'), ('ש', 'לם', '205', 'ספר'),
+                    ('ד', 'בר', '300', 'ספר')]
+
+
+def add_scan_meta(outdir, db_path):
+    """report.db names the Otzaria DB its scan read."""
+    import json
+    rep = sqlite3.connect(os.path.join(outdir, db.REPORT_DB_F))
+    rep.execute('CREATE TABLE scan_meta(key TEXT PRIMARY KEY, value TEXT)')
+    rep.execute("INSERT INTO scan_meta VALUES('corpus', ?)",
+                (json.dumps({'type': 'sqlite', 'preset': 'otzaria',
+                             'path': db_path}),))
+    rep.commit()
+    rep.close()
+
+
+def make_seforim(path, books):
+    """A minimal Otzaria DB: line id -> book id."""
+    con = sqlite3.connect(path)
+    con.execute('CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INTEGER)')
+    con.executemany('INSERT INTO line VALUES(?,?)', sorted(books.items()))
+    con.commit()
+    con.close()
+
+
+class TestDoclessBookKey(Case):
+    def space_docs(self):
+        return {r[0]: r[1] for r in self.con.execute(
+            "SELECT unit, doc FROM findings WHERE family = 'extra_space'")}
+
+    def space_id(self, unit):
+        return self.con.execute(
+            "SELECT id FROM findings WHERE family = 'extra_space' "
+            'AND unit = ?', (unit,)).fetchone()[0]
+
+    def test_line_spans_give_each_row_its_book(self):
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE)
+        db.import_all(self.outdir)
+        self.assertEqual(self.space_docs(),
+                         {'105': '1', '205': '2', '300': None})
+        keys = {b['key'] for b in db.get_books(self.con)}
+        self.assertEqual(keys, {'1', '2', 'line:300'})
+        rows, _t = db.query_findings(self.con, {'book_key': 'line:300'})
+        self.assertEqual([r['unit'] for r in rows], ['300'])
+        # 'src:' keys no longer reach a row on a DB line
+        rows, _t = db.query_findings(self.con, {'book_key': 'src:ספר'})
+        self.assertEqual(rows, [])
+
+    def test_book_rule_on_an_unplaced_row_stays_in_its_line(self):
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE
+                    + [('ד', 'בר', '400', 'ספר')])
+        db.import_all(self.outdir)
+        db.set_status(self.con, self.outdir, [self.space_id('300')],
+                      'not_error', scope='book')
+        self.assertEqual(self.eff(self.space_id('300')), 'not_error')
+        self.assertEqual(self.eff(self.space_id('400')), 'pending')
+        self.assertEqual(self.con.execute('SELECT doc FROM book_rules')
+                         .fetchone()[0], 'line:300')
+
+    def test_the_scanned_db_names_the_book(self):
+        dbp = os.path.join(self.tmp, 'seforim.db')
+        make_seforim(dbp, {100: 1, 110: 1, 200: 2, 210: 2, 105: 1, 205: 2,
+                           300: 7})
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE)
+        db.import_all(self.outdir)
+        # a book rule made while line 300's book was unknown...
+        db.set_status(self.con, self.outdir, [self.space_id('300')],
+                      'not_error', scope='book')
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE)
+        add_scan_meta(self.outdir, dbp)
+        db.import_all(self.outdir)
+        self.assertEqual(self.space_docs(),
+                         {'105': '1', '205': '2', '300': '7'})
+        # ...follows the row to its book
+        self.assertEqual(self.eff(self.space_id('300')), 'not_error')
+        self.assertIn(('ד בר', '7'), [tuple(r) for r in self.con.execute(
+            'SELECT word, doc FROM book_rules')])
+
+    def test_a_rebuilt_db_is_not_trusted(self):
+        dbp = os.path.join(self.tmp, 'seforim.db')
+        # line ids moved: line 100 is another book's now
+        make_seforim(dbp, {100: 9, 110: 1, 200: 2, 210: 2, 300: 7})
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE)
+        add_scan_meta(self.outdir, dbp)
+        db.import_all(self.outdir)
+        self.assertIsNone(self.space_docs()['300'])
+
+    def test_book_scan_takes_only_its_own_docless_rows_by_index(self):
+        make_report(self.outdir, SAME_TITLE_OCC, space=SAME_TITLE_SPACE)
+        db.import_all(self.outdir)
+        other = self.space_id('205')
+        db.set_status(self.con, self.outdir, [other], 'approved')
+        res = db.import_book_scan(self.outdir, book_result(
+            '1', 'ספר', [('בית', 'ביתו', '100')]))
+        self.assertEqual(res['replaced'], 3)          # 100, 105, 110
+        self.assertEqual(self.eff(other), 'approved')
+        self.assertIsNotNone(db.get_finding(self.con, self.space_id('300')))
+        plan = ' '.join(r[-1] for r in self.con.execute(
+            'EXPLAIN QUERY PLAN ' + db.BOOK_ROWS_SQL,
+            ('1',) + ('1', 'ספר', 100, 110) * 2))
+        self.assertIn('idx_f_doc', plan)
+        self.assertNotRegex(plan, r'SCAN (f|findings)\b(?! USING)')
+
+    def test_upgrade_moves_title_keyed_book_rules(self):
+        # rev 4 database: doc-less rows keyed by title, a book rule on one
+        self.add(1, 'בית', 'ביתו', '100', doc='1')
+        self.add(2, 'בית', 'ביתו', '110', doc='1')
+        self.add(3, 'בית', 'ביתו', '200', doc='2')
+        self.add(4, 'בית', 'ביתו', '210', doc='2')
+        self.add(5, 'בית', 'ביתו', '105', doc=None, family='tokdiag',
+                 errtype='tokdiag')
+        self.add(6, 'בית', 'ביתו', '205', doc=None, family='tokdiag',
+                 errtype='tokdiag')
+        self.add(7, 'בית', 'ביתו', '300', doc=None, family='tokdiag',
+                 errtype='tokdiag')
+        self.con.execute("INSERT INTO book_rules VALUES('בית', 'src:ספר', "
+                         "'not_error', 'human', 't')")
+        # the rule was set from row 5 (its own decision has book scope)
+        self.con.execute("INSERT INTO review VALUES(5, 'not_error', NULL, "
+                         "NULL, 't')")
+        self.con.execute("INSERT INTO review_ext(finding_id, scope) "
+                         "VALUES(5, 'book')")
+        self.con.execute("UPDATE meta SET value = '4' "
+                         "WHERE key = 'schema_rev'")
+        self.con.commit()
+        self.con.close()
+        self.con = db.connect(self.outdir)
+        docs = dict(self.con.execute('SELECT id, doc FROM findings'))
+        self.assertEqual((docs[5], docs[6], docs[7]), ('1', '2', None))
+        # the rule now covers the book it was set in (1) and the line no
+        # book could be found for; book 2 only shared the title
+        self.assertEqual([self.eff(i) for i in range(1, 8)],
+                         ['not_error', 'not_error', 'pending', 'pending',
+                          'not_error', 'pending', 'not_error'])
 
 
 if __name__ == '__main__':

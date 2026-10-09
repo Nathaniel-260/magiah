@@ -205,11 +205,28 @@ SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
 ADDED_COLUMNS = {
     'history': (('prev_state', 'TEXT'), ('decided_by', 'TEXT')),
 }
-SCHEMA_REV = 4
+SCHEMA_REV = 5
 
 # A book's stable identity. `source` is only a display title and several
-# books share one, so it is used only when a row has no doc at all.
-BOOKKEY = "COALESCE(NULLIF(f.doc, ''), 'src:' || COALESCE(f.source, ''))"
+# books share one, so it is never the key of a row on a DB line: a doc-less
+# row there (one whose book no import could establish, see _resolve_docs)
+# is keyed by its own line, 'line:<id>', a book of its own. Only a row with
+# neither a doc nor a line id falls back to its title.
+_DB_LINE = "({u} != '' AND {u} NOT GLOB '*[^0-9]*')"
+BOOKKEY = ("COALESCE(NULLIF(f.doc, ''), CASE WHEN "
+           + _DB_LINE.format(u='f.unit') +
+           " THEN 'line:' || f.unit ELSE 'src:' || COALESCE(f.source, '') "
+           "END)")
+
+
+def book_key(f):
+    """BOOKKEY of one finding row (a mapping with doc, unit and source)."""
+    if f['doc']:
+        return f['doc']
+    unit = f['unit'] or ''
+    if re.fullmatch('[0-9]+', unit):
+        return 'line:' + unit
+    return 'src:' + (f['source'] or '')
 
 
 def _rule_status(col):
@@ -357,6 +374,135 @@ def _fill_missing_docs(cur, table):
     cur.execute('DROP TABLE u2d')
 
 
+def _docs_from_db(cur, table, db_path):
+    """Doc-less rows of `table` on a DB line take the book id of their line
+    from the Otzaria DB the scan read — the doc every other row of that book
+    carries. A DB that cannot be read leaves them as they are."""
+    if not db_path or not os.path.isfile(db_path):
+        return
+    units = [r[0] for r in cur.execute(
+        f"SELECT DISTINCT unit FROM {table} WHERE (doc IS NULL OR doc = '') "
+        f"AND {_DB_LINE.format(u='unit')}")]
+    if not units:
+        return
+    # the DB must still be the one scanned: line ids change when it is
+    # rebuilt, so the rows whose doc is known must all agree with it
+    known = cur.execute(
+        f"SELECT unit, doc FROM {table} WHERE doc IS NOT NULL AND doc != '' "
+        f"AND {_DB_LINE.format(u='unit')} LIMIT 200").fetchall()
+    if not known:
+        return
+
+    def books(src, ids):
+        out = []
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            out += src.execute('SELECT id, bookId FROM line WHERE id IN (%s)'
+                               % ','.join('?' * len(part)),
+                               [int(u) for u in part]).fetchall()
+        return out
+    try:
+        src = sqlite3.connect(_uri(db_path, ro=True), uri=True)
+        try:
+            seen = {str(i): str(b) for i, b in books(src, [u for u, _ in known])}
+            if any(seen.get(u) != d for u, d in known):
+                return
+            found = books(src, units)
+        finally:
+            src.close()
+    except (sqlite3.Error, ValueError):
+        return
+    cur.execute('CREATE TEMP TABLE l2b(unit TEXT PRIMARY KEY, doc TEXT)')
+    cur.executemany('INSERT OR IGNORE INTO l2b VALUES(?,?)',
+                    [(str(i), str(b)) for i, b in found if b is not None])
+    cur.execute(f'''UPDATE {table}
+        SET doc = (SELECT l.doc FROM l2b l WHERE l.unit = {table}.unit)
+        WHERE (doc IS NULL OR doc = '')
+          AND unit IN (SELECT unit FROM l2b)''')
+    cur.execute('DROP TABLE l2b')
+
+
+def _docs_from_spans(cur, table):
+    """A doc-less row of `table` on a DB line takes the doc of the book of
+    its title whose span of known line ids (its rows that have a doc)
+    contains the line. An Otzaria DB stores each book's lines under
+    consecutive ids, so a line inside one book's span is that book's. A line
+    outside every span of its title, or inside two, stays doc-less: another
+    book of the same title may own it."""
+    line = _DB_LINE.format(u='unit')
+    if not cur.execute(f"SELECT 1 FROM {table} WHERE (doc IS NULL OR "
+                       f"doc = '') AND {line} LIMIT 1").fetchone():
+        return
+    cur.execute(f'''CREATE TEMP TABLE docless AS
+        SELECT DISTINCT unit, source FROM {table}
+        WHERE (doc IS NULL OR doc = '') AND {line}''')
+    cur.execute(f'''CREATE TEMP TABLE spans AS
+        SELECT source, doc, MIN(CAST(unit AS INTEGER)) AS lo,
+               MAX(CAST(unit AS INTEGER)) AS hi
+        FROM {table}
+        WHERE doc IS NOT NULL AND doc != '' AND {line}
+          AND source IN (SELECT source FROM docless)
+        GROUP BY source, doc''')
+    cur.execute('CREATE INDEX temp.ix_spans ON spans(source, lo)')
+    cur.execute('''CREATE TEMP TABLE l2d AS
+        SELECT t.unit AS unit, t.source AS source, MIN(s.doc) AS doc
+        FROM docless t JOIN spans s ON s.source = t.source
+         AND CAST(t.unit AS INTEGER) BETWEEN s.lo AND s.hi
+        GROUP BY t.unit, t.source HAVING COUNT(DISTINCT s.doc) = 1''')
+    cur.execute('CREATE UNIQUE INDEX temp.ix_l2d ON l2d(unit, source)')
+    cur.execute(f'''UPDATE {table}
+        SET doc = (SELECT l.doc FROM l2d l WHERE l.unit = {table}.unit
+                   AND l.source = {table}.source)
+        WHERE (doc IS NULL OR doc = '') AND EXISTS (
+            SELECT 1 FROM l2d l WHERE l.unit = {table}.unit
+               AND l.source = {table}.source)''')
+    for t in ('docless', 'spans', 'l2d'):
+        cur.execute(f'DROP TABLE {t}')
+
+
+def _resolve_docs(cur, table, db_path=None):
+    """Give doc-less rows of `table` the doc of their book wherever it can be
+    established: from the unit itself or another row on the same line
+    (:func:`_fill_missing_docs`), from the scan's Otzaria DB, from the line
+    spans of same-titled books. What is left keys by its own line (BOOKKEY),
+    never by its title, so books that share a title stay apart."""
+    _fill_missing_docs(cur, table)
+    _docs_from_db(cur, table, db_path)
+    _docs_from_spans(cur, table)
+
+
+# a row whose own decision was made with book scope: the row the book rule
+# was set from ("correct in this book" was said of ITS book)
+BOOK_CLICKED = ("EXISTS(SELECT 1 FROM review_ext bx WHERE bx.finding_id = "
+                "{id} AND bx.scope = 'book')")
+
+
+def _rekey_book_rules(cur, pairs_sql, params=()):
+    """A book rule follows a finding whose book key changed (a doc-less row
+    whose book was established). `pairs_sql` selects (word, old_key,
+    new_key, clicked); a rule on (word, old_key) is copied onto
+    (word, new_key), unless that pair has a rule of its own, when the copy
+    reaches no row the user did not judge:
+
+    * from a line key ('line:<id>'): the rule was said of that line's book,
+      now known;
+    * to a line key: it covers the same rows as before;
+    * from a title key ('src:<title>', which lumped same-titled books) to a
+      book: only the book of the row the rule was set from (`clicked`).
+      Rows of the title in other books drop back to their own status: the
+      rule was never said of their book.
+    """
+    cur.execute(f'''INSERT OR IGNORE INTO book_rules(word, doc, status,
+                                                     decided_by, updated_at)
+        SELECT DISTINCT b.word, p.new_key, b.status, b.decided_by,
+               b.updated_at
+        FROM ({pairs_sql}) p
+        JOIN book_rules b ON b.word = p.word AND b.doc = p.old_key
+        WHERE p.new_key != p.old_key
+          AND (p.old_key LIKE 'line:%' OR p.new_key LIKE 'line:%'
+               OR p.clicked)''', params)
+
+
 def _schema_rev(con):
     row = con.execute(
         "SELECT value FROM meta WHERE key = 'schema_rev'").fetchone()
@@ -377,6 +523,10 @@ def _migrate(con, outdir=None):
     word_rule_ext) and the keyset sort indexes exist.
     rev 4: word-wide approvals are bound to the suggestion decisions.db
     recorded for them (:func:`_bind_word_approvals`).
+    rev 5: doc-less rows on DB lines get the doc of their book where the
+    line spans establish it (:func:`_resolve_docs`); the rest key by their
+    line instead of their title (BOOKKEY), and book rules made under a
+    title key move to each row's new key.
     Never touches a database of a newer revision; safe to run concurrently.
     decisions.db (when a step writes it) commits first; a lock on it, like
     one on ui_review.db, leaves the upgrade to the next connection.
@@ -420,6 +570,24 @@ def _migrate(con, outdir=None):
                     dec = _decisions_con(outdir,
                                          timeout=MIGRATE_DECISIONS_TIMEOUT)
                 _bind_word_approvals(con, dec)
+        if rev < 5:
+            rekey = con.execute("SELECT 1 FROM book_rules "
+                                "WHERE doc LIKE 'src:%' LIMIT 1").fetchone()
+            if rekey:
+                # the key every doc-less row had before rev 5
+                cur.execute('''CREATE TEMP TABLE bk_old AS
+                    SELECT id, 'src:' || COALESCE(source, '') AS okey
+                    FROM findings WHERE (doc IS NULL OR doc = '')
+                      AND word IN (SELECT word FROM book_rules
+                                   WHERE doc LIKE 'src:%')''')
+            _resolve_docs(cur, 'findings')
+            if rekey:
+                _rekey_book_rules(cur, f'''
+                    SELECT f.word AS word, o.okey AS old_key,
+                           {BOOKKEY} AS new_key,
+                           {BOOK_CLICKED.format(id='f.id')} AS clicked
+                    FROM bk_old o JOIN findings f ON f.id = o.id''')
+                cur.execute('DROP TABLE bk_old')
         cur.execute("INSERT OR REPLACE INTO meta VALUES('schema_rev', ?)",
                     (str(SCHEMA_REV),))
         if dec is not None:
@@ -628,6 +796,24 @@ def config_root_for_report(outdir):
     return os.path.abspath(lib or DEFAULT_LIBRARY)
 
 
+def _report_db_path(cur):
+    """The Otzaria DB the scan behind the attached report (``rep``) read,
+    from its scan_meta; None when the report does not say."""
+    if not cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                       "AND name='scan_meta'").fetchone():
+        return None
+    row = cur.execute(
+        "SELECT value FROM rep.scan_meta WHERE key = 'corpus'").fetchone()
+    try:
+        spec = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    if not isinstance(spec, dict):
+        return None
+    from ..core import spec_db
+    return spec_db(spec)
+
+
 def _report_source(cur, outdir):
     """The identity of the report.db attached as ``rep``: the library root
     its scan read and when it was written, from its own scan_meta table."""
@@ -798,7 +984,7 @@ def import_all(outdir, migrate_legacy=False):
 
         # report.db has no doc for extra_space / tanach / tokdiag rows; a
         # book scan must still find (and only find) its own rows by doc
-        _fill_missing_docs(cur, 'imp')
+        _resolve_docs(cur, 'imp', _report_db_path(cur))
 
         # -- stable-id assignment (see module docstring) ---------------------
         cur.execute(f'''CREATE TEMP TABLE imp2 AS
@@ -812,7 +998,8 @@ def import_all(outdir, migrate_legacy=False):
             SELECT id, family, COALESCE(word,'') AS w, COALESCE(unit,'') AS u,
                    errtype, COALESCE(ref,'') AS r, {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
-                                      ORDER BY id) AS seq
+                                      ORDER BY id) AS seq,
+                   {BOOKKEY} AS bkey
             FROM findings f''')
         cur.execute('''CREATE INDEX temp.ix_oldmap ON oldmap(
             family, w, u, errtype, r, seq)''')
@@ -882,6 +1069,16 @@ def import_all(outdir, migrate_legacy=False):
             SELECT ? + ROW_NUMBER() OVER (ORDER BY i.irow), {icols}
             FROM imp2 i JOIN assign a ON a.irow = i.irow
             WHERE a.old_id IS NULL''', (max_id,))
+        if cur.execute('SELECT 1 FROM book_rules LIMIT 1').fetchone():
+            # a row whose book was established by this import keeps the
+            # book rules it was under (they keyed it by line or title)
+            cur.execute('CREATE INDEX temp.ix_oldmap_bk ON oldmap(w, bkey)')
+            _rekey_book_rules(cur, f'''
+                SELECT o.w AS word, o.bkey AS old_key, {BOOKKEY} AS new_key,
+                       {BOOK_CLICKED.format(id='f.id')} AS clicked
+                FROM book_rules b
+                JOIN oldmap o ON o.w = b.word AND o.bkey = b.doc
+                JOIN findings f ON f.id = o.id''')
         for sql in index_sql:
             cur.execute(sql)
         total = cur.execute('SELECT COUNT(*) FROM findings').fetchone()[0]
@@ -1016,6 +1213,20 @@ def _report_coverage(con):
     return _gap_summary(info)
 
 
+# The rows of book `doc` a merge replaces (params: doc, then doc, title, lo,
+# hi twice; see import_book_scan). One OR over the doc and the doc-less
+# rows' conditions scans the whole table; each branch alone is an idx_f_doc
+# lookup.
+_DOCLESS_OF_BOOK = '''(magiah_doc_of_unit(f.unit) = ?
+    OR (f.source = ? AND f.unit != '' AND f.unit NOT GLOB '*[^0-9]*'
+        AND CAST(f.unit AS INTEGER) BETWEEN ? AND ?))'''
+BOOK_ROWS_SQL = f'''SELECT f.id AS id FROM findings f WHERE f.doc = ?
+    UNION SELECT f.id FROM findings f
+          WHERE f.doc IS NULL AND {_DOCLESS_OF_BOOK}
+    UNION SELECT f.id FROM findings f
+          WHERE f.doc = '' AND {_DOCLESS_OF_BOOK}'''
+
+
 def import_book_scan(outdir, result):
     """Merge ONE book's scan into `findings`, additively.
 
@@ -1037,11 +1248,13 @@ def import_book_scan(outdir, result):
     Which rows belong to the book
     -----------------------------
     ``doc`` is the book identity; the title is NOT (several books share one).
-    ``import_all`` derives a doc for every row it can, but a DB line holding
-    only an extra_space / tokdiag finding has no doc. Such a doc-less row is
-    taken as this book's only when its unit names this doc, or when it has
-    this book's title AND its line id lies within the span of this book's own
-    line ids — a same-titled other book lives on other line ids.
+    ``import_all`` derives a doc for every row it can (:func:`_resolve_docs`),
+    but a row on a DB line whose book it could not establish stays doc-less.
+    Such a row is taken as this book's only when its unit names this doc, or
+    when it has this book's title AND its line id lies within the span of
+    this book's own line ids — a same-titled other book lives on other line
+    ids. Both kinds are found through idx_f_doc; a book rule on a doc-less
+    row taken over moves to this doc.
 
     A book that yields no findings still counts as scanned: its old rows are
     removed, which is the correct outcome for a book the user has just fixed.
@@ -1065,12 +1278,8 @@ def import_book_scan(outdir, result):
                      (result.get('space_errors') or [])
                      if str(r.get('unit') or '').isdigit()]
         lo, hi = (min(line_ids), max(line_ids)) if line_ids else (1, 0)
-        where = ('''(f.doc = ? OR ((f.doc IS NULL OR f.doc = '') AND (
-                       magiah_doc_of_unit(f.unit) = ?
-                       OR (f.source = ? AND f.unit != ''
-                           AND f.unit NOT GLOB '*[^0-9]*'
-                           AND CAST(f.unit AS INTEGER) BETWEEN ? AND ?))))''')
-        wparams = (doc, doc, title, lo, hi)
+        cur.execute(f'CREATE TEMP TABLE bookids AS {BOOK_ROWS_SQL}',
+                    (doc,) + (doc, title, lo, hi) * 2)
 
         # -- remember the decisions currently attached to this book ---------
         cur.execute(f'''CREATE TEMP TABLE oldbook AS
@@ -1079,8 +1288,10 @@ def import_book_scan(outdir, result):
                    f.errtype AS errtype, COALESCE(f.ref,'') AS r,
                    {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
-                                      ORDER BY f.id) AS seq
-            FROM findings f WHERE {where}''', wparams)
+                                      ORDER BY f.id) AS seq,
+                   {BOOKKEY} AS bkey,
+                   {BOOK_CLICKED.format(id='f.id')} AS clicked
+            FROM findings f WHERE f.id IN (SELECT id FROM bookids)''')
         old_total = cur.execute('SELECT COUNT(*) FROM oldbook').fetchone()[0]
         cur.execute('''CREATE TEMP TABLE oldrev AS
             SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
@@ -1204,6 +1415,9 @@ def import_book_scan(outdir, result):
         # approvals whose re-scanned row proposes another correction
         stale = _mark_stale_approvals(
             cur, 'f.doc = ? AND f.id > ?', (doc, max_id))
+        # book rules on the doc-less rows taken over now key by this doc
+        _rekey_book_rules(cur, 'SELECT w AS word, bkey AS old_key, '
+                               '? AS new_key, clicked FROM oldbook', (doc,))
 
         # -- log the dropped legacy approvals --------------------------------
         # The old ids are gone with their history; the entry points at the
@@ -1235,7 +1449,7 @@ def import_book_scan(outdir, result):
         _set_meta_json(cur, 'book_coverage', books)
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
-        for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
+        for t in ('bookids', 'oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
         return {'doc': doc, 'title': result.get('title'),
@@ -1651,7 +1865,11 @@ def _book_key_where(key):
     """SQL for "this finding belongs to book `key`" (see BOOKKEY); split so
     the common doc case can use idx_f_doc."""
     if key.startswith('src:'):
-        return "(f.doc IS NULL OR f.doc = '') AND f.source = ?", key[4:]
+        return ("(f.doc IS NULL OR f.doc = '') AND f.source = ? AND NOT "
+                "(f.unit IS NOT NULL AND " + _DB_LINE.format(u='f.unit')
+                + ')'), key[4:]
+    if key.startswith('line:'):
+        return "(f.doc IS NULL OR f.doc = '') AND f.unit = ?", key[5:]
     return 'f.doc = ?', key
 
 
@@ -2014,8 +2232,7 @@ def _put_review(con, fid, row):
 
 def _rule_key(scope, f):
     if scope == 'book':
-        return {'word': f['word'],
-                'doc': f['doc'] or 'src:' + (f['source'] or '')}
+        return {'word': f['word'], 'doc': book_key(f)}
     if scope == 'replacement':
         return {'word': f['word'], 'suggestion': f['suggestion'] or ''}
     return {'word': f['word']}
