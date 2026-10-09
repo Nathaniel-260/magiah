@@ -2685,30 +2685,42 @@ def reset(con, outdir, scope='statuses'):
     empties decisions.db — the escape hatch from the whitelist feedback."""
     if scope not in ('statuses', 'all'):
         raise ValueError(hebrew.MESSAGES['bad_request'])
-    backup = write_backup(con, outdir)
-    counts = {
-        'review': con.execute('SELECT COUNT(*) FROM review').fetchone()[0],
-        'word_rules': con.execute(
-            'SELECT COUNT(*) FROM word_rules').fetchone()[0],
-        'history': con.execute('SELECT COUNT(*) FROM history').fetchone()[0],
-    }
-    for t in ('review', 'review_ext', 'word_rules', 'word_rule_ext',
-              'book_rules', 'replacement_rules', 'history'):
-        con.execute(f'DELETE FROM {t}')
-    con.commit()
-    counts['decisions'] = 0
-    if scope == 'all':
-        dec = _decisions_con(outdir)
-        try:
+    # ui_review.db locked first, then decisions.db, which commits first (the
+    # order every write takes): a lock on decisions.db fails the whole reset
+    # with DecisionsLocked (423) before anything was cleared
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    dec = None
+    try:
+        if scope == 'all':
+            dec = _decisions_for_write(outdir)
+        backup = write_backup(con, outdir)
+        counts = {
+            'review': con.execute('SELECT COUNT(*) FROM review').fetchone()[0],
+            'word_rules': con.execute(
+                'SELECT COUNT(*) FROM word_rules').fetchone()[0],
+            'history': con.execute(
+                'SELECT COUNT(*) FROM history').fetchone()[0],
+        }
+        for t in ('review', 'review_ext', 'word_rules', 'word_rule_ext',
+                  'book_rules', 'replacement_rules', 'history'):
+            con.execute(f'DELETE FROM {t}')
+        counts['decisions'] = 0
+        if dec is not None:
             counts['decisions'] = dec.execute(
                 'SELECT COUNT(*) FROM decisions').fetchone()[0]
             dec.execute('DELETE FROM decisions')
             dec.execute('DELETE FROM decision_scope')
-            dec.commit()
             con.execute('DELETE FROM owned_decisions')
+            _commit_decisions_first(con, dec)
+        else:
             con.commit()
-        finally:
-            dec.close()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
     return {'backup': backup, 'cleared': counts, 'scope': scope}
 
 
