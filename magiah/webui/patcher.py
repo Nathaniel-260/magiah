@@ -6,7 +6,8 @@ The one rule this module exists to enforce
 **A correction must never land on an unrelated passage.** Everything below is
 an identity check; whenever identity is uncertain the module REFUSES and the
 human is asked. Silence is never an option, and a partial write never happens:
-:func:`plan_all` validates every edit before :func:`write_doc` touches a byte.
+:func:`plan_all` validates every edit before a byte is written — and the only
+writer, ``fixer_api``, writes under the book's lock and its journal.
 
 Why a plain ``line.replace(word, fix)`` would corrupt books
 ----------------------------------------------------------
@@ -68,8 +69,8 @@ CONFLICT_CODES = frozenset((
     'occurrence_count_changed', 'ambiguous_occurrence', 'overlapping_edits',
     'unit_mismatch', 'file_changed_since_edit', 'word_spans_markup',
     'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
-    'source_unknown', 'file_busy', 'already_applied', 'backup_corrupt',
-    'journal_conflict', 'journal_pending',
+    'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
+    'backup_corrupt', 'journal_conflict', 'journal_pending',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -98,6 +99,27 @@ class PatchError(ValueError):
         self.code = code
         self.extra = extra
         super().__init__(message or hebrew.FIXER_MESSAGES.get(code, code))
+
+
+class AccessDenied(PermissionError):
+    """A file or folder the fixer must read or write refuses access: the book
+    is locked by another program or read-only, or its folder does not allow
+    new files. Waiting cannot help, so it is reported at once (HTTP 423),
+    with a Hebrew message and a machine code, like a :class:`PatchError`.
+    """
+
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+def denied_folder(folder):
+    return AccessDenied('folder_not_writable',
+                        _msg('folder_not_writable', folder=folder))
+
+
+def denied_file(path):
+    return AccessDenied('access_denied', _msg('access_denied', path=path))
 
 
 def _msg(code, **fmt):
@@ -193,7 +215,7 @@ class FileDoc:
     """
 
     def __init__(self, path, raw, encoding, lines, line_ends, bom=False,
-                 fingerprint=None):
+                 fingerprint=None, size=None):
         self.path = path
         self.raw = raw                  # decoded text, BOM excluded
         self.encoding = encoding
@@ -201,6 +223,9 @@ class FileDoc:
         self.line_ends = line_ends
         self.bom = bom                  # re-emitted verbatim on write
         self.fingerprint = fingerprint or fingerprint_bytes(self.encode())
+        # bytes on disk when read (BOM included); with the fingerprint, what a
+        # book scan's record is compared against
+        self.size = size
         self._clean = {}                # lineno -> clean(line), for scans
 
     def __len__(self):
@@ -232,8 +257,11 @@ def read_bytes(path):
         raise PatchError('too_big', _msg(
             'too_big', mb=size / 1e6,
             limit=book_source.MAX_BOOK_BYTES / 1e6))
-    with open(path, 'rb') as f:
-        return f.read()
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError as e:       # opened exclusively by another program
+        raise denied_file(path) from e
 
 
 def read_doc(path):
@@ -244,7 +272,7 @@ def read_doc(path):
 def doc_from_bytes(path, data):
     """Parse bytes already read, so the fingerprint and the text a plan is
     made against are guaranteed to be the same version of the file."""
-    fp = fingerprint_bytes(data)
+    fp, size = fingerprint_bytes(data), len(data)
     # the BOM is a property of the file, kept aside so it is neither lost nor
     # invented on write
     bom = data.startswith(b'\xef\xbb\xbf')
@@ -273,7 +301,8 @@ def doc_from_bytes(path, data):
         ends.pop()
     elif not raw:
         lines, ends = [], []           # an empty file has no lines at all
-    doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp)
+    doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp,
+                  size=size)
     if doc.encode() != ((b'\xef\xbb\xbf' + data) if bom else data):
         # a decode/encode round trip that is not byte-exact would rewrite
         # bytes outside every span; refuse rather than write such a file
@@ -284,7 +313,9 @@ def doc_from_bytes(path, data):
 def fingerprint_bytes(text_or_bytes):
     data = (text_or_bytes.encode('utf-8')
             if isinstance(text_or_bytes, str) else text_or_bytes)
-    return 'sha256:' + hashlib.sha256(data).hexdigest()[:32]
+    # one definition with the book scan, which records the fingerprint of the
+    # bytes it read for _locate_line's "unchanged since the scan" test
+    return book_source.file_fingerprint(data)
 
 
 def fingerprint(path):
@@ -292,15 +323,6 @@ def fingerprint(path):
     editors preserve it and FAT rounds it to two seconds."""
     with open(path, 'rb') as f:
         return fingerprint_bytes(f.read())
-
-
-def check_fingerprint(path, expected):
-    if not expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    actual = fingerprint(path)
-    if actual != expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    return actual
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +444,14 @@ def _identify(line, word, snippet):
     return occs, [], None
 
 
+def _copies(text, word):
+    """How many times `word` (one token or several) occurs in `text`."""
+    want = word.split()
+    toks = normalize.tokenize(text or '')
+    return sum(1 for i in range(len(toks) - len(want) + 1)
+               if toks[i:i + len(want)] == want)
+
+
 def _clean_of(doc, n):
     c = doc._clean.get(n)
     if c is None:
@@ -465,15 +495,18 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     inserted above shifts a DIFFERENT sentence that happens to contain the
     word into that slot. So the line must be identified by the snippet; if it
     is not, the finding is looked for nearby (unambiguous matches only).
-    ``trusted`` means the file is byte-identical to the one scanned, so the
-    line number itself is evidence and identical twins nearby do not matter.
+    ``trusted`` means the file is byte-identical to the bytes the scan read
+    (fingerprint and size recorded when the scan read them), so the line
+    number itself is evidence and identical twins nearby do not matter — but
+    only when the snippet window matches that line EXACTLY as well. A token-
+    level match there is a parallel verse as easily as the scanned one.
     """
     here = None
     if lineno < len(doc.lines):
         occs, ident, level = _identify(doc.lines[lineno], word, snippet)
         if level:
             here = (lineno, occs, ident, level, False)
-    if here is not None and not trusted:
+    if here is not None and not (trusted and here[3] == LEVEL_WINDOW):
         # an identical twin nearby means the line number alone is deciding,
         # and a line number is exactly what an insertion invalidates
         twins = _candidates(doc, lineno, word, snippet, skip=lineno)
@@ -521,9 +554,140 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
 # quotes AFTER a word are closing quotation marks, never part of the word.
 _GERESH = "'’׳"
 
-# "(תיקון) [" right before the span and "]" after it: the span is the original
-# half of an earlier bracket-mode correction, and editing it would nest.
+# "(x) [" right before the span and "]" after it: the exact layout the fixer's
+# bracket mode writes, "(correction) [original]". A plain ketiv/qere pair,
+# "(הנער) [הנערה]", looks the same, while Otzaria's Tanach writes ketiv/qere
+# inside mam-kq spans or as "ketiv [qere]", neither of which matches here.
 _BRACKETED_RE = re.compile(r'\([^()\[\]]*\) \[$')
+
+
+def _bare(text):
+    """Text compared without marks, spacing or a trailing geresh."""
+    return normalize.clean(text or '').strip().rstrip("'\"")
+
+
+def _bracket_origin(line, a, b, snippet, corrections, own_edits):
+    """Where ``line[a:b]`` — "(x) [word]" — came from: ``'record'`` or
+    ``'own'`` (the fixer's output), ``'later'`` (unexplained brackets that
+    came after the scan), or ``'scanned'`` (the book's own ketiv/qere).
+
+    The text alone cannot tell the fixer's output from a ketiv/qere pair,
+    and the two mistakes are not alike: taking a real pair for the fixer's
+    output only refuses a correction, while taking the fixer's output for a
+    pair nests brackets into it or overwrites the original half — data lost.
+    So every doubt counts as the fixer's, in this order:
+
+    1. a live record of the fixer sitting exactly there, matched by its text
+       and context on whatever line it is now (lines move; matching a twin
+       line by mistake only refuses) — ``'record'``;
+    2. the parenthesized text is what this finding writes, or the detector's
+       suggestion for it — ``'own'``. Bracket output keeps the original typo
+       inside "[...]", so every later scan flags it again, and a scan in a new
+       folder has no record of it. A ketiv equal to the correction is refused
+       here too: a refusal is the price of never nesting into the fixer's
+       brackets;
+    3. the layout is missing from the scan's snippet: brackets that came
+       after the scan with nothing to explain them — ``'later'``;
+    4. otherwise the book had this pair when it was scanned and nothing ties
+       it to the fixer: ketiv/qere, corrected like any word — ``'scanned'``.
+       (Left open: a pair the fixer wrote with a custom correction, re-scanned
+       in a new folder, then re-applied with yet another correction.)
+    """
+    text = line[a:b]
+    for e in own_edits or ():
+        if e.get('new') == text and _locate_entry(line, e) == a:
+            return 'record'
+    paren = _bare(text[1:text.index(') [')])
+    if paren and any(paren == _bare(c) for c in corrections if c):
+        return 'own'
+    layout = normalize.clean(text).strip()
+    if not (snippet and layout and layout in snippet):
+        return 'later'
+    return 'scanned'
+
+
+def _as_scanned(line, lineno, own_edits):
+    """The line with the fixer's own live edits on it undone: as the scan
+    saw it, as far as the fixer had a hand in it.
+
+    Returns ``(text, undone)`` with each undone edit as ``(now_start,
+    now_end, then_start, then_end)``. An edit no longer found where its
+    record says (edited around by hand since) is left as it is: wherever it
+    matters, the exact checks made on the result then fail, which is the
+    point. None when two records overlap — nothing is proven then.
+    """
+    found = []
+    for e in own_edits or ():
+        if e.get('lineno') != lineno:
+            continue
+        pos = _locate_entry(line, e)
+        if pos is not None:
+            found.append((pos, pos + len(e.get('new') or ''),
+                          e.get('old') or ''))
+    found.sort()
+    parts, undone, prev, then = [], [], 0, 0
+    for a, b, old in found:
+        if a < prev:
+            return None
+        parts.append(line[prev:a])
+        then += a - prev
+        undone.append((a, b, then, then + len(old)))
+        parts.append(old)
+        then += len(old)
+        prev = b
+    parts.append(line[prev:])
+    return ''.join(parts), undone
+
+
+def _scanned_copy(line, lineno, word, finding, spans, own_edits):
+    """Index in `spans` (the copies of `word` on the line now) of the copy
+    the finding means, chosen by the scan's order — and proven, or refused.
+
+    Counting the copies that are left proves nothing: a copy fixed by hand
+    and another one typed in keep the count while shifting every copy after
+    them. So the line is rebuilt as the scan saw it (the fixer's own edits on
+    it undone); there the word must occur as often as the scan counted, and
+    the copy at the finding's place in that order must have the scan's
+    snippet window EXACTLY. Only then is it mapped back onto the line as it
+    is now. Anything less is refused, with the copies offered for a click.
+    """
+    fid = finding.get('id')
+    expected = finding.get('expected_count')
+    occurrence = finding.get('occurrence') or 0
+    snippet = finding.get('snippet')
+
+    def refuse(code):
+        raise PatchError(code, _msg(code, word=word, n=lineno + 1,
+                                    k=len(spans)),
+                         id=fid, candidates=[[s[0], s[1]] for s in spans],
+                         located_line=lineno)
+
+    rebuilt = _as_scanned(line, lineno, own_edits)
+    if rebuilt is None:
+        refuse('ambiguous_occurrence')
+    then, undone = rebuilt
+    clean_then, occs = _occurrences(then, word)
+    if expected is not None and expected != len(occs):
+        refuse('occurrence_count_changed')
+    if not 0 <= occurrence < len(occs):
+        refuse('ambiguous_occurrence')
+    o, r = occs[occurrence], SNIPPET_RADIUS
+    if not snippet or \
+            clean_then[max(0, o[2] - r):o[3] + r].strip() != snippet:
+        refuse('ambiguous_occurrence')
+    shift = 0
+    for a, b, ta, tb in undone:
+        if tb <= o[0]:
+            shift += (b - a) - (tb - ta)
+        elif ta < o[1]:
+            # the fixer already rewrote this very copy (for another finding)
+            raise PatchError('already_applied', _msg(
+                'already_applied', n=lineno + 1), id=fid)
+    hit = [i for i, s in enumerate(spans)
+           if (s[0], s[1]) == (o[0] + shift, o[1] + shift)]
+    if len(hit) != 1:
+        refuse('ambiguous_occurrence')
+    return hit[0]
 
 
 def manual_lines(doc, finding):
@@ -543,13 +707,15 @@ def manual_lines(doc, finding):
 
 
 def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
-              check_vocalization=True):
+              check_vocalization=True, own_edits=None):
     """Verify one finding against the file and return an :class:`EditPlan`.
 
     ``finding`` is a dict with ``id, lineno, word, correction, snippet`` and
     the server-computed ``occurrence``/``expected_count``. ``explicit`` is an
     ``(start, end)`` pair supplied only when the human pointed at the word
     themselves, which resolves an ambiguity that the automatic rules refused.
+    ``own_edits`` are this book's live recorded edits (file_edits detail
+    entries): proof of which text in the file is the fixer's own output.
     """
     fid = finding.get('id')
     lineno = finding.get('lineno')
@@ -602,39 +768,40 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             finding.get('trusted', False))
         line = doc.lines[lineno]
         total = len(spans)
-        expected = finding.get('expected_count')
-        occurrence = finding.get('occurrence') or 0
-        if level == LEVEL_WINDOW and len(ident) == 1:
-            # the window pins the occurrence, whatever else changed
+        if level == LEVEL_WINDOW and len(ident) == 1 \
+                and _copies(finding.get('snippet'), word) == 1:
+            # The window pins the occurrence, whatever else changed — when
+            # the window holds this one copy only. A window holding several
+            # copies can equal the snippet around ANOTHER of them once the
+            # line shifts: on a short line every window is clipped at the
+            # line's ends, so a word typed at the start makes the last
+            # copy's window equal the old whole line. Then the scan's order
+            # must decide, with proof (_scanned_copy).
             occurrence, confidence = ident[0], 'exact'
+        elif total == 1 and finding.get('expected_count') in (None, 1):
+            # the one copy, on a line identified by its words: as scanned
+            occurrence, confidence = 0, 'weak'
         else:
-            # Several equally-identified copies (a short line: every window is
-            # the whole line). Only the scan's own order can choose, and only
-            # while the line still has the count the scan saw — "only one is
-            # left" says nothing about WHICH one the finding meant.
-            if expected is not None and expected != total:
-                raise PatchError(
-                    'occurrence_count_changed',
-                    _msg('occurrence_count_changed', word=word,
-                         n=lineno + 1),
-                    id=fid, candidates=[[s[0], s[1]] for s in spans],
-                    located_line=lineno)
-            if total == 1:
-                occurrence = 0
-            elif not (0 <= occurrence < total) or occurrence not in ident:
-                raise PatchError(
-                    'ambiguous_occurrence',
-                    _msg('ambiguous_occurrence', word=word, n=lineno + 1,
-                         k=total),
-                    id=fid, candidates=[[s[0], s[1]] for s in spans],
-                    located_line=lineno)
-            confidence = 'indexed' if level == LEVEL_WINDOW else 'weak'
+            # Several copies to choose from (on a short line every window is
+            # the whole line), or copies gone or added since the scan: only
+            # the scan's own order can choose, and only with proof.
+            occurrence = _scanned_copy(line, lineno, word, finding, spans,
+                                       own_edits)
+            confidence = 'indexed'
         start, end = spans[occurrence][0], spans[occurrence][1]
 
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
-    if _BRACKETED_RE.search(line[:start]) and line[close:close + 1] == ']':
-        raise PatchError('already_applied', _msg('already_applied',
-                                                 n=lineno + 1), id=fid)
+    opened = _BRACKETED_RE.search(line[:start])
+    if opened and line[close:close + 1] == ']':
+        origin = _bracket_origin(
+            line, opened.start(), close + 1, finding.get('snippet'),
+            (correction, finding.get('suggestion')), own_edits)
+        if origin in ('record', 'own'):
+            raise PatchError('already_applied', _msg('already_applied',
+                                                     n=lineno + 1), id=fid)
+        if origin == 'later':
+            raise PatchError('already_bracketed', _msg(
+                'already_bracketed', word=word, n=lineno + 1), id=fid)
 
     # A trailing geresh belongs to the abbreviation. It stays attached to the
     # correction; a correction that brings its own replaces it (never two).
@@ -678,7 +845,7 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
 
 
 def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
-             explicit=None):
+             explicit=None, own_edits=None):
     """Plan every edit, collecting failures instead of raising on the first.
 
     Returns ``(plans, failures)``. The caller writes ONLY when `failures` is
@@ -691,7 +858,7 @@ def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
         fid = f.get('id')
         try:
             plans.append(plan_edit(doc, f, modes.get(fid, default_mode),
-                                   explicit.get(fid)))
+                                   explicit.get(fid), own_edits=own_edits))
         except PatchError as e:
             failures.append(dict({'id': fid, 'code': e.code,
                                   'message': str(e)}, **e.extra))
@@ -872,12 +1039,14 @@ def write_backup(outdir, path, data):
     name; returns ``(backup_path, sha)``."""
     for _ in range(5):
         bpath = backup_path(outdir, path)
-        os.makedirs(os.path.dirname(bpath), exist_ok=True)
         try:
+            os.makedirs(os.path.dirname(bpath), exist_ok=True)
             _write_new(bpath, data)
             return bpath, fingerprint_bytes(data)
         except FileExistsError:
             continue
+        except PermissionError as e:
+            raise denied_folder(os.path.dirname(bpath)) from e
     raise FileExistsError(bpath)
 
 
@@ -885,8 +1054,11 @@ def write_backup(outdir, path, data):
 STALE_TEMP_SECONDS = 600
 
 
-def _clean_stale_temps(path):
-    """Remove this book's own temp files that a crash left behind."""
+def _clean_stale_temps(path, max_age=STALE_TEMP_SECONDS):
+    """Remove this book's own temp files that a crash left behind: those
+    older than `max_age` seconds, or all of them with ``max_age=0`` — which
+    only a holder of the book's lock may ask for: every writer of these
+    files holds it, so then none of them is still being written."""
     d, base = os.path.split(path)
     pat = re.compile(re.escape(base) + r'\.[0-9a-f]{32}\.tmp$')
     try:
@@ -898,7 +1070,7 @@ def _clean_stale_temps(path):
         if pat.match(n):
             full = os.path.join(d, n)
             try:
-                if now - os.path.getmtime(full) > STALE_TEMP_SECONDS:
+                if max_age <= 0 or now - os.path.getmtime(full) > max_age:
                     os.remove(full)
             except OSError:
                 pass
@@ -909,36 +1081,29 @@ def atomic_write(path, data):
     sees the old book or the new one, never half of either."""
     _clean_stale_temps(path)
     tmp = temp_path_for(path)
+    placed = False
     try:
         _write_new(tmp, data)
+        placed = True
         os.replace(tmp, path)
-    except BaseException:
+    except BaseException as e:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
+        if isinstance(e, PermissionError) and not isinstance(e, AccessDenied):
+            # the raw error names the temp file, in English; say what it means
+            if placed:
+                raise denied_file(path) from e        # locked or read-only
+            raise denied_folder(os.path.dirname(path) or '.') from e
         raise
     return fingerprint_bytes(data)
 
 
-def write_doc(doc, outdir):
-    """Back the file up, then replace it atomically.
-
-    Order matters: the backup is taken FIRST, so any later failure — a locked
-    file, a full disk, a crash — leaves the user with both the untouched
-    original and a copy. The fixer's own write path (fixer_api.apply) adds a
-    lock and a journal around these same two steps.
-    """
-    with open(doc.path, 'rb') as f:
-        before = f.read()
-    bpath, bsha = write_backup(outdir, doc.path, before)  # PermissionError -> 423
-    data = doc.encode()
-    atomic_write(doc.path, data)
-    doc.raw = doc.text()
-    doc.fingerprint = fingerprint_bytes(data)
-    return {'backup': bpath, 'backup_sha': bsha,
-            'fingerprint': doc.fingerprint, 'bytes': len(data)}
+# There is deliberately no "write this doc" or "restore this backup" helper
+# here: a write that skipped the book's lock and its journal would reopen the
+# lost-update and no-undo holes. fixer_api._write_journaled is the only writer.
 
 
 def backup_file(outdir, backup):
@@ -961,24 +1126,6 @@ def read_backup(outdir, backup, expect_sha=None):
     if expect_sha and fingerprint_bytes(data) != expect_sha:
         raise PatchError('backup_corrupt', _msg('backup_corrupt'))
     return data
-
-
-def restore_backup(outdir, backup, path, expect_fingerprint=None,
-                   backup_fingerprint=None):
-    """Put a backup back, refusing if the file changed after we wrote it.
-
-    If the corrector edited the book by hand since the fix was applied,
-    restoring would destroy that work, so a fingerprint mismatch refuses
-    instead (fixer_api.undo_file then tries a span-level undo).
-    """
-    full = backup_file(outdir, backup)
-    if not os.path.isfile(path):
-        raise PatchError('not_a_file', _msg('not_a_file', path=path))
-    data = read_backup(outdir, full, backup_fingerprint)
-    if expect_fingerprint and fingerprint(path) != expect_fingerprint:
-        raise PatchError('file_changed_since_edit',
-                         _msg('file_changed_since_edit'))
-    return {'restored': path, 'fingerprint': atomic_write(path, data)}
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1161,7 @@ def anchor_rows(doc, rows, applied=None):
     such instead of being re-anchored inside its own correction.
     """
     applied = applied or {}
+    own = list(applied.values())
     for r in rows:
         e = applied.get(r.get('id'))
         if e is not None and entry_in_place(doc, e):
@@ -1028,11 +1176,12 @@ def anchor_rows(doc, rows, applied=None):
                 'id': r.get('id'), 'lineno': r.get('lineno'),
                 'word': r.get('word'),
                 'correction': r.get('correction') or r.get('word'),
+                'suggestion': r.get('suggestion'),
                 'snippet': r.get('snippet'),
                 'occurrence': r.get('occurrence'),
                 'expected_count': r.get('expected_count'),
                 'trusted': r.get('trusted', False)},
-                check_vocalization=False)
+                check_vocalization=False, own_edits=own)
             r['anchor'] = {'ok': True, 'start': plan.start, 'end': plan.end,
                            'confidence': plan.confidence,
                            'spans_markup': plan.spans_markup,

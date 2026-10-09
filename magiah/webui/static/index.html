@@ -82,6 +82,8 @@
   </aside>
 
   <main id="main">
+    <!-- result status (UI_SPEC §9f): filled by renderResultBanner() -->
+    <div id="resultBanner" role="status" aria-live="polite" hidden></div>
     <nav id="viewtabs">
       <button data-view="table" class="active">📋 תצוגת טבלה</button>
       <button data-view="cards">🗂 תצוגת כרטיסים</button>
@@ -140,6 +142,7 @@
           <div class="pbar"><div id="fixProgressBar" style="width:0%"></div></div>
         </div>
       </div>
+      <div id="fixConflicts" hidden></div>
       <div id="fixerBanner" hidden></div>
       <div id="fixPickBar">
         <span id="fixPickCount"></span>

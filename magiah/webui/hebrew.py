@@ -120,7 +120,7 @@ ERRTYPES = {
             'עיבודים של אותו מקור (למשל עם טעמים / עם ניקוד / אותיות בלבד) '
             'נספרים כמקור אחד. הבדלי קרי וכתיב והבדלי כתיב מלא/חסר אינם '
             'מדווחים. עמודת ההצעה מציגה את הנוסח המוסכם, ובפרטים מופיעים '
-            'העדים. ממצא שסומן tanach_legacy נוצר בשיטה הישנה ודורש בדיקה '
+            'העדים. ממצא שסומן "שיטה ישנה" נוצר בשיטה הישנה ודורש בדיקה '
             'מחדש.',
     },
     'tanach_match': {
@@ -402,6 +402,53 @@ FAMILIES = {
 }
 
 # ---------------------------------------------------------------------------
+# Tanach evidence (magiah.tanach): the evidence kinds and reason codes stored
+# in a finding's `extra`, and the `extra` keys themselves, as the finding
+# drawer shows them. Unknown codes are shown as-is.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_LABELS = {
+    'tanach_legacy': 'שיטה ישנה — דורש בדיקה מחדש',
+    'tanach_verse_variant': 'נוסח הפסוק זהה להצעת הגלאי',
+    'tanach_disagrees': 'נוסח הפסוק שונה מהצעת הגלאי — להכרעה ידנית',
+    'tanach_verse_match': 'המילה זהה לנוסח הפסוק',
+    'tanach_edition_variant': 'מהדורה חורגת מנוסח מוסכם',
+    'tanach_edition_unresolved': 'מחלוקת מהדורות שלא הוכרעה (לידיעה)',
+    'tanach_plene': 'הבדל כתיב מלא/חסר',
+    'tanach_qere_ketiv': 'קרי וכתיב',
+    'tanach_single_source': 'נוסח של מקור יחיד',
+    'tanach_disputed': 'המקורות הבלתי תלויים חלוקים',
+    'tanach_unrelated': 'מילה אחרת, לא שיבוש כתיב',
+    'tanach_ambiguous': 'ההקשר מתאים ליותר מפסוק אחד',
+    # reasons of an unresolved edition disagreement
+    'one_against_one': 'מקור אחד מול מקור אחד',
+    'no_majority': 'אין רוב של מקורות בלתי תלויים',
+    'intra_source': 'עיבודים של אותו מקור חלוקים ביניהם',
+    'plene': 'הבדל כתיב מלא/חסר',
+    'qere_ketiv': 'קרי וכתיב',
+    'unrelated': 'מילה אחרת, לא שיבוש כתיב',
+}
+
+EXTRA_LABELS = {
+    'evidence_kind': 'סוג הראיה',
+    'reason': 'סיבה',
+    'recheck': 'דורש בדיקה מחדש',
+    'canonical': 'הנוסח המוסכם',
+    'ref': 'מקום בתנ"ך',
+    'verse_line': 'מזהה שורת הפסוק',
+    'reading': 'נוסח הפסוק',
+    'readings': 'הגרסאות',
+    'aligned_tokens': 'מילים מיושרות',
+    'occurrences': 'מהדורות',
+    'works': 'ספרים',
+    'independent_sources': 'מקורות בלתי תלויים',
+    'witnesses': 'העדים',
+    'minority_source': 'מקור המיעוט',
+    'minority_editions': 'מהדורות המיעוט',
+    'source': 'מקור',
+}
+
+# ---------------------------------------------------------------------------
 # §9d — scan-from-UI: Hebrew label + explanation + default for every Config
 # threshold, for the pipeline stages, and for the corpus modes.
 # ---------------------------------------------------------------------------
@@ -514,6 +561,21 @@ CONFIG_LABELS = {
             'נתיבים לקבצי מילים (מילה בכל שורה) שלעולם לא יסומנו כשגיאה. '
             'שורה אחת לכל קובץ. ברירת מחדל: ללא.',
     },
+    # the label must start with core.ALLOW_UNREAD_UI — the CLI's messages
+    # send the user to this field by that name
+    'allow_unread': {
+        'hebrew': 'שורות לא קריאות מותרות (allow_unread)',
+        'explanation':
+            'כמה שורות קלט שאי אפשר לקרוא מותר לסריקה לדלג עליהן: שורות '
+            'פגומות או חסרות במסד הנתונים, או קובצי טקסט שלא נפתחו (קובץ '
+            'כזה נספר כשורה אחת). ב-0 הסריקה נעצרת בכל שורה שלא נקראה. ערך '
+            'גדול מ-0 מאפשר להשלים סריקה של מקור נתונים שהתקבל פגום: השורות '
+            'האלה לא נסרקות, והתוצאות מסומנות כחלקיות יחד עם רשימת השורות '
+            'שחסרו. '
+            'הערך חל על ההרצה הנוכחית בלבד ואינו נשמר — גם המשך עבודה על '
+            'תוצאות חלקיות קיימות (למשל סריקת ספר בודד מול מילון חלקי) '
+            'דורש אותו שוב. ברירת מחדל: 0.',
+    },
 }
 
 STAGE_LABELS = {
@@ -597,6 +659,10 @@ SCAN_MESSAGES = {
     'cancelled': 'הסריקה בוטלה על ידי המשתמש',
     'cancel_sent': 'בקשת הביטול נשלחה — התהליך מופסק',
     'started': 'הסריקה הופעלה',
+    # recorded when a stage process ended without saying why (killed from
+    # outside, or it could not even start)
+    'stage_exit': 'תהליך השלב הסתיים בקוד שגיאה {rc} בלי לדווח על הסיבה '
+                  '(ייתכן שנסגר מבחוץ, או שלא הצליח לעלות)',
     # --- single-book scan ---------------------------------------------------
     'book_started': 'סריקת הספר הופעלה',
     'book_no_book': 'לא נבחר ספר לסריקה',
@@ -609,6 +675,11 @@ SCAN_MESSAGES = {
     'book_done': 'סריקת הספר הושלמה',
     # shown when a re-scan silently keeps decisions the user made earlier
     'book_kept_decisions': 'החלטות שנשמרו מהסריקה הקודמת של הספר: ',
+    # added to the start confirmation when allow_unread > 0 ({n}: the value)
+    'allow_unread_confirm': (
+        '⚠ הסריקה תדלג על עד {n} שורות שלא ניתן לקרוא (במסד הנתונים, או '
+        'קובצי טקסט שלא נפתחו), והתוצאות יסומנו כחלקיות. ההיתר חל על הרצה '
+        'זו בלבד.'),
 }
 
 # ---------------------------------------------------------------------------
@@ -670,8 +741,159 @@ MESSAGES = {
     'server_error': 'שגיאה פנימית בשרת',
     'legacy_decision_kept': 'החלטה ישנה נשמרה ולא נמחקה (היא לא נוצרה '
                             'בממשק זה) עבור המילה: ',
+    'decisions_locked': 'הקובץ decisions.db נעול בידי תוכנה אחרת (למשל כלי '
+                        'הסקירה הישן), ולכן טעינת הממצאים לא בוצעה ושום '
+                        'דבר לא השתנה. יש לסגור אותה ולנסות שוב.',
+    # the same lock, met by an action other than loading (undo, restore)
+    'decisions_locked_action': 'הקובץ decisions.db נעול בידי תוכנה אחרת '
+                               '(למשל כלי הסקירה הישן), ולכן הפעולה לא '
+                               'בוצעה ושום דבר לא השתנה. יש לסגור אותה '
+                               'ולנסות שוב.',
+    'legacy_accept_recheck': 'החלטה ישנה: אושר עם ההצעה "{sugg}", על סמך '
+                             'ראיית תנ"ך בשיטה הישנה — יש לבדוק מחדש',
     'import_done': 'הייבוא הושלם',
     'export_done': 'הייצוא הושלם',
+}
+
+
+# ---------------------------------------------------------------------------
+# Result status (UI_SPEC §9f): the persistent banner that says whether the
+# findings shown are those of the latest scan. Built by result_status.py.
+# ---------------------------------------------------------------------------
+
+RESULT_STATUS = {
+    # -- the results are not those of the latest scan -------------------------
+    'stale_title': {
+        'failed': 'הסריקה האחרונה נכשלה',
+        'partial': 'הסריקה האחרונה לא קראה את כל הקלט',
+        'cancelled': 'הסריקה האחרונה בוטלה לפני שהסתיימה',
+        'interrupted': 'הסריקה האחרונה נקטעה באמצע',
+        'unknown': 'לא ידוע אם הסריקה האחרונה הסתיימה',
+    },
+    # appended to the title when there are findings on screen
+    'stale_title_shown': {
+        'unknown': ' — ייתכן שהממצאים המוצגים אינם מעודכנים',
+        'default': ' — הממצאים המוצגים אינם מעודכנים',
+    },
+    'stale_what': {
+        'failed': 'הסריקה שהתחילה ב־{started} נכשלה בשלב «{stage}».',
+        # also a stage that refused the partial output of an earlier one
+        'partial': 'בסריקה שהתחילה ב־{started}, שלב «{stage}» נעצר כי חלק '
+                   'מהקלט שלו לא נקרא (הסיבה המלאה בפרטים).',
+        'cancelled': 'הסריקה שהתחילה ב־{started} בוטלה בשלב «{stage}».',
+        'interrupted': 'הסריקה שהתחילה ב־{started} נעצרה בשלב «{stage}» '
+                       'בלי לסיים — למשל כי החלון נסגר, התהליך הופסק או '
+                       'שהמחשב כבה.',
+        'unknown': 'קובץ מצב הסריקה פגום ואי אפשר לקרוא אותו: {path}',
+        # no run record: the evidence is a coverage file (older versions)
+        'coverage': 'הריצה האחרונה של שלב «{stage}» לא קראה את כל הקלט, '
+                    'ולכן התוצרים שלו ושל השלבים שאחריו לא עודכנו.',
+    },
+    'stale_shown': 'הממצאים שמוצגים כאן הם מהסריקה הקודמת שהושלמה '
+                   '({results_at}).',
+    'stale_shown_undated': 'הממצאים שמוצגים כאן הם מסריקה קודמת שהושלמה.',
+    'stale_shown_empty': 'הסריקה הקודמת שהושלמה ({results_at}) לא מצאה '
+                         'ממצאים, ולכן אין ממצאים להצגה.',
+    'stale_none': 'עדיין לא הושלמה בתיקייה הזו אף סריקה, ולכן אין ממצאים '
+                  'להצגה.',
+    'stale_keep': 'ההחלטות שלכם נשמרו ואפשר להמשיך לעבוד, אבל ייתכן '
+                  'שהממצאים אינם משקפים את מצב הספרים כעת.',
+    'stale_todo': 'לבדוק את הסיבה (בפרטים), לתקן אותה ולהריץ את הסריקה '
+                  'שוב. ההודעה תיעלם מעצמה כשסריקה תסתיים בהצלחה.',
+    # -- report.db is newer than what was loaded ------------------------------
+    'refresh_title': 'יש תוצאות סריקה חדשות שעדיין לא נטענו',
+    'refresh_text': 'קובץ התוצאות report.db עודכן ב־{report_at}, אחרי '
+                    'שהממצאים המוצגים נטענו ממנו ({results_at}). כדי לראות '
+                    'את התוצאות החדשות יש לרענן את הממצאים — החלטות על '
+                    'ממצאים שעדיין קיימים יישמרו.',
+    # -- single-book scans that did not complete ------------------------------
+    'book_title': 'סריקת ספר בודד לא הושלמה',
+    'book_what': {
+        'failed': 'סריקת «{book}» שהתחילה ב־{started} נכשלה.',
+        'interrupted': 'סריקת «{book}» שהתחילה ב־{started} נקטעה באמצע.',
+    },
+    'book_after': 'הממצאים של הספר הזה נשארו כפי שהיו לפניה, ושאר הממצאים '
+                  'לא הושפעו ממנה.',
+    'book_todo': 'לבדוק את הסיבה (בפרטים) ולסרוק את הספר שוב. ההודעה '
+                 'תיעלם כשסריקה של הספר הזה תסתיים בהצלחה.',
+    # appended when a full scan reads the book(s) too (runstate: superseded)
+    'book_todo_full': ' גם סריקה מלאה שתסתיים בהצלחה תסיר מההודעה את '
+                      'ספרי המאגר, כי היא קוראת אותם מחדש.',
+    # a book from the database whose scan failed before its title was known
+    'book_db_key': 'ספר {key} במסד הנתונים',
+    # more than one book: one notice, the books named compactly
+    'books_title': 'סריקות ספר בודד שלא הושלמו: {n} ספרים',
+    'books_what': 'הסריקה האחרונה של כל אחד מהספרים {books} נכשלה או נקטעה '
+                  'באמצע.',
+    'books_more': 'ועוד {n}',
+    'books_after': 'הממצאים של הספרים האלה נשארו כפי שהיו לפני הסריקות, '
+                   'ושאר הממצאים לא הושפעו מהן.',
+    'books_todo': 'לבדוק את הסיבות (בפרטים) ולסרוק את הספרים שוב. כל ספר '
+                  'יוסר מההודעה כשסריקה שלו תסתיים בהצלחה.',
+    'books_detail': {
+        'failed': '«{book}» — נכשלה (התחילה ב־{started})',
+        'interrupted': '«{book}» — נקטעה באמצע (התחילה ב־{started})',
+    },
+    # -- buttons and other wording --------------------------------------------
+    'action_scan': 'ניהול סריקה',
+    'action_book_scan': 'סריקת ספר בודד',
+    'action_refresh': 'רענון הממצאים',
+    # /api/refresh when the results it loaded are not the latest scan's
+    'refresh_stale': 'הממצאים נטענו מחדש, אבל הם מהסריקה הקודמת שהושלמה — '
+                     'הסריקה האחרונה לא הושלמה (הפרטים בהודעה שבראש '
+                     'המסך). {counts}',
+}
+
+# The findings rest on rows a scan could not read, skipped on explicit
+# request (--allow-unread / the "שורות לא קריאות מותרות" field): one more
+# result-status notice, built by result_status.coverage_notice().
+
+# Worded by what was skipped (core.gap_record's ``unread_kind``): rows of a
+# database (seforim.db, or an SQLite corpus), text files of a folder or of
+# the library — an unreadable file counts as one — both, or, for a record
+# that does not say, input in general.
+COVERAGE_NOTICE = {
+    'title': {
+        'db': 'הממצאים מבוססים על קריאה חלקית של מסד הנתונים',
+        'files': 'הממצאים מבוססים על קריאה חלקית של קובצי הטקסט',
+        'input': 'הממצאים מבוססים על קריאה חלקית של מקור הנתונים',
+    },
+    # {rows}: how many
+    'what': {
+        'db': '{rows} שורות במסד הנתונים',
+        'files': '{rows} קובצי טקסט',
+        'mixed': '{rows} שורות במסד הנתונים וקובצי טקסט',
+        'input': '{rows} שורות קלט',
+    },
+    'why': {
+        'db': ' (פגומות או חסרות)',
+        'files': ' (פגומים, חסרים או ללא הרשאת קריאה)',
+        'mixed': '',
+        'input': '',
+    },
+    'scan': 'הסריקה דילגה על {what} שלא ניתן היה לקרוא{why}, לפי אישור '
+            'מפורש (‎--allow-unread {limit}‎): שגיאות בקלט שדולג לא '
+            'אותרו.',
+    # the lexicon itself was built without them (inherited from `lexicon`)
+    'scan_lexicon': ' גם המילון נבנה בלעדיו, ולכן המילים שבו אינן נספרות '
+                    'בשכיחויות.',
+    'book': 'סריקת הספר «{title}» דילגה על {what} שלא ניתן היה לקרוא '
+            '(‎--allow-unread {limit}‎).',
+    'book_lexicon': 'סריקת הספר «{title}» נשענת על קריאה חלקית: {what} לא '
+                    'נקראו בה או במילון שנבנה לפניה (‎--allow-unread '
+                    '{limit}‎).',
+    'hint': {
+        'db': 'השורות פגומות במסד הנתונים כפי שהתקבל, ואין צורך לעשות דבר '
+              'כדי להמשיך לעבוד. כשיהיה מסד נתונים תקין, סריקה חוזרת בלי '
+              'ההיתר תסיר את ההודעה.',
+        'files': 'אין צורך לעשות דבר כדי להמשיך לעבוד. כשהקבצים יהיו '
+                 'קריאים (תוקנו, הוחזרו או קיבלו הרשאה), סריקה חוזרת בלי '
+                 'ההיתר תסיר את ההודעה.',
+        'input': 'אין צורך לעשות דבר כדי להמשיך לעבוד. כשמקור הנתונים יהיה '
+                 'תקין, סריקה חוזרת בלי ההיתר תסיר את ההודעה.',
+    },
+    'more': 'הרשימה חלקית — הרשימה המלאה בקובצי coverage_*.json בתיקיית '
+            'הסריקה.',
 }
 
 
@@ -741,15 +963,26 @@ FIXER_MESSAGES = {
     'nothing_to_apply': 'לא נבחרו תיקונים להחלה',
     'apply_refused': 'חלק מהתיקונים לא אושרו — לא נכתב דבר לקובץ',
     'locked': 'הקובץ נעול (כנראה פתוח בעורך אחר) — יש לסגור אותו ולנסות שוב',
+    # a permission problem is not "busy": waiting never helps, so say so now
+    'access_denied': 'אין גישה לקובץ {path} — ייתכן שהוא פתוח בתוכנה אחרת '
+                     'שנעלה אותו, או שהוא מוגדר לקריאה בלבד. לא נכתב דבר. '
+                     'יש לסגור את התוכנה או לבטל את הקריאה בלבד, ולנסות שוב.',
+    'folder_not_writable': 'אין אפשרות ליצור קבצים בתיקייה {folder} — אין '
+                           'הרשאת כתיבה בה, או שהיא לקריאה בלבד. כדי לכתוב '
+                           'בבטחה המתקן יוצר בה קובץ נעילה וקובץ זמני, ולכן '
+                           'לא נכתב דבר. יש לתקן את הרשאות התיקייה ולנסות '
+                           'שוב.',
     'db_warning': 'התיקון נכתב לקובץ בהצלחה, אך עדכון הסטטוס במסד הנתונים '
                   'נכשל — אפשר לסמן «תוקן בספר» ידנית',
     'file_untouched': 'הסטטוס בוטל, אך הקובץ עצמו לא שוחזר — לשחזור הקובץ '
                       'יש להשתמש בכפתור «שחזור מגיבוי»',
 
     # -- identity of the line and of the library --
+    # no click is offered here: nothing identifies a line to click on
     'line_mismatch': 'המילה «{word}» נמצאת בשורה {n}, אך השורה אינה השורה '
-                     'שנסרקה (ייתכן שנוספה או נמחקה שורה) — יש לסרוק את '
-                     'הספר מחדש או לסמן את המילה ידנית',
+                     'שנסרקה (ייתכן שנוספה, נמחקה או שונתה שורה), ולכן '
+                     'התיקון לא ייכתב בה — יש לסרוק את הספר מחדש, או לתקן '
+                     'את המילה ישירות בקובץ ולסמן את הממצא «תוקן»',
     'ambiguous_line': 'הקטע של «{word}» (שורה {n}) מופיע בכמה שורות סמוכות '
                       'זהות — לא ברור איזו מהן נסרקה. יש לסמן את המילה '
                       'ידנית בשורה הנכונה',
@@ -764,6 +997,11 @@ FIXER_MESSAGES = {
                           'תיקון מנוקד או לבחור במצב «סוגריים»',
     'bad_correction': 'התיקון מכיל מעבר שורה ולכן לא ייכתב',
     'already_applied': 'התיקון כבר נמצא בקובץ (שורה {n}) — לא נכתב שוב',
+    'already_bracketed': 'המילה «{word}» בשורה {n} נמצאת בתוך סוגריים '
+                         '«(…) […]» שלא היו שם בזמן הסריקה, ואין רישום שהכלי '
+                         'כתב אותם — כנראה תיקון קודם במצב סוגריים. תיקון '
+                         'נוסף היה מקנן סוגריים או דורס את המילה המקורית, '
+                         'ולכן בוטל. אם צריך, יש לתקן ישירות בקובץ.',
     'file_busy': 'הקובץ נמצא כעת בכתיבה על ידי פעולה אחרת — יש לנסות שוב '
                  'בעוד רגע',
     'backup_corrupt': 'קובץ הגיבוי אינו תואם את מה שנשמר בזמן הכתיבה, ולכן '

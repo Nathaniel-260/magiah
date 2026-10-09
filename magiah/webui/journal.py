@@ -52,11 +52,26 @@ COMPACT_BYTES = 256 * 1024
 TERMINAL = ('committed', 'aborted', 'conflict')
 
 _guard = threading.Lock()
-_locks = {}                      # normalized path -> [RLock, depth, stop]
+_locks = {}                      # _key(path) -> [RLock, depth, stop]
 
 
 def _key(path):
-    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    """One key per book FILE, however its path is spelled.
+
+    realpath does not map a ``\\\\server\\share`` spelling onto the drive
+    letter of the same folder (or back), and the fixer accepts both for one
+    library, so the folder is keyed by its volume and file id. The file
+    itself is not: every write replaces it, and with it its id.
+    """
+    p = os.path.realpath(os.path.abspath(path))
+    folder, name = os.path.split(p)
+    try:
+        st = os.stat(folder)
+    except (OSError, ValueError):
+        st = None
+    if st is not None and st.st_ino and st.st_dev:
+        return 'id:%x:%x:%s' % (st.st_dev, st.st_ino, os.path.normcase(name))
+    return os.path.normcase(p)
 
 
 def _busy():
@@ -64,45 +79,64 @@ def _busy():
 
 
 def _break_if_stale(lf):
-    """Remove a dead holder's lock file; any failure just means 'still busy'."""
+    """Remove a dead holder's lock file; True when it is gone. Any failure
+    just means 'still busy'."""
     try:
         if time.time() - os.path.getmtime(lf) <= STALE_LOCK_SECONDS:
-            return
+            return False
         aside = '%s.%s.stale' % (lf, uuid.uuid4().hex)
         os.rename(lf, aside)
     except OSError:
-        return
+        return False
     try:
         if time.time() - os.path.getmtime(aside) <= STALE_LOCK_SECONDS:
             # a live holder re-created it between our check and the rename
             if not os.path.exists(lf):
                 os.rename(aside, lf)
-                return
+                return False
         os.remove(aside)
     except OSError:
         pass
+    return True
 
 
 def _acquire_lock_file(lf, deadline):
-    if not os.path.isdir(os.path.dirname(lf) or '.'):
+    folder = os.path.dirname(lf) or '.'
+    if not os.path.isdir(folder):
         return                        # the book's folder is gone: nothing to guard
+    denied = retried = False
     while True:
         try:
             fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError):
-            # PermissionError: Windows reports a lock file that is being
-            # deleted ("delete pending") this way — busy, not fatal
-            _break_if_stale(lf)
-            if time.time() >= deadline:
-                raise _busy()
-            time.sleep(0.05)
+        except FileExistsError:
+            pass
+        except PermissionError:
+            # Windows reports a lock file that is being deleted ("delete
+            # pending") this way: busy, not fatal. With no lock file there at
+            # all, the folder itself refuses new files, and no amount of
+            # waiting helps: say so at once rather than "busy, try again".
+            if not os.path.lexists(lf):
+                if denied:
+                    raise patcher.denied_folder(folder)
+                denied = True         # a pending delete may just have ended
+                time.sleep(0.05)
+                continue
+        else:
+            try:
+                os.write(fd, json.dumps({'pid': os.getpid(),
+                                         'ts': time.time()}).encode('ascii'))
+            finally:
+                os.close(fd)
+            return
+        if _break_if_stale(lf) and not retried:
+            # a dead holder's lock is gone: take it now, even past the
+            # deadline — a page load has no time to wait at all, and would
+            # otherwise break the lock and still report the book as busy
+            retried = True
             continue
-        try:
-            os.write(fd, json.dumps({'pid': os.getpid(),
-                                     'ts': time.time()}).encode('ascii'))
-        finally:
-            os.close(fd)
-        return
+        if time.time() >= deadline:
+            raise _busy()
+        time.sleep(0.05)
 
 
 def _keep_fresh(lf, stop):
@@ -327,7 +361,8 @@ def recover(con, outdir, path=None, wait=True):
     """Settle every open intent (for one file, or all). Returns one dict per
     intent: ``{'jid', 'path', 'kind', 'state'}``; ``state`` stays 'pending'
     when the database is still failing, and is 'busy' when ``wait`` is False
-    and another writer holds the file."""
+    and another writer holds the file ('denied' when the file or its folder
+    refuses access; with ``wait`` that error is raised instead)."""
     intents, last, _r = _settled(outdir)
     order = list(intents.values())
     k = _key(path) if path else None
@@ -354,10 +389,20 @@ def recover(con, outdir, path=None, wait=True):
                     state = 'conflict'
                 finish(outdir, rec['jid'], state, fp_seen=fp, **extra)
                 last[rec['jid']] = {'op': state}
+                # the interrupted write may have left its partial temp file
+                # next to the book; its stale lock went when this one was
+                # taken (and goes on release)
+                patcher._clean_stale_temps(p, max_age=0)
         except patcher.PatchError as e:
             if e.code != 'file_busy':
                 raise
             state = 'busy'
+        except PermissionError:
+            # the book (or its folder) refuses access: a writer is told why
+            # it cannot go on; a page load just leaves the intent open
+            if wait:
+                raise
+            state = 'denied'
         except Exception:
             # the DB is still unavailable: leave the intent open; writers
             # refuse this file until it is settled

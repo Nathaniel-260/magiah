@@ -25,8 +25,8 @@ reason a correction for one of them can never reach another.
 import json
 import os
 import sqlite3
+import stat
 import traceback
-from datetime import datetime
 
 from ..corpus_hybrid import DEFAULT_LIBRARY
 from . import db, hebrew, journal, patcher, scanner
@@ -61,6 +61,26 @@ def _norm(path):
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
+def _same_root(a, b):
+    """Do two spellings name one library folder?
+
+    First by normalized real path; then by file identity, because realpath
+    leaves ``\\\\server\\share\\...`` and a drive letter for the same folder
+    apart, while both report the same volume and file id. A folder that is
+    missing, or a filesystem without file ids (id 0), compares by path only,
+    so a doubt is always a mismatch, never a match.
+    """
+    if _norm(a) == _norm(b):
+        return True
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except (OSError, ValueError):
+        return False
+    return (stat.S_ISDIR(sa.st_mode) and stat.S_ISDIR(sb.st_mode)
+            and bool(sa.st_ino) and bool(sa.st_dev)
+            and (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino))
+
+
 def _row_scope(row):
     """'report' for full-scan rows, 'doc:<doc>' for single-book-scan rows."""
     extra = row.get('extra') or {}
@@ -72,19 +92,6 @@ def _row_scope(row):
     if isinstance(extra, dict) and extra.get('book_scan'):
         return 'doc:' + (row.get('doc') or '')
     return 'report'
-
-
-def _config_newer_than_import(outdir, last_import):
-    """run_config.json rewritten after the last import means a scan was
-    started whose results are not the ones in the database."""
-    p = os.path.join(outdir, scanner.RUN_CONFIG)
-    if not last_import or not os.path.isfile(p):
-        return False
-    try:
-        written = datetime.fromtimestamp(os.path.getmtime(p))
-        return written > datetime.fromisoformat(last_import)
-    except (OSError, ValueError):
-        return False
 
 
 def _report_scan_meta(outdir):
@@ -104,30 +111,32 @@ def _report_scan_meta(outdir):
 
 
 def _report_root(con, outdir):
-    """The root of the current full import; None while it cannot be known.
+    """The library root the current full import was scanned from; None
+    while it cannot be known.
 
-    report.db names its own library root; that is used whenever report.db is
-    the one imported (scanned before the last import). Older reports fall
-    back to run_config.json, pinned the first time the fixer sees the import.
+    import_all records it in the same transaction as the rows (from
+    report.db's own scan_meta), so neither a later scan written into this
+    folder nor a single-book merge can change what it says — and nothing
+    here is inferred from timestamps.
+
+    An import made by an older version recorded nothing. Then report.db
+    naming a root of its own means it was written AFTER that import (by
+    this version), so it says nothing about the rows: unknown. Otherwise the
+    configured library stands in, pinned to that import the first time the
+    fixer sees it, so a later change of the setting cannot move it.
     """
-    counts, last_import = db.import_stamp(con)
+    src = db.get_import_source(con)
+    if src is not None:
+        return src.get('root') or None
+    stamp = db.full_import_stamp(con)
     rec = db.get_source_root(con, 'report')
-    meta = _report_scan_meta(outdir)
-    scanned = (meta or {}).get('scanned_at') or ''
-    if scanned and last_import and scanned <= last_import:
-        stamp = counts + '|' + scanned
-        if rec is not None and rec['stamp'] == stamp:
-            return rec['root']
-        root = meta.get('library_root') or None
-        if root:
-            db.record_source_root(con, 'report', root, stamp)
-        return root
-    if rec is not None and (rec['stamp'] or '').split('|')[0] == counts:
+    if rec is not None and rec['stamp'] == stamp:
         return rec['root']
-    if _config_newer_than_import(outdir, last_import):
+    if _report_scan_meta(outdir) is not None:
         return None
-    root = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
-    db.record_source_root(con, 'report', root, counts)
+    root = db.config_root_for_report(outdir)
+    if root:
+        db.record_source_root(con, 'report', root, stamp)
     return root
 
 
@@ -135,43 +144,54 @@ def _book_scan_scopes(rows):
     return {_row_scope(r) for r in rows} - {'report'}
 
 
-def _mark_trusted(con, rows, fp):
-    """Flag rows whose book file is byte-identical to the one scanned: their
-    recorded line number is then evidence in its own right."""
-    sha = {}
+def _mark_trusted(con, rows, fp, size):
+    """Flag rows whose book file is byte-identical to the bytes their scan
+    read (fingerprint AND size, both recorded at read time): their recorded
+    line number is then evidence in its own right — together with an exact
+    snippet window there (patcher._locate_line)."""
+    seen = {}
     for r in rows:
         scope = _row_scope(r)
         if scope == 'report':
             r['trusted'] = False
             continue
-        if scope not in sha:
-            rec = db.get_source_root(con, scope)
-            sha[scope] = rec and rec.get('file_sha')
-        r['trusted'] = bool(sha[scope]) and sha[scope] == fp
+        if scope not in seen:
+            rec = db.get_source_root(con, scope) or {}
+            seen[scope] = (rec.get('file_sha'), rec.get('file_size'))
+        sha, rsize = seen[scope]
+        r['trusted'] = (bool(sha) and rsize is not None and sha == fp
+                        and int(rsize) == size)
 
 
 def _resolve_book(con, outdir, key, rows):
     """``(kind, path, root)`` for a book key, resolved against the root its
-    findings were scanned from — never a guess from the current setting."""
+    findings were scanned from — never a guess from the current setting.
+
+    Every row is checked, but each scope's root is looked up once and each
+    distinct root compared once: a book of thousands of rows is resolved on
+    every page load, and comparing paths touches the disk (over a network
+    share, slowly)."""
     if not key.startswith('file:'):
         kind, path = patcher.resolve_key(key)
         return kind, path, None
     configured = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
-    roots, report = {}, []
+    by_scope = {}
     for row in rows:
         scope = _row_scope(row)
-        if scope == 'report':
-            if not report:
-                report.append(_report_root(con, outdir))
-            root = report[0]
-        else:
-            rec = db.get_source_root(con, scope)
-            root = rec['root'] if rec else None
-        if root is None:
+        if scope not in by_scope:
+            if scope == 'report':
+                by_scope[scope] = _report_root(con, outdir)
+            else:
+                rec = db.get_source_root(con, scope)
+                by_scope[scope] = rec['root'] if rec else None
+        if by_scope[scope] is None:
             raise patcher.PatchError('source_unknown', id=row.get('id'))
-        roots.setdefault(_norm(root), root)
-    root = next(iter(roots.values())) if roots else configured
-    if len(roots) > 1 or _norm(root) != _norm(configured):
+    roots = []
+    for root in dict.fromkeys(by_scope.values()):    # distinct, in order
+        if not any(_same_root(root, r) for r in roots):
+            roots.append(root)
+    root = roots[0] if roots else configured
+    if len(roots) > 1 or not _same_root(root, configured):
         raise patcher.PatchError('source_mismatch', recorded=root,
                                  configured=configured)
     kind, path = patcher.resolve_key(key, root)
@@ -179,8 +199,13 @@ def _resolve_book(con, outdir, key, rows):
 
 
 def _conflicts(outdir, path):
-    keep = ('jid', 'ts', 'kind', 'backup', 'fp_before', 'fp_after', 'fp_seen')
-    return [{k: c.get(k) for k in keep}
+    """Interrupted writes of this book that could not be settled because
+    the file changed since: shown in the fixer until the user acknowledges
+    them (resolve_conflict)."""
+    keep = ('jid', 'ts', 'kind', 'backup', 'finding_ids', 'fp_before',
+            'fp_after', 'fp_seen')
+    return [dict({k: c.get(k) for k in keep},
+                 message=hebrew.FIXER_MESSAGES['journal_conflict'])
             for c in journal.conflicts(outdir, path)]
 
 
@@ -233,7 +258,7 @@ def doc(con, outdir, q):
     # never wait on a busy file just to draw a page; a writer settles it
     journal.recover(con, outdir, path, wait=False)
     fdoc = patcher.read_doc(path)
-    _mark_trusted(con, items, fdoc.fingerprint)
+    _mark_trusted(con, items, fdoc.fingerprint, fdoc.size)
     patcher.anchor_rows(fdoc, items, db.get_live_edit_entries(con, key))
 
     # lines the client needs: the ones carrying findings, plus context. Whole
@@ -319,10 +344,12 @@ def _settle_or_refuse(con, outdir, path):
         raise patcher.PatchError('journal_pending')
 
 
-def _advance_trust(con, rows, fp_before, fp_after):
+def _advance_trust(con, rows, fp_before, data_after):
+    fp_after = patcher.fingerprint_bytes(data_after)
     for scope in _book_scan_scopes(rows):
         try:
-            db.advance_scan_file_sha(con, scope, fp_before, fp_after)
+            db.advance_scan_file_sha(con, scope, fp_before, fp_after,
+                                     len(data_after))
         except Exception:
             traceback.print_exc()
 
@@ -398,7 +425,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
     # (e.g. the status update was lost): re-anchoring it would find the word
     # inside its own correction and apply it twice.
     recorded = db.get_live_edit_entries(con, key)
-    _mark_trusted(con, list(rows.values()), fdoc.fingerprint)
+    _mark_trusted(con, list(rows.values()), fdoc.fingerprint, len(data))
     already = sorted(fid for fid in by_id if fid in recorded
                      and patcher.entry_in_place(fdoc, recorded[fid]))
 
@@ -416,6 +443,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
             'lineno': patcher.resolve_unit_lineno(row.get('unit')),
             'word': row.get('word'),
             'correction': correction,
+            'suggestion': row.get('suggestion'),
             'snippet': row.get('snippet'),
             'occurrence': ref.get('occurrence', 0),
             'expected_count': ref.get('expected_count'),
@@ -429,7 +457,8 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
                 findings[-1]['explicit_lineno'] = int(r['explicit_lineno'])
 
     plans, failures = patcher.plan_all(fdoc, findings, default_mode,
-                                       modes, explicit)
+                                       modes, explicit,
+                                       own_edits=list(recorded.values()))
     if failures:
         # nothing is written when anything is in doubt
         return {'ok': False, 'failed': failures,
@@ -465,7 +494,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
             out['db_warning'] = hebrew.FIXER_MESSAGES['db_warning']
         else:
             journal.finish(outdir, jid, 'committed', edit_id=out['edit_id'])
-        _advance_trust(con, rows.values(), fdoc.fingerprint, fp_after)
+        _advance_trust(con, rows.values(), fdoc.fingerprint, new_data)
         out.update(applied=[p.to_dict() for p in plans],
                    changed_lines=[{'n': n, 'text': fdoc.lines[n]}
                                   for n in changed],
@@ -536,8 +565,7 @@ def undo_file(con, outdir, body):
         journal.finish(outdir, jid, 'committed', edit_id=rec['id'])
         rows = [db.get_finding(con, fid) for fid in rec['finding_ids']]
         _advance_trust(con, [r for r in rows if r],
-                       patcher.fingerprint_bytes(data),
-                       patcher.fingerprint_bytes(restored))
+                       patcher.fingerprint_bytes(data), restored)
     out = {'ok': True, 'restored': 0,
            'fingerprint': patcher.fingerprint_bytes(restored),
            'message': hebrew.FIXER_MESSAGES['restored']}

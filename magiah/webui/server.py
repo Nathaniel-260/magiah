@@ -16,7 +16,8 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, export, fixer_api, hebrew, patcher, scanner
+from . import (db, export, fixer_api, hebrew, patcher, result_status,
+               scanner)
 
 
 def _static_dir():
@@ -87,6 +88,22 @@ class Handler(BaseHTTPRequestHandler):
         body = {'error': str(exc), 'code': exc.code}
         body.update(exc.extra or {})
         self._json(body, 409 if exc.code in patcher.CONFLICT_CODES else 400)
+
+    def _permission_error(self, exc):
+        """423, always in Hebrew. An error this program raised carries its
+        own Hebrew message (a locked decisions.db or export file, the fixer's
+        AccessDenied); one the OS raised reads "[WinError 5] Access is
+        denied: '...tmp'", so it is replaced, keeping the path it names."""
+        if exc.errno is None and str(exc):
+            body = {'error': str(exc)}
+            if getattr(exc, 'code', None):
+                body['code'] = exc.code
+        else:
+            path = exc.filename2 or exc.filename
+            body = {'error': hebrew.FIXER_MESSAGES['access_denied'].format(
+                path=path) if path else hebrew.FIXER_MESSAGES['locked'],
+                'code': 'access_denied'}
+        self._json(body, 423)
 
     def _static(self, relpath):
         if relpath in ('', '/'):
@@ -175,6 +192,8 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
         except patcher.PatchError as e:
             self._patch_error(e)
+        except PermissionError as e:
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -183,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_get(self, path, q, con):
         if path == '/api/meta':
-            self._json(db.get_meta(con))
+            self._json(db.get_meta(con, self.outdir))
         elif path == '/api/books':
             books = db.get_books(con, q.get('origin'), q.get('q'))
             self._json({'books': books, 'rows': books, 'total': len(books)})
@@ -268,17 +287,29 @@ class Handler(BaseHTTPRequestHandler):
                 with _import_lock:
                     counts = db.import_all(self.outdir)
                 kept = counts.get('book_scan_kept') or 0
+                summary = (f"נוספו {counts['added']:,}, הוסרו "
+                           f"{counts['removed']:,}, נשמרו "
+                           f"{counts['preserved']:,} החלטות"
+                           + (f'. נשמרו גם {kept:,} ממצאים '
+                              'מסריקות ספר בודד' if kept else ''))
+                con = db.connect(self.outdir)
+                try:
+                    status = result_status.build(con, self.outdir)
+                finally:
+                    con.close()
+                # an import of the previous scan's results is not "done":
+                # the scan the user ran last did not produce them
+                message = (hebrew.RESULT_STATUS['refresh_stale'].format(
+                               counts=f'({summary})')
+                           if status['stale'] else 'הרענון הושלם: ' + summary)
                 self._json({'ok': True, 'counts': counts,
                             'added': counts['added'],
                             'removed': counts['removed'],
                             'preserved': counts['preserved'],
                             'book_scan_kept': kept,
-                            'message': 'הרענון הושלם: נוספו '
-                                       f"{counts['added']:,}, הוסרו "
-                                       f"{counts['removed']:,}, נשמרו "
-                                       f"{counts['preserved']:,} החלטות"
-                                       + (f'. נשמרו גם {kept:,} ממצאים '
-                                          'מסריקות ספר בודד' if kept else '')})
+                            'stale': status['stale'],
+                            'result_status': status,
+                            'message': message})
                 return
             con = db.connect(self.outdir)
             try:
@@ -289,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
             # before the ValueError clause below: PatchError subclasses it
             self._patch_error(e)
         except PermissionError as e:
-            self._error(str(e) or hebrew.FIXER_MESSAGES['locked'], 423)
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -338,7 +369,8 @@ class Handler(BaseHTTPRequestHandler):
             res = db.migrate_legacy_decisions(con, self.outdir)
             self._json({'ok': True, **res,
                         'message': 'יובאו החלטות ישנות: '
-                                   f"{res['review']} ממצאים, "
+                                   f"{res['review']} ממצאים "
+                                   f"(מהם {res['recheck']} לבדיקה מחדש), "
                                    f"{res['word_rules']} כללי מילים"})
         elif path == '/api/reset':
             res = db.reset(con, self.outdir, body.get('scope', 'statuses'))
@@ -380,6 +412,16 @@ def serve(outdir, port=8766, open_browser=True):
             # in "no scan" mode where the user can launch one from the scan
             # panel, then load the findings without restarting.
             print('[webui] ' + hebrew.MESSAGES['no_scan_console'], flush=True)
+    if os.path.exists(ui_db):
+        # the same warnings the UI's banner shows, for whoever reads the
+        # console (not creating ui_review.db: its absence triggers the import)
+        con = db.connect(outdir)
+        try:
+            for n in result_status.build(con, outdir)['notices']:
+                if n['level'] != 'info':
+                    print(f"[webui] {n['title']}", flush=True)
+        finally:
+            con.close()
     srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     url = f'http://127.0.0.1:{port}/'
     print(f'[webui] serving {url}  (Ctrl+C to stop)', flush=True)

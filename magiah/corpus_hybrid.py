@@ -170,9 +170,7 @@ class LibraryCorpus:
                     yield f'{FILE_UNIT_PREFIX}{rel}:{lineno}', rel, text
             except OSError as e:
                 # an unreadable book is a coverage gap, not an empty book
-                self.stats.decode_errors += 1
-                if len(self.stats.error_samples) < 20:
-                    self.stats.error_samples.append((rel, repr(e)[:200]))
+                self.stats.unread_row(rel, 'decode_errors', repr(e)[:200])
 
     # -- enrichment --------------------------------------------------------
     def file_unit_meta(self, units):
@@ -277,12 +275,16 @@ class HybridCorpus:
         _, lo, hi = chunk
         # the uncorrelated IN-subquery is materialized once by SQLite, so
         # non-Sefaria rows are filtered before their content is decoded
-        for uid, book_id, text in self._otzaria().iter_range(
-                lo, hi, self.stats,
-                book_ids_sql='SELECT b.id FROM book b JOIN source s '
-                             'ON s.id = b.sourceId WHERE s.name = ?',
+        sefaria = ('SELECT b.id FROM book b JOIN source s '
+                   'ON s.id = b.sourceId WHERE s.name = ?')
+        odb = self._otzaria()
+        for uid, book_id, text in odb.iter_range(
+                lo, hi, self.stats, book_ids_sql=sefaria,
                 params=(SEFARIA_SOURCE,)):
             yield str(uid), str(book_id), text
+        # same exclusion as the plain otzaria corpus, counted the same way
+        self.stats.version_lines_skipped += odb.count_version_lines(
+            lo, hi, book_ids_sql=sefaria, params=(SEFARIA_SOURCE,))
 
     # -- enrichment --------------------------------------------------------
     def enrich(self, con):

@@ -515,6 +515,550 @@ class LegacyTest(unittest.TestCase):
         con.close()
         self.assertEqual(st[0], 'not_error')
 
+    def _ui_state(self):
+        """(word -> status, decisions.db (word, unit) -> verdict, number of
+        legacy_recheck history entries, word -> finding id)."""
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        st = dict(con.execute('SELECT f.word, r.status FROM findings f '
+                              'LEFT JOIN review r ON r.finding_id = f.id'))
+        ids = dict(con.execute('SELECT word, id FROM findings'))
+        n = con.execute("SELECT COUNT(*) FROM history "
+                        "WHERE action = 'legacy_recheck'").fetchone()[0]
+        con.close()
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        d = {(w, u): v for w, u, v in dec.execute(
+            'SELECT word, unit, verdict FROM decisions')}
+        dec.close()
+        return st, d, n, ids
+
+    # statuses set through the UI before the re-check mark existed, so
+    # decisions.db mirrors them (and the UI owns those rows)
+    SEED = ((1, 'error', 'edit1_sub', 'פרץ', '7', 2, 'פרח', 'approved'),
+            (2, 'error', 'edit1_sub', 'בייתה', '8', 0, 'ביתה', 'approved'),
+            (3, 'tanach_error', 'tanach_edition', 'אדוס', '9', None, 'אדום',
+             'approved'),
+            (4, 'error', 'edit1_sub', 'קפץ', '10', 2, 'קפה', 'not_error'),
+            (5, 'error', 'edit1_sub', 'גשמ', '11', 2, 'גשם', 'ignored'),
+            (6, 'error', 'edit1_sub', 'שמש', '12', 2, 'שמס', 'unsure'),
+            (7, 'error', 'edit1_sub', 'ירח', '13', 2, 'ירך', 'fixed'))
+    SEED_ST = {'פרץ': 'approved', 'בייתה': 'approved', 'אדוס': 'approved',
+               'קפץ': 'not_error', 'גשמ': 'ignored', 'שמש': 'unsure',
+               'ירח': 'fixed'}
+    SEED_DEC = {('פרץ', '7'): 'accept', ('בייתה', '8'): 'accept',
+                ('אדוס', '9'): 'accept', ('קפץ', '10'): 'reject',
+                ('גשמ', '11'): 'ignore', ('ירח', '13'): 'accept'}
+    EXPECT_ST = dict(SEED_ST, פרץ=None, אדוס=None)
+    EXPECT_DEC = {k: v for k, v in SEED_DEC.items()
+                  if k not in (('פרץ', '7'), ('אדוס', '9'))}
+
+    def _seed_ui(self):
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        rep.executemany(
+            f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})', [
+                ('שמש', 'edit1_sub', 'שמס', 2.0, 0, 0, 0, 2, 'ספר', 'ר',
+                 '12', 's', 'Dicta', '3'),
+                ('ירח', 'edit1_sub', 'ירך', 2.0, 0, 0, 0, 2, 'ספר', 'ר',
+                 '13', 's', 'Dicta', '3')])
+        rep.commit()
+        rep.close()
+        con = uidb.connect(self.dir)
+        for fid, fam, et, w, unit, tan, sugg, _ in self.SEED:
+            con.execute('INSERT INTO findings(id, family, errtype, word, '
+                        'unit, ref, tanach, suggestion, source) '
+                        'VALUES(?,?,?,?,?,?,?,?,?)',
+                        (fid, fam, et, w, unit, 'ר', tan, sugg, 'ספר'))
+        con.commit()
+        for fid, *_, status in self.SEED:
+            uidb.set_status(con, self.dir, [fid], status)
+        con.close()
+
+    def test_dropped_legacy_approval_is_withdrawn_from_decisions_db(self):
+        """A dropped approval must not come back through decisions.db: not via
+        "import legacy decisions", and not in the old review tool."""
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        expect_st, expect_dec = self.EXPECT_ST, self.EXPECT_DEC
+        counts = uidb.import_all(self.dir)
+        self.assertEqual(counts['legacy_approvals_dropped'], 2)
+        st, dec, n, _ = self._ui_state()
+        self.assertEqual(st, expect_st)
+        self.assertEqual(dec, expect_dec)
+        self.assertEqual(n, 2)                  # the drop stays in history
+
+        # "import legacy decisions" has nothing to bring back...
+        con = uidb.connect(self.dir)
+        uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        self.assertEqual(self._ui_state()[:3], (expect_st, expect_dec, 2))
+        # ...and a second refresh changes nothing
+        counts = uidb.import_all(self.dir)
+        self.assertEqual(counts['legacy_approvals_dropped'], 0)
+        self.assertEqual(self._ui_state()[:3], (expect_st, expect_dec, 2))
+
+    def test_book_rescan_logs_and_withdraws_dropped_legacy_approvals(self):
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        for fid, w, unit, tan, sugg in ((1, 'פרץ', '7', 2, 'פרח'),
+                                        (2, 'בייתה', '8', 0, 'ביתה'),
+                                        (3, 'קפץ', '10', 2, 'קפה')):
+            con.execute('INSERT INTO findings(id, family, errtype, word, '
+                        'unit, ref, tanach, suggestion, source, origin, doc) '
+                        'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                        (fid, 'error', 'edit1_sub', w, unit, 'ר', tan, sugg,
+                         'ספר', 'Dicta', '3'))
+        con.commit()
+        uidb.set_status(con, self.dir, [1, 2], 'approved')
+        uidb.set_status(con, self.dir, [3], 'not_error')
+        con.close()
+
+        def found(word, unit, sugg):
+            return {'word': word, 'errtype': 'edit1_sub', 'suggestion': sugg,
+                    'score': 2.0, 'unit': unit, 'ref': 'ר', 'source': 'ספר',
+                    'origin': 'Dicta', 'snippet': 's'}
+        counts = uidb.import_book_scan(self.dir, {
+            'doc': '3', 'title': 'ספר',
+            'findings': [found('פרץ', '7', 'פרס'), found('בייתה', '8', 'ביתה'),
+                         found('קפץ', '10', 'קפה')]})
+        self.assertEqual(counts['legacy_approvals_dropped'], 1)
+        expect_st = {'פרץ': None, 'בייתה': 'approved', 'קפץ': 'not_error'}
+        expect_dec = {('בייתה', '8'): 'accept', ('קפץ', '10'): 'reject'}
+        st, dec, n, ids = self._ui_state()
+        self.assertEqual(st, expect_st)
+        self.assertEqual(dec, expect_dec)
+        con = uidb.connect(self.dir)
+        hist = con.execute("SELECT finding_id, word, old_status FROM history "
+                           "WHERE action = 'legacy_recheck'").fetchall()
+        uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        # logged against the re-scanned row, as a full refresh would
+        self.assertEqual([tuple(h) for h in hist],
+                         [(ids['פרץ'], 'פרץ', 'approved')])
+        self.assertEqual(self._ui_state()[:2], (expect_st, expect_dec))
+        # the re-scan removed this book's own history; its drop is not an
+        # undo step either (else undo would approve the re-scanned row)
+        con = uidb.connect(self.dir)
+        self.assertIsNone(uidb.undo(con, self.dir))
+        con.close()
+        self.assertIsNone(self._ui_state()[0]['פרץ'])
+
+    def _undo_all(self):
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.dir)
+        entries = []
+        try:
+            for _ in range(50):
+                res = uidb.undo(con, self.dir)
+                if res is None:
+                    break
+                entries += res['entries']
+        finally:
+            con.close()
+        return entries
+
+    def test_undo_never_restores_a_dropped_legacy_approval(self):
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        res = uidb.undo(con, self.dir)
+        con.close()
+        # the user's own last action (ירח -> fixed), not the refresh's drop
+        self.assertEqual([(e['word'], e['restored']) for e in res['entries']],
+                         [('ירח', 'pending')])
+        self.assertEqual(self._ui_state()[0],
+                         dict(self.EXPECT_ST, ירח=None))
+        # undoing everything walks back the user's actions only
+        entries = self._undo_all()
+        self.assertNotIn('approved', [e['restored'] for e in entries])
+        st, dec, n, _ = self._ui_state()
+        self.assertEqual(set(st.values()), {None})
+        self.assertEqual(dec, {})
+        self.assertEqual(n, 2)
+
+    def test_locked_decisions_db_changes_nothing_and_heals(self):
+        """decisions.db locked by another program (a read transaction, or a
+        pending write): the refresh fails in Hebrew and changes nothing; the
+        next refresh drops and withdraws as usual."""
+        from unittest import mock
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        base = self.dir
+        try:
+            for mode in ('BEGIN', 'BEGIN IMMEDIATE'):
+                with self.subTest(lock=mode):
+                    self.dir = os.path.join(base, mode.replace(' ', '_'))
+                    os.makedirs(self.dir)
+                    for f in ('report.db', 'ui_review.db', 'decisions.db'):
+                        shutil.copy(os.path.join(base, f), self.dir)
+                    before = self._ui_state()
+                    self.assertEqual(before[1], self.SEED_DEC)
+                    holder = sqlite3.connect(
+                        os.path.join(self.dir, 'decisions.db'),
+                        isolation_level=None)
+                    try:
+                        holder.execute(mode)
+                        holder.execute('SELECT * FROM decisions').fetchall()
+                        with mock.patch.object(uidb, 'DECISIONS_TIMEOUT', 0.2):
+                            with self.assertRaises(uidb.DecisionsLocked) as cm:
+                                uidb.import_all(self.dir)
+                    finally:
+                        holder.execute('ROLLBACK')
+                        holder.close()
+                    self.assertIn('decisions.db', str(cm.exception))
+                    self.assertIsInstance(cm.exception, PermissionError)
+                    # nothing dropped, nothing withdrawn, ownership intact
+                    self.assertEqual(self._ui_state(), before)
+                    con = uidb.connect(self.dir)
+                    owned = set(tuple(r) for r in con.execute(
+                        'SELECT word, unit FROM owned_decisions'))
+                    con.close()
+                    self.assertTrue(set(self.SEED_DEC) <= owned)
+                    # the lock is gone: the next refresh does it all
+                    counts = uidb.import_all(self.dir)
+                    self.assertEqual(counts['legacy_approvals_dropped'], 2)
+                    self.assertEqual(counts['legacy_decisions_withdrawn'], 2)
+                    con = uidb.connect(self.dir)
+                    uidb.migrate_legacy_decisions(con, self.dir)
+                    con.close()
+                    self.assertEqual(self._ui_state()[:3],
+                                     (self.EXPECT_ST, self.EXPECT_DEC, 2))
+        finally:
+            self.dir = base
+
+    def test_undo_of_an_earlier_step_does_not_reapprove_a_dropped_row(self):
+        """Undo restores the whole previous decision; when that decision is
+        an approval a refresh dropped afterwards (legacy_recheck), the row
+        comes back pending, and decisions.db gets no 'accept' again."""
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        con = uidb.connect(self.dir)
+        # approved -> approved with a note: a real step whose previous state
+        # is the approval
+        uidb.set_status(con, self.dir, [1], 'approved', note='נבדק')
+        con.close()
+        uidb.import_all(self.dir)
+        self.assertIsNone(self._ui_state()[0]['פרץ'])
+        con = uidb.connect(self.dir)
+        res = uidb.undo(con, self.dir)
+        con.close()
+        self.assertEqual([(e['word'], e['restored']) for e in res['entries']],
+                         [('פרץ', 'pending')])
+        self.assertTrue(res['entries'][0]['legacy_recheck'])
+        st, dec, _n, _ = self._ui_state()
+        self.assertIsNone(st['פרץ'])
+        self.assertNotIn(('פרץ', '7'), dec)
+        entries = self._undo_all()
+        self.assertNotIn('approved', [e['restored'] for e in entries])
+        st, dec, _n, _ = self._ui_state()
+        self.assertEqual(set(st.values()), {None})
+        self.assertEqual(dec, {})
+
+    def test_import_legacy_does_not_approve_tanach_backed_rows(self):
+        """An accept of the old tool (never owned by this UI) on a row backed
+        by Tanach evidence comes in as 'unsure', without its suggestion."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        # a row the new evidence backs (tanach = 4: the verse reads otherwise)
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "tanach, suggestion) VALUES(99, 'error', 'edit1_sub', "
+                    "'האוד', '32', 4, 'העוד')")
+        con.commit()
+        con.close()
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        dec.execute('CREATE TABLE decisions(word TEXT, unit TEXT, '
+                    'errtype TEXT, verdict TEXT, suggestion TEXT, '
+                    'source TEXT, ref TEXT, PRIMARY KEY(word, unit))')
+        dec.executemany('INSERT INTO decisions VALUES(?,?,?,?,?,?,?)', [
+            ('פרץ', '7', 'edit1_sub', 'accept', 'פרח', 'ספר', 'ר'),
+            ('אדוס', '9', 'tanach_edition', 'accept', 'אדום', 'ספר', 'ר'),
+            ('האוד', '32', 'edit1_sub', 'accept', 'האור', 'ספר', 'ר'),
+            ('בייתה', '8', 'edit1_sub', 'accept', 'בייתא', 'ספר', 'ר'),
+            ('קפץ', '10', 'edit1_sub', 'reject', 'קפה', 'ספר', 'ר')])
+        dec.commit()
+        dec.close()
+        con = uidb.connect(self.dir)
+        out = uidb.migrate_legacy_decisions(con, self.dir)
+        rows = {r[0]: tuple(r[1:]) for r in con.execute(
+            'SELECT f.word, r.status, r.custom_suggestion, r.note '
+            'FROM findings f JOIN review r ON r.finding_id = f.id')}
+        again = uidb.migrate_legacy_decisions(con, self.dir)
+        con.close()
+        self.assertEqual(out['recheck'], 3)
+        for w, sugg in (('פרץ', 'פרח'), ('אדוס', 'אדום'), ('האוד', 'האור')):
+            st, custom, note = rows[w]
+            self.assertEqual((st, custom), ('unsure', None), w)
+            self.assertIn(sugg, note)
+        # a row without Tanach evidence keeps the old tool's own correction
+        self.assertEqual(rows['בייתה'][:2], ('approved', 'בייתא'))
+        self.assertEqual(rows['קפץ'][0], 'not_error')
+        self.assertEqual((again['review'], again['recheck']), (0, 0))
+
+    def test_word_rule_approval_does_not_reach_legacy_rows(self):
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        rep.execute(f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})',
+                    ('פרץ', 'edit1_sub', 'פרח', 2.0, 0, 0, 0, 0, 'ספר', 'ר',
+                     '14', 's', 'Dicta', '3'))
+        rep.commit()
+        rep.close()
+        con = uidb.connect(self.dir)
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "ref, tanach, suggestion, source) VALUES(1, 'error', "
+                    "'edit1_sub', 'פרץ', '7', 'ר', 2, 'פרח', 'ספר')")
+        con.execute("INSERT INTO findings(id, family, errtype, word, unit, "
+                    "ref, tanach, suggestion, source) VALUES(4, 'error', "
+                    "'edit1_sub', 'קפץ', '10', 'ר', 2, 'קפה', 'ספר')")
+        con.commit()
+        # "everywhere" decisions taken on the old evidence. set_status no
+        # longer makes a word-wide approval (a scoped approval is refused);
+        # one still exists in a database of an earlier version, which wrote
+        # word_rules positionally, as it wrote it there
+        uidb.set_status(con, self.dir, [1], 'approved')
+        con.execute("INSERT INTO word_rules VALUES('פרץ', 'approved', "
+                    "'2026-01-01T00:00:00')")
+        con.commit()
+        uidb.set_status(con, self.dir, [4], 'not_error', scope='word')
+        con.close()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        eff = {(w, u): s for w, u, s in con.execute(
+            f'SELECT f.word, f.unit, {uidb.EFF} FROM findings f {uidb.JOINS}')}
+        con.close()
+        self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
+        self.assertEqual(eff[('פרץ', '14')], 'approved')    # the word rule
+        self.assertEqual(eff[('קפץ', '10')], 'not_error')   # judges the word
+
+    def test_scoped_rule_approval_does_not_reach_legacy_rows(self):
+        """A replacement-scope approval (the only approval a rule may carry
+        now) reaches the other findings of its (word, suggestion) pair, but
+        not a tanach_legacy row of the same pair; a book convention's
+        not_error still reaches it."""
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        # beside the legacy rows פרץ@7 and קפץ@10 (tanach = 2), rows of the
+        # same words in the same book that rest on no Tanach evidence
+        rep.executemany(
+            f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})',
+            [(w, 'edit1_sub', s, 2.0, 0, 0, 0, 0, 'ספר', 'ר', u, 's',
+              'Dicta', '3') for w, s, u in (('פרץ', 'פרח', '14'),
+                                            ('פרץ', 'פרח', '15'),
+                                            ('קפץ', 'קפה', '16'))])
+        rep.commit()
+        rep.close()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        ids = {(w, u): i for i, w, u in con.execute(
+            'SELECT id, word, unit FROM findings')}
+        uidb.set_status(con, self.dir, [ids[('פרץ', '14')]], 'approved',
+                        scope='replacement')
+        uidb.set_status(con, self.dir, [ids[('קפץ', '16')]], 'not_error',
+                        scope='book')
+        eff = {(w, u): s for w, u, s in con.execute(
+            f'SELECT f.word, f.unit, {uidb.EFF} FROM findings f {uidb.JOINS}')}
+        approved = {(w, u) for w, u in con.execute(
+            f'SELECT f.word, f.unit FROM findings f {uidb.JOINS} '
+            f"WHERE {uidb.EFF} IN ('approved', 'fixed')")}
+        con.close()
+        self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
+        self.assertEqual(eff[('פרץ', '14')], 'approved')    # its own row
+        self.assertEqual(eff[('פרץ', '15')], 'approved')    # the pair's rule
+        self.assertEqual(eff[('קפץ', '10')], 'not_error')   # the convention
+        self.assertEqual(approved, {('פרץ', '14'), ('פרץ', '15')})
+
+    def test_status_filter_works_with_the_legacy_guard(self):
+        """EFF carries a LIKE '%tanach_legacy%' pattern; the status filter
+        must not run it through %-formatting (it used to fail every
+        status-filtered query with "unsupported format character")."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        try:
+            fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
+                              ).fetchone()[0]
+            uidb.set_status(con, self.dir, [fid], 'approved')
+            rows, total = uidb.query_findings(con, {'status': 'approved'})
+            self.assertEqual(([r['word'] for r in rows], total),
+                             (['בייתה'], 1))
+            _rows, total = uidb.query_findings(
+                con, {'status': 'pending,approved'})
+            self.assertEqual(total, con.execute(
+                'SELECT COUNT(*) FROM findings').fetchone()[0])
+        finally:
+            con.close()
+
+    def test_import_legacy_keeps_a_word_wide_approval_an_approval(self):
+        """decisions.db mirrors a word-wide approval as (word, '*', accept);
+        importing it back must not turn it into "not an error everywhere"."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        kid = con.execute("SELECT id FROM findings WHERE word = 'גשמ'"
+                          ).fetchone()[0]
+        uidb.set_status(con, self.dir, [kid], 'not_error', scope='word')
+        con.close()
+        # set_status no longer makes a word-wide approval; earlier versions
+        # of this UI mirrored one into decisions.db like this
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        dec.execute("INSERT INTO decisions VALUES('בייתה', '*', '', "
+                    "'accept', '', '', '')")
+        dec.commit()
+        dec.close()
+        con = uidb.connect(self.dir)
+        uidb.migrate_legacy_decisions(con, self.dir)
+        rules = dict(con.execute('SELECT word, status FROM word_rules'))
+        con.close()
+        self.assertEqual(rules, {'בייתה': 'approved', 'גשמ': 'not_error'})
+        # ...and only the global rejection feeds the detector's whitelist
+        self.assertEqual(core.load_review_rejections(self.dir), {'גשמ'})
+
+
+class BibleBookShareTest(unittest.TestCase):
+    """The 90% heRef threshold is exact: 90% passes at every book size."""
+
+    def _books(self, parsed, total):
+        from magiah import tanach
+        con = sqlite3.connect(':memory:')
+        con.executescript('''
+            CREATE TABLE category(id INTEGER PRIMARY KEY, parentId INT,
+                                  title TEXT);
+            CREATE TABLE book(id INTEGER PRIMARY KEY, categoryId INT,
+                              sourceId INT, title TEXT);
+            CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INT,
+                              heRef TEXT);''')
+        con.executemany('INSERT INTO category VALUES(?,?,?)',
+                        [(ROOT, None, 'תנ״ך'), (TORAH, ROOT, 'תורה')])
+        con.execute('INSERT INTO book VALUES(1, ?, 1, ?)', (TORAH, TITLE))
+        refs = ([f'{TITLE}, א, א'] * parsed
+                + [f'{TITLE} הקדמה'] * (total - parsed))
+        con.executemany('INSERT INTO line(bookId, heRef) VALUES(1, ?)',
+                        [(r,) for r in refs])
+        books = tanach.find_bible_books(con)[0]
+        con.close()
+        return books
+
+    def test_exactly_ninety_percent_is_enough(self):
+        for total in (10, 30, 70, 130, 1000, 4370):
+            with self.subTest(total=total):
+                self.assertEqual(len(self._books(total * 9 // 10, total)), 1)
+                self.assertEqual(self._books(total * 9 // 10 - 1, total), [])
+
+
+class ReportWriteFailureTest(_DBCase):
+    """A failed report.db write leaves the last good report.db and no
+    report.db.tmp behind; a report.db held open is a Hebrew StageError."""
+
+    def setUp(self):
+        super().setUp()
+        self.out = os.path.join(self.dir, 'out')
+        os.makedirs(self.out)
+        lex = {w: 1000 for w in _fixture_words()}
+        for w in FLAGGED:
+            lex[w] = 1
+        with open(os.path.join(self.out, core.LEXICON_F), 'wb') as f:
+            pickle.dump(lex, f)
+        with open(os.path.join(self.out, core.FLAGGED_F), 'wb') as f:
+            pickle.dump({w: (1, et, s, 1000, 3.0)
+                         for w, (et, s) in FLAGGED.items()}, f)
+        self._run()
+        self.report = os.path.join(self.out, core.REPORT_DB_F)
+        with open(self.report, 'rb') as f:
+            self.before = f.read()
+
+    def _run(self):
+        spec = {'type': 'sqlite', 'path': self.db, 'table': 'line',
+                'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+        core.locate(spec, Config(workers=1, n_chunks=2), self.out)
+
+    def _assert_untouched(self):
+        with open(self.report, 'rb') as f:
+            self.assertEqual(f.read(), self.before)
+        self.assertFalse(os.path.exists(self.report + '.tmp'))
+
+    def test_failed_write_removes_tmp(self):
+        from unittest import mock
+        with mock.patch.object(core.tanach, 'write_evidence',
+                               side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                self._run()
+        self._assert_untouched()
+
+    def test_report_in_use_is_a_hebrew_stage_error(self):
+        from unittest import mock
+        real = os.replace
+
+        def replace(src, dst):
+            if os.path.basename(dst) == core.REPORT_DB_F:
+                raise PermissionError(13, 'in use', dst)
+            return real(src, dst)
+        with mock.patch.object(core.os, 'replace', side_effect=replace):
+            with self.assertRaises(core.StageError) as cm:
+                self._run()
+        self.assertNotIsInstance(cm.exception, core.PartialRead)
+        self.assertIn('פתוח בתוכנה אחרת', str(cm.exception))
+        self._assert_untouched()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows file locking')
+    def test_report_open_elsewhere_on_windows(self):
+        holder = sqlite3.connect(self.report)
+        try:
+            holder.execute('SELECT COUNT(*) FROM errors').fetchone()
+            with self.assertRaises(core.StageError):
+                self._run()
+        finally:
+            holder.close()
+        self._assert_untouched()
+
+
+class PartialTanachReadTest(_DBCase):
+    """A Tanach index built from a partial read never feeds report.db."""
+
+    def _run(self, out):
+        spec = {'type': 'sqlite', 'path': self.db, 'table': 'line',
+                'id_col': 'id', 'text_col': 'content', 'preset': 'otzaria'}
+        core.locate(spec, Config(workers=1, n_chunks=2), out)
+
+    def test_unreadable_version_row_stops_locate_and_keeps_report(self):
+        out = os.path.join(self.dir, 'out')
+        os.makedirs(out)
+        lex = {w: 1000 for w in _fixture_words()}
+        for w in FLAGGED:
+            lex[w] = 1
+        with open(os.path.join(out, core.LEXICON_F), 'wb') as f:
+            pickle.dump(lex, f)
+        with open(os.path.join(out, core.FLAGGED_F), 'wb') as f:
+            pickle.dump({w: (1, et, s, 1000, 3.0)
+                         for w, (et, s) in FLAGGED.items()}, f)
+        self._run(out)
+        report = os.path.join(out, core.REPORT_DB_F)
+        with open(report, 'rb') as f:
+            before = f.read()
+        # a version row only the Tanach index reads (the main pass skips
+        # versions): a BLOB in a database without a zstd dictionary
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE version_line SET content = X'00FF' "
+                    "WHERE versionId = 2 AND content IS NOT NULL "
+                    "AND lineId = (SELECT MIN(lineId) FROM version_line "
+                    "WHERE versionId = 2 AND content IS NOT NULL)")
+        con.commit()
+        con.close()
+        with self.assertRaises(core.PartialRead) as cm:
+            self._run(out)
+        self.assertIn('לא הצליח לקרוא 1 שורות', str(cm.exception))
+        with open(report, 'rb') as f:
+            self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(report + '.tmp'))
+        with open(os.path.join(out, core.COVERAGE_F.format(stage='locate')),
+                  encoding='utf-8') as f:
+            cov = json.load(f)
+        self.assertFalse(cov['complete'])
+        self.assertEqual(cov['passes']['tanach_index']['decode_errors'], 1)
+        # ...and the consumers refuse the older report.db
+        with self.assertRaises(core.PartialRead):
+            core.report(Config(), out)
+
 
 class EditionRankTest(unittest.TestCase):
     def test_only_resolved_edition_variants_rank(self):

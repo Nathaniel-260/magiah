@@ -42,6 +42,7 @@ import re
 from array import array
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from fractions import Fraction
 from urllib.parse import urlsplit
 
 from .normalize import TOKEN_RE, clean
@@ -58,9 +59,11 @@ COMMON_FREQ = 200
 MIN_DISTINCT = 2
 AMBIGUITY_MARGIN = 2       # the best verse must beat the runner-up by this
 MIN_INDEPENDENT = 2        # independent sources that must agree on a reading
-REF_SHARE = 0.9            # share of a book's referenced lines that must parse
+# Shares are exact fractions: `count < SHARE * total` is then an exact
+# rational comparison, so exactly 90% passes for every size.
+REF_SHARE = Fraction(9, 10)  # a book's referenced lines that must parse
 VERSION_LINE_RATIO = 0.6   # token similarity of a version line to the primary
-VERSION_ACCEPT_SHARE = 0.9  # share of a version's lines that must track it
+VERSION_ACCEPT_SHARE = Fraction(9, 10)  # a version's lines that must track it
 
 # --- evidence kinds ----------------------------------------------------------
 VARIANT = 'tanach_verse_variant'     # verse reading == detector suggestion
@@ -418,8 +421,15 @@ class TanachIndex:
 
     # -- building ------------------------------------------------------------
     @classmethod
-    def build(cls, db_path):
+    def build(cls, db_path, stats=None):
+        """Read the verified editions. Every line and version row read is
+        counted in `stats` (``idx.stats``): a row that could not be decoded,
+        or a ``line`` without its ``line_content`` row, is unread, and the
+        caller must not present an index built from a partial read as
+        complete. The database is released even when the build fails."""
         idx = cls()
+        if stats is not None:
+            idx.stats = stats
         with OtzariaDB(db_path) as odb:
             idx._build(odb)
         return idx
@@ -517,10 +527,9 @@ class TanachIndex:
                         try:
                             text = odb.decode(raw)
                         except Exception as e:      # noqa: BLE001
-                            self.stats.decode_errors += 1
-                            if len(self.stats.error_samples) < 20:
-                                self.stats.error_samples.append(
-                                    (f'ver:{vid}:{lid}', repr(e)[:200]))
+                            self.stats.unread_row(f'ver:{vid}:{lid}',
+                                                  'decode_errors',
+                                                  repr(e)[:200])
                             continue
                         self.stats.version_lines += 1
                         toks = verse_tokens(text)
@@ -750,7 +759,17 @@ class TanachIndex:
           with a `reason` (one_against_one, no_majority, intra_source, plene,
           qere_ketiv, unrelated). Informational: nobody is outvoted.
 
-        Rows: (unit, word, canonical, snippet, evidence_json)."""
+        Rows: (unit, word, canonical, snippet, evidence_json).
+
+        Location: `unit` is the PRIMARY text's line id, which is also the
+        ``lineId`` of every version's row for that verse; `snippet` is the
+        minority edition's own text. When the minority is a version, `word`
+        is in that version (named by `minority_editions` / `readings` in the
+        evidence), not in the primary line, so an exported fix row names the
+        right line but not the edition to correct. Unresolved rows carry no
+        canonical reading (empty suggestion): they inform, nobody is
+        outvoted. Neither can be applied by the fixer, which does not edit
+        database books."""
         rows = []
         st = Counter()
 
@@ -829,8 +848,8 @@ class TanachIndex:
         return rows, dict(st)
 
 
-def build_index(db_path):
-    return TanachIndex.build(db_path)
+def build_index(db_path, stats=None):
+    return TanachIndex.build(db_path, stats)
 
 
 # ---------------------------------------------------------------------------

@@ -687,24 +687,29 @@ def walk(con, filters=None, **kw):
             return seen
 
 
+def add_r2_rows(con):
+    """400 findings with NULLs, empty strings and ties in every sort key."""
+    import random
+    rnd = random.Random(1)
+    rows = []
+    for i in range(1, 401):
+        rows.append((i, 'error', 'edit1_sub',
+                     rnd.choice([None, 'אב', 'גד', '']), 'ס',
+                     rnd.choice([None, 1.0, 2.5, 2.5, -1.0, 0.0]), 0, 'o',
+                     rnd.choice([None, 'א', 'ב', '']), 'r',
+                     rnd.choice([None, '', '5', '17', 'file:x/y.txt:3',
+                                 'abc']), 'd', ''))
+    con.executemany(f'INSERT INTO findings({FCOLS}) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+    con.commit()
+
+
 class TestR2Paging(Case):
     """NULLs, empty strings and ties in every sort key; seeds that differ."""
 
     def setUp(self):
         super().setUp()
-        import random
-        rnd = random.Random(1)
-        rows = []
-        for i in range(1, 401):
-            rows.append((i, 'error', 'edit1_sub',
-                         rnd.choice([None, 'אב', 'גד', '']), 'ס',
-                         rnd.choice([None, 1.0, 2.5, 2.5, -1.0, 0.0]), 0, 'o',
-                         rnd.choice([None, 'א', 'ב', '']), 'r',
-                         rnd.choice([None, '', '5', '17', 'file:x/y.txt:3',
-                                     'abc']), 'd', ''))
-        self.con.executemany(f'INSERT INTO findings({FCOLS}) '
-                             'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-        self.con.commit()
+        add_r2_rows(self.con)
 
     def test_every_sort_walks_every_row_once(self):
         for sort in ('rank', 'source', 'word', 'random'):
@@ -1022,6 +1027,237 @@ class TestR2CardQueueJs(ServerCase):
         res = self.run_js('noop_changed')
         self.assertEqual(res['first'], True)
         self.assertEqual(res['second'], False)
+
+
+# ===========================================================================
+# Stale approvals leave decisions.db the way dropped legacy approvals do
+# ===========================================================================
+
+class TestStaleWithdrawal(ServerCase):
+    """A stale approval's decisions.db 'accept' is withdrawn in the same
+    step that drops the approval, decisions.db first; a lock on decisions.db
+    fails the step with DecisionsLocked (423) and changes nothing."""
+
+    def _fid(self, word='אבי'):
+        return self.con.execute('SELECT id FROM findings WHERE word = ?',
+                                (word,)).fetchone()[0]
+
+    def _state(self):
+        c = db.connect(self.outdir)
+        try:
+            ui = [tuple(r) for r in c.execute(
+                'SELECT r.finding_id, r.status, x.flag FROM review r '
+                'LEFT JOIN review_ext x ON x.finding_id = r.finding_id '
+                'ORDER BY 1')]
+            owned = sorted(tuple(r) for r in c.execute(
+                'SELECT word, unit FROM owned_decisions'))
+            undos = c.execute("SELECT COUNT(*) FROM history "
+                              "WHERE action = 'undo'").fetchone()[0]
+        finally:
+            c.close()
+        dec = sqlite3.connect(os.path.join(self.outdir, db.DECISIONS_F))
+        try:
+            d = sorted(dec.execute('SELECT word, unit, verdict, suggestion '
+                                   'FROM decisions'))
+        finally:
+            dec.close()
+        return ui, owned, undos, d
+
+    def _locked(self, mode='BEGIN'):
+        holder = sqlite3.connect(os.path.join(self.outdir, db.DECISIONS_F),
+                                 isolation_level=None)
+        holder.execute(mode)
+        holder.execute('SELECT * FROM decisions').fetchall()
+        return holder
+
+    def _approve_then_change(self, rescan):
+        make_report(self.outdir, [('אבי', 'אביו', '10', '1', 'ספר')])
+        db.import_all(self.outdir)
+        db.set_status(self.con, self.outdir, [self._fid()], 'approved')
+        make_report(self.outdir, [('אבי', 'אבא', '10', '1', 'ספר')])
+        if rescan == 'book':
+            return lambda: db.merge_book_scan(self.outdir, book_result(
+                '1', 'ספר', [('אבי', 'אבא', '10')]))
+        return lambda: db.import_all(self.outdir)
+
+    def test_locked_decisions_db_fails_the_refresh_and_heals(self):
+        from unittest import mock
+        for rescan in ('full', 'book'):
+            for mode in ('BEGIN', 'BEGIN IMMEDIATE'):
+                with self.subTest(rescan=rescan, lock=mode):
+                    self.con.close()
+                    shutil.rmtree(self.outdir)
+                    os.makedirs(self.outdir)
+                    self.con = db.connect(self.outdir)
+                    refresh = self._approve_then_change(rescan)
+                    before = self._state()
+                    self.assertEqual(before[3][0][2:], ('accept', 'אביו'))
+                    holder = self._locked(mode)
+                    try:
+                        with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                            with self.assertRaises(db.DecisionsLocked):
+                                refresh()
+                    finally:
+                        holder.execute('ROLLBACK')
+                        holder.close()
+                    self.assertEqual(self._state(), before)
+                    refresh()
+                    ui, owned, _u, d = self._state()
+                    fid = self._fid()
+                    self.assertEqual(self.eff(fid), 'pending')
+                    self.assertEqual(self.review(fid)['flag'],
+                                     'stale_approval')
+                    self.assertEqual(d, [])
+                    self.assertEqual(owned, [])
+
+    def test_undo_with_locked_decisions_db_is_423_and_changes_nothing(self):
+        from unittest import mock
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'approved')
+        db.set_status(self.con, self.outdir, [1], 'not_error')
+        before = self._state()
+        holder = self._locked('BEGIN IMMEDIATE')
+        try:
+            with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                code, res = self.call('/api/undo', {})
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+        self.assertEqual(code, 423)
+        self.assertIn('decisions.db', res['error'])
+        self.assertEqual(self._state(), before)
+        self.assertEqual(self.call('/api/undo', {})[0], 200)
+        self.assertEqual(self.eff(1), 'approved')
+        self.assertEqual(self._state()[3], [('בית', '10', 'accept', 'ביתו')])
+
+    def test_stale_withdrawal_keeps_a_key_another_approval_stands_on(self):
+        # two findings on one (word, unit) key share one decisions.db row
+        def report(sub_sugg):
+            make_report(self.outdir, [('אבי', sub_sugg, '10', '1', 'ספר')])
+            rep = sqlite3.connect(os.path.join(self.outdir, db.REPORT_DB_F))
+            rep.execute("INSERT INTO occurrences_full VALUES('אבי', "
+                        "'edit1_ins', 'אביי', 5.0, 0, 0, 0, 0, 'ספר', 'r', "
+                        "'10', '', 'o1', '1')")
+            rep.commit()
+            rep.close()
+        report('אביו')
+        db.import_all(self.outdir)
+        ids = dict(self.con.execute('SELECT errtype, id FROM findings'))
+        db.set_status(self.con, self.outdir, list(ids.values()), 'approved')
+        report('אבא')                     # only the edit1_sub row changes
+        res = db.import_all(self.outdir)
+        self.assertEqual(res['stale_approvals'], 1)
+        self.assertEqual(self.eff(ids['edit1_sub']), 'pending')
+        self.assertEqual(self.eff(ids['edit1_ins']), 'approved')
+        # the row still mirrors the approval that stands
+        self.assertEqual([r[:3] for r in self._state()[3]],
+                         [('אבי', '10', 'accept')])
+
+    def test_status_write_waits_for_decisions_db_and_never_desyncs(self):
+        """A reader holding decisions.db used to let ui_review.db commit and
+        decisions.db fail; the retry was a no-op, so decisions.db never
+        caught up. Now the write fails whole (423) and the retry writes
+        both."""
+        from unittest import mock
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'unsure', note='x')
+        before = self._state()
+        holder = self._locked('BEGIN')
+        try:
+            with mock.patch.object(db, 'DECISIONS_TIMEOUT', 0.2):
+                code, res = self.call('/api/status', {
+                    'ids': [1], 'status': 'not_error', 'scope': 'word'})
+        finally:
+            holder.execute('ROLLBACK')
+            holder.close()
+        self.assertEqual(code, 423)
+        self.assertIn('decisions.db', res['error'])
+        self.assertEqual(self._state(), before)
+        code, res = self.call('/api/status', {
+            'ids': [1], 'status': 'not_error', 'scope': 'word'})
+        self.assertEqual((code, res['updated']), (200, 1))
+        self.assertIn(('בית', '*', 'reject', ''), self._state()[3])
+        self.assertIn('בית', core.load_review_rejections(self.outdir))
+
+    def test_ui_review_is_locked_before_decisions_db(self):
+        """Every write takes ui_review.db's lock first and decisions.db's
+        second, so two writers never hold one each and wait for the other."""
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'approved')
+        backup = os.path.basename(db.write_backup(self.con, self.outdir))
+        orig, seen = db._decisions_for_write, []
+
+        def checked(outdir):
+            other = sqlite3.connect(os.path.join(outdir, db.UI_DB_F),
+                                    timeout=0)
+            try:
+                other.execute('BEGIN IMMEDIATE')
+                other.rollback()
+                seen.append('ui_review.db was free')
+            except sqlite3.OperationalError:
+                seen.append('locked')
+            finally:
+                other.close()
+            return orig(outdir)
+        db._decisions_for_write = checked
+        try:
+            db.set_status(self.con, self.outdir, [1], 'not_error')
+            db.undo(self.con, self.outdir)
+            db.restore_backup(self.con, self.outdir, backup)
+        finally:
+            db._decisions_for_write = orig
+        self.assertEqual(seen, ['locked'] * 3)
+
+    def test_undo_with_nothing_to_undo_releases_its_lock(self):
+        self.assertIsNone(db.undo(self.con, self.outdir))
+        self.assertFalse(self.con.in_transaction)
+        other = db.connect(self.outdir)
+        try:
+            other.execute('BEGIN IMMEDIATE')
+            other.rollback()
+        finally:
+            other.close()
+
+
+# ===========================================================================
+# The random sort's cursor
+# ===========================================================================
+
+class TestRandomCursor(Case):
+    """A random-sort cursor must name a position of a walk this table could
+    have started; a crafted width made the server walk 2**62 positions."""
+
+    def setUp(self):
+        super().setUp()
+        add_r2_rows(self.con)
+
+    def test_crafted_cursors_are_refused(self):
+        bits = db._id_bits(self.con)
+        for cur in ('[0, 62]', '[0, %d]' % (bits + 2), '[0, 5]', '[-5, 10]',
+                    '[%d, 10]' % (1 << 10), '["a", 10]', '[1.5, 10]',
+                    '[1e400, 10]', '[0]', '{}', '7', 'x', '[true, 10]'):
+            with self.subTest(cursor=cur):
+                with self.assertRaises(ValueError):
+                    db.query_findings_page(self.con, {}, sort='random',
+                                           cursor=cur, seed=1)
+        rows, _t, _c = db.query_findings_page(
+            self.con, {}, sort='random', cursor='[-1, %d]' % bits, seed=1)
+        self.assertEqual(len(rows), 50)
+
+    def test_a_crafted_cursor_is_a_400_over_http(self):
+        server.Handler.outdir = self.outdir
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = ('http://127.0.0.1:%d/api/findings?sort=random&seed=1'
+                   '&cursor=%%5B0%%2C62%%5D' % srv.server_address[1])
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(url, timeout=30)
+            self.assertEqual(cm.exception.code, 400)
+            cm.exception.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == '__main__':

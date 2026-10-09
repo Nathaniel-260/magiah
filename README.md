@@ -142,8 +142,9 @@ encoding problems.
 (`line.content`) and schema 6 (`line_content`, zstd with a stored
 dictionary) are read. Alternative editions in `version_line` are not
 scanned and are counted as skipped. Every stage writes
-`coverage_<stage>.json`, and a stage that could not decode some rows
-stops with an error instead of reporting a partial pass as complete:
+`coverage_<stage>.json`, and a stage that could not read some rows
+stops with an error instead of reporting a partial pass as complete (see
+*Unreadable rows* below):
 
 ```bash
 magiah all --otzaria --out results
@@ -153,6 +154,58 @@ Stages can be run separately (`lexicon`, `detect`, `locate`, `report`) — the
 corpus source and thresholds are remembered in `results/run_config.json`, so
 after tuning thresholds you can rerun from `detect` without recounting the
 lexicon.
+
+A failed stage never replaces its previous output, so after a failed run the
+folder still holds the last good results. Every run therefore records itself
+in `results/run_state/` — when it started, the stage it reached, and how it
+ended (done, failed, partial, cancelled). A run that never got to say how it
+ended (killed, window closed, power cut) is recognized as *interrupted*: it
+holds an OS file lock for as long as it lives. The review UI (`magiah ui`)
+reads this record and, until a scan that rebuilds the results succeeds, shows
+a warning above the findings that they come from the previous complete scan.
+Two pipeline runs on one folder at a time are refused — they would overwrite
+each other's files.
+
+**Unreadable rows (`--allow-unread`).** `seforim.db` is used as downloaded,
+and it may hold a row that cannot be read — a corrupt zstd frame, or a
+`line` without its `line_content` row. By default any such row stops the
+stage before it writes anything; the error lists the rows (book, reference,
+line id) and says how to go on. If the database cannot be repaired, let the
+scan skip them:
+
+```bash
+magiah all --otzaria --out results --allow-unread 3
+```
+
+* `N` is an absolute number of distinct rows (a row met by several passes
+  counts once). The default, `0`, skips none, and there is no "unlimited".
+  With more than N unreadable rows the stage stops as before, so a database
+  that degrades further is not let through.
+* With a folder of text files (`--textdir`, or the library of a hybrid scan)
+  an unreadable *file* counts as one row, and the review UI's notice speaks
+  of files, not of the database.
+* Skipped rows are not scanned: errors in them are not found, and their
+  words are missing from the lexicon frequencies. Every output built this way
+  is marked partial, never complete: `coverage_<stage>.json` keeps
+  `complete: false` and adds `accepted: true`, `allow_unread`, `unread_rows`,
+  `unread_units` (the row ids) and `unread_refs` (where the first 20 are); a
+  stage built on a partial output of an earlier stage records it under
+  `inherited`. `report.db` carries the same record, and the review UI shows a
+  persistent notice listing the rows. Such a run still counts as completed:
+  its results are the latest, so the warning about a scan that did not
+  finish does not appear — unless a later scan fails, and then both do.
+* The option applies only to the run that names it and is not remembered in
+  `run_config.json`. A later run — `detect`, `report`, a single-book scan —
+  refuses partial outputs unless it is given an `--allow-unread` that covers
+  as many rows, and its error says which value to give. A complete run (for
+  example on a repaired database, without the option) replaces the partial
+  outputs and clears every mark.
+* A single-book scan follows the same rule: a book with at most N unreadable
+  rows is scanned without them and marked partial; with more, it is refused.
+* In the UI scan panel the option is the advanced setting «שורות לא קריאות
+  מותרות»; it opens at 0 and is cleared after each scan.
+* Deleting `coverage_*.json` is not a workaround: on a fresh folder it
+  unblocks nothing, and on an old one it passes stale results off as current.
 
 **Second, sharper pass** (recommended, after reviewing some findings):
 
@@ -310,6 +363,8 @@ titles, references and source-repository names from Otzaria's schema. Use
 | `tanach_matches.csv` / `tanach_edition_errors.csv` | quotations confirmed by 2+ independent sources / edition disagreements (`evidence` JSON: variant vs. unresolved, witnesses) |
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
+| `coverage_<stage>.json` | what each stage actually read — a partial read stops the stage and is recorded here; for a partial output accepted under `--allow-unread` also `accepted`, the rows not read and where they are |
+| `run_state/` | how the latest runs ended (`scan.json`, `book.json`) — read by the review UI |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |
 
 ```sql

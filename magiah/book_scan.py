@@ -59,7 +59,9 @@ from collections import Counter
 from . import core
 from .book_source import load_book
 from .config import Config
+from .corpus import OTZARIA_DB
 from .normalize import tokenize
+from .textsource import ReadStats
 
 LOCAL_TYPES = core.LOCAL_TYPES
 
@@ -68,7 +70,7 @@ class BookScanError(Exception):
     """A book scan cannot run (Hebrew message ready to display)."""
 
 
-def load_lexicon(out_dir):
+def load_lexicon(out_dir, allow_unread=0):
     """The existing lexicon. Never rebuilt here — that is the whole point."""
     path = os.path.join(out_dir, core.LEXICON_F)
     if not (os.path.isfile(path) and os.path.getsize(path) > 0):
@@ -76,6 +78,12 @@ def load_lexicon(out_dir):
             'סריקת ספר בודד מתבססת על המילון הקיים, והוא לא נמצא '
             f'({core.LEXICON_F}).\nיש להריץ פעם אחת סריקה מלאה (או את שלב '
             '"בניית מילון") לפני שאפשר לסרוק ספר בודד.')
+    # the lexicon's latest build must have read its whole input — an older
+    # lexicon left behind by a failed build is refused too; one built partial
+    # under --allow-unread only when this scan allows as many rows
+    problem = core.coverage_problem(out_dir, 'lexicon', allow_unread)
+    if problem:
+        raise BookScanError(problem)
     with open(path, 'rb') as f:
         return pickle.load(f)
 
@@ -177,14 +185,19 @@ def _context_needs(occ, errors):
 # optional: the corpus-wide evidence pass
 # ---------------------------------------------------------------------------
 
-def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None):
+def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None,
+                   stats=None):
     """Count the wanted pairs, book-local words and split sequences over the
     whole corpus, in ONE pass with the full pipeline's worker.
+
+    A pass that missed more rows than ``cfg.allow_unread`` is refused; what
+    it read is added to `stats`, so a caller can mark a result partial.
 
     Returns ``(ctx_counts, local_counts, seq_counts)``; seq_counts is indexed
     like `seqs`.
     """
     ctx_counts, local_counts, seq_counts = Counter(), Counter(), Counter()
+    read = ReadStats()
     if not ctx_pairs and not book_need and not seqs:
         return ctx_counts, local_counts, seq_counts
     corpus = core.make_corpus(spec)
@@ -200,11 +213,12 @@ def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None):
             with open(paths[key], 'wb') as f:
                 pickle.dump(obj, f, protocol=4)
         with core._pool(spec, cfg, paths) as pool:
-            for i, (c, lc, sc, _st) in enumerate(
+            for i, (c, lc, sc, st) in enumerate(
                     pool.imap_unordered(core._ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
                 seq_counts.update(sc)
+                read.add(ReadStats.from_dict(st))
                 if progress:
                     progress(f'  [context] chunk {i}/{len(chunks)}')
     finally:
@@ -217,6 +231,20 @@ def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None):
             os.rmdir(tmp)
         except OSError:
             pass
+    limit = core.unread_limit(cfg)
+    if read.unread() > limit:
+        # counts from a partial pass would understate ctx_hits silently
+        gaps = core.gap_record({'context': read}, {}, limit,
+                               core.spec_db(spec))
+        msg = [f'אימות ההקשר מול המאגר לא הצליח לקרוא {read.unread():,} '
+               f'שורות; הסריקה בוטלה כדי לא להציג תוצאה חלקית.']
+        if limit:
+            msg.append(f'הריצה אישרה לדלג על {limit:,} שורות לכל היותר.')
+        msg += core.refs_lines(gaps['unread_refs'], read.unread())
+        msg.append(core.proceed_hint(read.unread()))
+        raise BookScanError('\n'.join(msg))
+    if stats is not None:
+        stats.add(read)
     return ctx_counts, local_counts, seq_counts
 
 
@@ -239,29 +267,37 @@ def scan_book(out_dir, source, key, cfg=None, db_path=None, library_dir=None,
                      was looked for.
     ``split_alternatives``  every segmentation tried for a reported split,
                      with its spaced count.
+    ``coverage`` None, or — when ``cfg.allow_unread`` let the scan skip
+                 unreadable rows of the book or of the context pass, or let it
+                 rest on a lexicon built partial — the gap record
+                 (:func:`magiah.core.gap_record`) that marks it partial.
     """
     t0 = time.time()
     cfg = cfg or Config()
     say = progress or (lambda *_: None)
+    limit = core.unread_limit(cfg)
 
     # Resolve the book BEFORE loading the lexicon: the lexicon is ~33 MB and
     # takes a couple of seconds, and a mistyped book id should fail instantly
     # rather than after that wait (during which no other scan can start).
-    book = load_book(source, key, db_path=db_path, library_dir=library_dir)
+    book = load_book(source, key, db_path=db_path, library_dir=library_dir,
+                     allow_unread=limit)
     say(f'[book] נסרק: {book.title}  ({book.origin})')
 
-    freq = load_lexicon(out_dir)
+    freq = load_lexicon(out_dir, limit)
     say(f'[book] מילון קיים: {len(freq):,} צורות, '
         f'{sum(freq.values()):,} מילים')
     return scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=verify_ctx,
-                            spec=spec, progress=say, t0=t0)
+                            spec=spec, progress=say, t0=t0, db_path=db_path)
 
 
 def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
-                     progress=None, t0=None):
+                     progress=None, t0=None, db_path=None):
     """:func:`scan_book` for a book and lexicon already in memory."""
     t0 = t0 or time.time()
     say = progress or (lambda *_: None)
+    limit = core.unread_limit(cfg)
+    ctx_stats = ReadStats()
     lex, errors, split_cands, present, lsource = detect_in_book(
         book, freq, cfg, out_dir, progress=say)
     profiles, psource = core.load_ocr_profiles(out_dir)
@@ -277,7 +313,8 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         ctx_pairs, need = _context_needs(pre_occ, errors)
         say('[book] אימות הקשר מול כל המאגר — זה השלב הארוך בסריקת ספר בודד')
         ctx_counts, lc, seq_counts = verify_context(
-            spec, cfg, ctx_pairs, {book.doc: need}, seqs, progress=say)
+            spec, cfg, ctx_pairs, {book.doc: need}, seqs, progress=say,
+            stats=ctx_stats)
         local_counts = Counter({w: c for (d, w), c in lc.items()
                                 if d == book.doc})
     else:
@@ -341,15 +378,47 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
                   for w, lst in alts.items()
                   for p, o, e, ch in lst]
 
+    # same rule as a full scan: accepted is not complete
+    passes = {'book': book.stats or ReadStats(), 'context': ctx_stats}
+    coverage = core.gap_record(
+        passes, core.accepted_gaps(out_dir, 'lexicon'), limit,
+        db_path or (spec and core.spec_db(spec)) or OTZARIA_DB)
+    if coverage and not coverage['accepted']:
+        # each part was within the limit, their union is not: the book's
+        # rows, the context pass and the lexicon missed different rows
+        raise BookScanError('\n'.join(
+            [f'הסריקה של «{book.title}» חסרה {coverage["unread_rows"]:,} '
+             f'שורות בסך הכול (בספר, באימות ההקשר ובמילון), יותר מ-'
+             f'{limit:,} שהותרו; היא בוטלה כדי לא להציג תוצאה חלקית.']
+            + core.refs_lines(coverage['unread_refs'],
+                              coverage['unread_rows'])
+            + [core.proceed_hint(coverage['unread_rows'])]))
     say(f'[book] הסתיים: {len(rows):,} ממצאים, '
         f'{len(space_rows):,} רווחים מיותרים  ({time.time() - t0:.1f} שניות)')
+    if coverage:
+        say(book_coverage_warning(book.title, coverage))
     return {
         'doc': book.doc, 'title': book.title, 'origin': book.origin,
         'kind': book.kind, 'path': book.path, 'lines': len(book),
+        # the bytes the rows above were read from (context verification can
+        # run for minutes; the file may change meanwhile)
+        'file_sha': book.file_sha, 'file_size': book.file_size,
         'ctx_scope': scope, 'split_scope': scope,
         'calibration': {'learned': lsource or 'none',
                         'ocr_profiles': psource or 'none'},
         'findings': rows, 'space_errors': space_rows,
         'split_alternatives': split_alts,
+        'coverage': coverage,
         'seconds': round(time.time() - t0, 1),
     }
+
+
+def book_coverage_warning(title, coverage):
+    """The Hebrew notice for a book scan marked partial."""
+    rows = coverage['unread_rows']
+    lines = [f'[book] אזהרה: הסריקה של «{title}» חלקית — {rows:,} שורות לא '
+             f'נקראו ולא נכללו בה (אושר במפורש ב-'
+             f'‎--allow-unread {coverage["allow_unread"]}‎).']
+    if coverage.get('inherited'):
+        lines.append('היא מבוססת על מילון שנבנה מקריאה חלקית של המאגר.')
+    return '\n'.join(lines + core.refs_lines(coverage['unread_refs'], rows))

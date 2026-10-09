@@ -835,6 +835,52 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 #fixerBanner ul { margin: 4px 0 0; padding-inline-start: 18px; }
 #fixerBanner li { margin: 2px 0; }
 
+/* -- interrupted writes the tool could not settle: shown until acknowledged -- */
+#fixConflicts {
+  background: var(--red-soft); border: 1px solid var(--red);
+  border-radius: var(--radius); padding: 10px 14px; margin-bottom: 10px;
+  font-size: 13.5px; line-height: 1.7;
+}
+#fixConflicts[hidden] { display: none; }
+#fixConflicts ul { margin: 6px 0 0; padding-inline-start: 18px; }
+#fixConflicts li { margin: 4px 0; }
+#fixConflicts .fc-meta { color: var(--muted); font-size: 12.5px; }
+#fixConflicts code { direction: ltr; unicode-bidi: embed; word-break: break-all; }
+#fixConflicts .btn { margin-inline-start: 8px; }
+
+/* -- result status: are the findings on screen the latest scan's? -- */
+#resultBanner {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-bottom: 12px;
+  flex: 0 0 auto;   /* never shrink when #main is a flex column (table view) */
+}
+#resultBanner[hidden] { display: none; }
+.rb-notice {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: var(--blue-soft); border: 1px solid var(--blue);
+  border-inline-start-width: 5px;
+  border-radius: var(--radius); padding: 10px 14px;
+  font-size: 13.5px; line-height: 1.7;
+}
+.rb-notice.rb-error { background: var(--red-soft); border-color: var(--red); }
+.rb-notice.rb-warning { background: var(--amber-soft); border-color: var(--amber); }
+.rb-icon { font-size: 20px; line-height: 1.3; flex: 0 0 auto; }
+.rb-error .rb-icon { color: var(--red); }
+.rb-warning .rb-icon { color: var(--amber); }
+.rb-info .rb-icon { color: var(--blue); }
+.rb-body { flex: 1 1 auto; min-width: 0; }
+.rb-title { font-weight: 700; font-size: 14.5px; }
+.rb-hint { margin-top: 2px; }
+.rb-details { margin-top: 4px; }
+.rb-details summary { cursor: pointer; color: var(--muted); }
+.rb-reason {
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 10px; margin-top: 4px;
+  max-height: 220px; overflow-y: auto; font-size: 12.5px;
+}
+.rb-action { flex: 0 0 auto; align-self: center; white-space: nowrap; }
+
 /* -- split: the book on the reading side, the worklist beside it -- */
 /* -- quick selection: what will actually be written -- */
 #fixPickBar {
@@ -1152,6 +1198,7 @@ table.stats td.rowtotal, table.stats th.rowtotal { font-weight: 700; background:
 }
 .toast.err { border-inline-start-color: var(--red); }
 .toast.ok { border-inline-start-color: var(--green); }
+.toast.warn { border-inline-start-color: var(--amber); }
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: none; }
