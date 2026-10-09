@@ -3,6 +3,7 @@
 per-occurrence OCR suggestions, evidence kinds, calibration provenance."""
 import csv
 import json
+import math
 import os
 import pickle
 import shutil
@@ -483,15 +484,39 @@ class SplitChoiceByAssociation(unittest.TestCase):
                                       lex, 'corpus')
         self.assertEqual(best[0], b)
 
-    def test_unassociated_split_is_not_confirmed(self):
-        freq = {'גדול': 10 ** 5, 'מאוד': 10 ** 5, **self.FILL}
-        lex = _lex(freq, split_obs_min=3)
-        parts = ('גדול', 'מאוד')
-        self.assertGreater(lex.expected(parts), 5)
-        best, alts = core.resolve_splits([(parts, False)], [5], lex,
-                                         'corpus')
+    def test_frequent_pair_near_chance_is_confirmed(self):
+        # real misses of a chance gate (spaced count vs expected, Otzaria
+        # subset): two frequent words glued together are as common as
+        # chance spaced, and are still a missing space
+        cases = [(('אבל', 'נראה'), 32, 34.9), (('והנה', 'כתב'), 6, 6.9),
+                 (('ונראה', 'שלא'), 7, 7.4), (('אבל', 'עיין'), 17, 27.0),
+                 (('אלא', 'דאי'), 17, 19.0)]
+        n = 10 ** 7
+        for parts, obs, exp in cases:
+            f = round(math.sqrt(exp * n))
+            lex = _lex({parts[0]: f, parts[1]: f, 'ספר': n - 2 * f},
+                       split_obs_min=3)
+            self.assertGreater(lex.expected(parts), obs, parts)
+            best, alts = core.resolve_splits([(parts, False)], [obs], lex,
+                                             'corpus')
+            self.assertIsNotNone(best, parts)
+            self.assertEqual(best[0], parts)
+            self.assertTrue(alts[0][3])
+
+    def test_below_split_obs_min_is_not_confirmed(self):
+        lex = _lex({'גדול': 50, 'מאוד': 50, **self.FILL}, split_obs_min=3)
+        best, alts = core.resolve_splits([(('גדול', 'מאוד'), False)], [2],
+                                         lex, 'corpus')
         self.assertIsNone(best)
         self.assertFalse(alts[0][3])
+
+    def test_short_part_still_needs_twice_chance(self):
+        lex = _lex({'בכ': 10 ** 5, 'למקום': 10 ** 5, **self.FILL},
+                   split_obs_min_short=1)
+        parts = ('בכ', 'למקום')
+        obs = int(1.5 * lex.expected(parts))
+        best, _ = core.resolve_splits([(parts, False)], [obs], lex, 'corpus')
+        self.assertIsNone(best)
 
     def test_strong_split_needs_no_association(self):
         freq = {'שלום': 10 ** 5, 'עליכם': 10 ** 5, **self.FILL}
@@ -675,10 +700,6 @@ class WorkerMemory(unittest.TestCase):
             core._W.clear()
             shutil.rmtree(tmp, ignore_errors=True)
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class UnverifiedFinalLetterSplit(unittest.TestCase):
     """A final letter mid-word stays a suspicion when its split is never
     seen spaced (the parts are frequent, but never adjacent)."""
@@ -732,3 +753,47 @@ class FootnoteMarkerLetter(unittest.TestCase):
         res = core.locate_line('אמר לנו שלמ) דבר', self._lex(), small_cfg(),
                                flagged)
         self.assertEqual([o[0] for o in res[0]], ['שלמ'])
+
+
+class FrequentPairSplit(unittest.TestCase):
+    """Two frequent words glued together are a missing space even when the
+    spaced pair is no more common than chance predicts (full and book scan
+    alike)."""
+
+    LINES = (['אבל נראה לי'] * 3 + ['אבל אמר'] * 47 + ['נראה שם'] * 47
+             + ['אבלנראה לי'])
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='magiah_pair_')
+        self.lib = os.path.join(self.tmp, 'lib')
+        self.out = os.path.join(self.tmp, 'out')
+        os.makedirs(self.out)
+        write_lib(self.lib, {BOOK_A: self.LINES})
+        self.spec = {'type': 'library', 'path': self.lib}
+        self.cfg = small_cfg(split_obs_min=3)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _found(self, rows):
+        return [(r['errtype'], r['suggestion'], r['evidence'])
+                for r in rows if r['word'] == 'אבלנראה']
+
+    def test_full_and_book_scan_confirm_the_split(self):
+        run_full(self.spec, self.cfg, self.out)
+        con = sqlite3.connect(os.path.join(self.out, core.REPORT_DB_F))
+        obs, exp = con.execute(
+            'SELECT observed, expected FROM split_alternatives '
+            "WHERE word = 'אבלנראה' AND parts = 'אבל נראה'").fetchone()
+        con.close()
+        self.assertLess(obs, exp)               # spaced below chance
+        want = [('missing_space', 'אבל נראה', 'split_observed')]
+        self.assertEqual(self._found(report_rows(self.out)), want)
+        res = book_scan.scan_book(self.out, 'library', BOOK_A, cfg=self.cfg,
+                                  library_dir=self.lib, spec=self.spec,
+                                  verify_ctx=True)
+        self.assertEqual(self._found(res['findings']), want)
+
+
+if __name__ == '__main__':
+    unittest.main()

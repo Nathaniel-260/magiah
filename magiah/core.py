@@ -961,16 +961,20 @@ def _split_score(strong, obs, exp, minlen, cfg, scope):
     'corpus': the full pipeline's rule. 'book': only one book was searched,
     so an observation there is capped below the corpus band, and an
     unobserved split may stand on part frequencies alone (low score).
+
+    Chance (`exp`) gates only splits with a 2-letter part. A split into two
+    longer words is accepted on `split_obs_min` spaced observations even
+    when the pair is about as common as chance predicts: two frequent words
+    glued together (אבלנראה, והנהכתב) are exactly such a pair, and the glued
+    form itself is rare. Association only ranks the accepted alternatives
+    (:func:`resolve_splits`) and decides whether a split may displace a
+    correction (:func:`settle_split`).
     """
     if scope == 'corpus':
         if obs <= 0:
             return None
-        # a final-form letter mid-word proves the break; otherwise the
-        # spaced sequence must occur at least as often as chance predicts
-        if strong:
+        if strong:              # a final-form letter mid-word proves the break
             ok = obs >= 1
-        elif obs < exp:
-            ok = False
         elif minlen >= 3:
             ok = obs >= cfg.split_obs_min
         else:
