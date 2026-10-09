@@ -149,5 +149,40 @@ class TestNoRelocationOntoAParallelVerse(TempCase):
         self.assertTrue(plan.drifted)
 
 
+class TestSingleCopyNeedsItsNeighbours(TempCase):
+    """The scanned copy was fixed by hand and the typo typed again: one copy
+    is left, the scan counted one, and the line still shares the words. The
+    'weak' path wrote on the new copy."""
+
+    W, FIX = 'לשמיס', 'לשמים'
+    L0 = 'והלכה כדברי האומר שהתפלה לשמיס במקום קרבן היא ולכן צריך לעמוד'
+
+    def plan(self, line, **kw):
+        d = self.doc(line + '\n')
+        return d, patcher.plan_edit(d, dict(finding(self.L0, self.W, self.FIX),
+                                            occurrence=0, expected_count=1),
+                                    **kw)
+
+    def test_a_retyped_copy_is_refused(self):
+        for line in (self.L0.replace(self.W, self.FIX + ' ' + self.W),
+                     self.L0.replace(self.W, self.FIX).replace(
+                         'ולכן', 'ולכן ' + self.W)):
+            with self.subTest(line=line):
+                with self.assertRaises(patcher.PatchError) as cm:
+                    self.plan(line)
+                self.assertEqual(cm.exception.code, 'copy_moved')
+                self.assertEqual(cm.exception.extra['located_line'], 0)
+                # a human who looked may still point at it
+                a = line.index(self.W)
+                _d, p = self.plan(line, explicit=(a, a + len(self.W)))
+                self.assertEqual(p.confidence, 'manual')
+
+    def test_the_scanned_copy_with_other_edits_nearby_is_written(self):
+        line = self.L0.replace('האומר', 'האמר').replace('ולכן', 'לכן')
+        d, p = self.plan(line)
+        self.assertEqual(p.confidence, 'weak')
+        self.assertEqual(p.start, line.index(self.W))
+
+
 if __name__ == '__main__':
     unittest.main()

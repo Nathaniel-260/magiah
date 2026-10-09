@@ -72,7 +72,7 @@ CONFLICT_CODES = frozenset((
     'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
     'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
     'backup_corrupt', 'journal_conflict', 'journal_pending',
-    'moved_unproven',
+    'moved_unproven', 'copy_moved',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -499,6 +499,39 @@ def _identify(line, word, snippet, doc=None):
     return occs, [], None
 
 
+def _neighbours(text, word):
+    """``{(token before, token after), ...}`` of each copy of `word` in
+    `text` (None at either end)."""
+    want = word.split()
+    toks = normalize.tokenize(text or '')
+    k = len(want)
+    return {(toks[i - 1] if i else None,
+             toks[i + k] if i + k < len(toks) else None)
+            for i in range(len(toks) - k + 1) if toks[i:i + k] == want}
+
+
+def _same_neighbour(a, b, before):
+    """Two neighbouring tokens agree; at a window's edge one may be cut
+    short (the end of the word before, the start of the word after)."""
+    if a == b:
+        return True
+    if a is None or b is None:
+        return False
+    return (a.endswith(b) or b.endswith(a)) if before else \
+        (a.startswith(b) or b.startswith(a))
+
+
+def _neighbours_agree(clean_text, occ, snippet, word):
+    """Does the copy at `occ` stand between the same words as a copy of the
+    word in the scan's snippet? Cheap evidence for the single-copy path,
+    where the line is identified by its words only."""
+    r = SNIPPET_RADIUS
+    here = _neighbours(clean_text[max(0, occ[2] - r):occ[3] + r], word)
+    then = _neighbours(snippet, word)
+    return any(_same_neighbour(p, q, True) and _same_neighbour(n, m, False)
+               for p, n in here for q, m in then)
+
+
 def _copies(text, word):
     """How many times `word` (one token or several) occurs in `text`."""
     want = word.split()
@@ -848,7 +881,7 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
         raise PatchError('line_gone', _msg(
             'line_gone', n=(lineno or 0) + 1), id=fid)
 
-    drifted = False
+    drifted = copy_moved = False
     if explicit is not None:
         # A human click resolves WHICH occurrence, never WHICH sentence: it is
         # only accepted on a line the snippet identifies.
@@ -893,7 +926,15 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             # must decide, with proof (_scanned_copy).
             occurrence, confidence = ident[0], 'exact'
         elif total == 1 and finding.get('expected_count') in (None, 1):
-            # the one copy, on a line identified by its words: as scanned
+            # the one copy, on a line identified by its words: as scanned —
+            # if it still stands between the words it stood between. A
+            # copy fixed by hand and the typo typed again elsewhere leaves
+            # one copy too, on a line that still shares the words.
+            # (Refused below, after the bracket checks: the fixer's own
+            # brackets around the copy change its neighbours too.)
+            copy_moved = not _neighbours_agree(
+                _line_info(doc, line).clean, spans[0],
+                finding.get('snippet'), word)
             occurrence, confidence = 0, 'weak'
         else:
             # Several copies to choose from (on a short line every window is
@@ -916,6 +957,10 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
         if origin == 'later':
             raise PatchError('already_bracketed', _msg(
                 'already_bracketed', word=word, n=lineno + 1), id=fid)
+    if copy_moved:
+        raise PatchError('copy_moved', _msg(
+            'copy_moved', word=word, n=lineno + 1), id=fid,
+            candidates=[[s[0], s[1]] for s in spans], located_line=lineno)
 
     # A trailing geresh belongs to the abbreviation. It stays attached to the
     # correction; a correction that brings its own replaces it (never two).
