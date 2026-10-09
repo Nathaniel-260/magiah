@@ -15,6 +15,15 @@ class Config:
     exp_prefilter: float = 5e-4   # expected-count prefilter for split candidates
     split_obs_min: int = 3   # min adjacent observations to confirm a split
     split_obs_min_short: int = 20  # ... when the shortest part has 2 letters
+    split_alts_3: int = 3    # 3-part segmentations verified per word (best
+                             # by part frequency), besides every 2-part one
+    split_override_ratio: float = 10.0  # a split displaces an edit-1 style
+                             # correction only when seen >= split_obs_min
+                             # times AND this many times above chance
+    struct_max: int = 10     # structural rules (final letter mid-word) apply
+                             # up to this frequency, beyond rare_max; more
+                             # frequent forms are established spellings
+    nonfinal_max: int = 20   # non-final letter at word end: up to this freq
     foreign_ratio: float = 0.35  # skip lines with this share of uncommon words
                                  # (Judeo-Arabic / badly garbled passages)
     ocr_pair_min: int = 8    # confirmed substitutions of one letter pair in a

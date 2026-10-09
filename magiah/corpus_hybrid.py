@@ -337,12 +337,14 @@ def _meta_enrich(con, meta):
     con.execute(tanach.EVIDENCE_SCHEMA)
     con.executescript(f'''
         CREATE TABLE occurrences_full AS
-          SELECT o.word, e.errtype, e.suggestion,
-                 e.score, o.ctx_hits, o.sugg_local, o.book_repeat, o.tanach,
+          SELECT o.word, e.errtype,
+                 COALESCE(o.occ_sugg, e.suggestion) AS suggestion,
+                 COALESCE(o.occ_score, e.score) AS score,
+                 o.ctx_hits, o.sugg_local, o.book_repeat, o.tanach,
                  COALESCE(m.source, o.doc) AS source,
                  COALESCE(m.ref, '') AS ref, o.unit, o.snippet,
                  COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin,
-                 o.doc AS doc, {tanach.ENRICH_COLS}
+                 o.doc AS doc, o.evidence AS evidence, {tanach.ENRICH_COLS}
           FROM occurrences o
           JOIN errors e ON e.word = o.word
           {tanach.ENRICH_JOIN}

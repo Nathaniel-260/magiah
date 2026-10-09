@@ -23,10 +23,10 @@ suspected correction can be **verified against the corpus itself**.
 
 | Class | Example | Verification |
 |---|---|---|
-| **Missing space** | `אתהשמים` → `את השמים` | the split sequence must actually occur *with* spaces elsewhere in the corpus (bigram evidence) |
+| **Missing space** | `אתהשמים` → `את השמים` | every plausible segmentation (all 2-part splits, the best 3-part ones) is checked; a split is confirmed when its exact word sequence occurs *with* spaces in the corpus (at least `split_obs_min` times; a split with a 2-letter part also needs twice the count expected by chance, and a final letter marking the break needs one sighting), and among the confirmed splits the chosen one has the best score and the strongest association (observed vs. expected by chance). A split never displaces an edit-1 correction of the same word unless it is seen at least `split_obs_min` times and 10x above chance; otherwise it stays an alternative (alternatives and their counts are kept in `report.db` → `split_alternatives`) |
 | **Extra space** | `הימ נו` → `הימנו` | the joined form is frequent while a fragment is rare |
 | **Wrong / missing / extra / swapped letter** | `היעמנו` → `הימנו` | Damerau-Levenshtein distance 1 from a word ≥50× more frequent, boosted by a **learned confusion matrix** (see Calibration), then **context-verified**: the corrected word must appear next to the same neighboring words elsewhere |
-| **Final letter mid-word** | `שלוםעליכם` | deterministic rule of Hebrew orthography (ם ן ץ ף ך) |
+| **Final letter mid-word** | `שלוםעליכם` | deterministic rule of Hebrew orthography (ם ן ץ ף ך), applied up to `struct_max` occurrences (default 10), not only to rare words; abbreviations (geresh/gershayim) are exempt, and with no corpus word to propose it is reported as a *suspicion* with an empty suggestion |
 | **Non-final letter at word end** | `אדמ` → `אדם` | the final-form variant must be ≥50× more frequent |
 | **Abbreviation that lost its gershayim** | `רמבם` → `רמב"ם` | the quoted form must be a frequent abbreviation in the corpus |
 | **Book-specific OCR errors** | ד↔ר confusion throughout one scanned book | per-book OCR profiles learned by calibration allow a sensitized rescan of books with a proven systematic confusion |
@@ -67,6 +67,13 @@ suspected correction can be **verified against the corpus itself**.
 Every finding gets a confidence score; reports are sorted so genuine errors
 concentrate at the top, and each class also gets a high-precision
 `*_verified.csv` subset (context-verified or repeated in the same book).
+Rarity is statistical evidence, not a verdict: each row also carries an
+`evidence` column naming the support actually found — `context` (correction
+seen beside the same neighbours corpus-wide), `book_local` (correction used
+3+ times in the same book), `split_observed` (the spaced sequence occurs),
+`tanach`, `structural` (a deterministic orthographic rule with a corpus suggestion), `ocr_profile` (the book's reviewed systematic confusion), `suspicion` (structural rule, nothing to propose) or `none`. A
+single-book scan that looked only inside the book reports `context_book` /
+`split_observed_book` instead.
 
 ### False-positive suppression
 
@@ -103,9 +110,9 @@ common failure modes of naive edit-distance flagging:
 3. locate     find occurrences, detect extra spaces,
               context-verify corrections, check Tanach quotes (two corpus passes)
 4. report     ranked CSVs + SQLite report, split per source
-5. calibrate  (optional, after a first run) learn a letter-confusion matrix
-              and per-book OCR profiles from the verified findings, then
-              rerun detect+locate for a sharper second pass
+5. calibrate  (optional, after reviewing findings) learn a letter-confusion
+              matrix and per-book OCR profiles from HUMAN-REVIEWED findings
+              (approved/fixed in the review UI), then rerun detect+locate
 6. review     local web interface for accepting/rejecting findings
 ```
 
@@ -200,14 +207,24 @@ magiah all --otzaria --out results --allow-unread 3
 * Deleting `coverage_*.json` is not a workaround: on a fresh folder it
   unblocks nothing, and on an old one it passes stale results off as current.
 
-**Second, sharper pass** (recommended):
+**Second, sharper pass** (recommended, after reviewing some findings):
 
 ```bash
 magiah calibrate --out results   # learn confusion matrix + OCR book profiles
+                                 # from your reviewed decisions (ui_review.db)
 magiah detect    --out results
 magiah locate    --out results
 magiah report    --out results
 ```
+
+Calibration never learns from the machine's own unreviewed output by
+default (that would reinforce its own guesses). Without reviewed findings it
+learns nothing and says so; `--calibrate-from-machine` learns from
+`report.db` anyway and labels the result `machine_unreviewed` in
+`calibration_meta.json`. Learned files without that provenance (written by
+older versions), or whose hash no longer matches it, are ignored, and a
+`calibrate` run with nothing to learn disables the previous files. `python -m magiah.eval --out results` measures
+the ranking's precision on reviewed books held out from calibration.
 
 **Scan a single book** (seconds instead of an hour):
 
@@ -227,8 +244,11 @@ Findings are merged **additively** into `ui_review.db`. If the book was scanned
 before, its rows are replaced in place (no duplicates) and your review
 decisions on them are preserved; other books are untouched.
 
-`--book-verify-ctx` additionally verifies each correction against the entire
-corpus (more accurate, adds ~10 min). Without it, verification is book-local.
+`--book-verify-ctx` additionally verifies each correction and each split
+against the entire corpus (adds ~10 min); the findings are then the ones a
+full scan gives for this book. Without it, verification is book-local and is
+labelled so (`ctx_scope`/`split_scope` = `book`, evidence `context_book` /
+`split_observed_book`).
 
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.

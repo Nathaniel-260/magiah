@@ -154,6 +154,14 @@ def _merge_config(outdir, overrides):
     return cfg
 
 
+def calibrate_available(outdir):
+    """Calibration learns only from human-reviewed findings (approved or
+    fixed in ui_review.db); without them the stage has nothing to learn."""
+    from .. import core
+    rows, _ = core.reviewed_findings(outdir, core.REVIEW_POSITIVE)
+    return bool(core.calibration_rows(rows))
+
+
 def start_scan(outdir, stages=None, config_overrides=None,
                corpus_overrides=None):
     """Validate, write run_config.json and launch the scan thread.
@@ -163,11 +171,10 @@ def start_scan(outdir, stages=None, config_overrides=None,
     stages = [s for s in STAGE_ORDER if s in (stages or DEFAULT_STAGES)]
     if not stages:
         raise ValueError(hebrew.SCAN_MESSAGES['no_stages'])
-    # calibrate learns from a previous scan's report.db; on a first run there
-    # is nothing to learn from, so drop it rather than fail the whole scan.
+    # calibrate learns from human review decisions; with none there is
+    # nothing to learn from, so drop it rather than fail the whole scan.
     skipped_calibrate = False
-    if 'calibrate' in stages and not os.path.isfile(
-            os.path.join(outdir, 'report.db')):
+    if 'calibrate' in stages and not calibrate_available(outdir):
         stages = [s for s in stages if s != 'calibrate']
         skipped_calibrate = True
         if not stages:
@@ -556,16 +563,16 @@ def scan_config(outdir):
             'type': ('list' if key == 'whitelist'
                      else 'float' if isinstance(default, float) else 'int'),
         })
-    have_report = os.path.isfile(os.path.join(outdir, 'report.db'))
+    have_reviews = calibrate_available(outdir)
     stages = [{'key': s,
                'hebrew': hebrew.STAGE_LABELS.get(s, {}).get('hebrew', s),
                'explanation': hebrew.STAGE_LABELS.get(s, {}).get(
                    'explanation', ''),
-               # calibrate is a deliberate second pass: only pre-tick it once a
-               # report.db from an earlier scan exists for it to learn from
+               # calibrate is a deliberate second pass: only pre-tick it once
+               # human-reviewed findings exist for it to learn from
                'default': s in DEFAULT_STAGES or (s == 'calibrate'
-                                                  and have_report),
-               'available': s != 'calibrate' or have_report}
+                                                  and have_reviews),
+               'available': s != 'calibrate' or have_reviews}
               for s in STAGE_ORDER]
     return {
         'corpus': {'mode': mode, 'library_dir': library_dir or

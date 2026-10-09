@@ -166,12 +166,14 @@ class SqliteCorpus:
         con.execute(tanach.EVIDENCE_SCHEMA)
         con.executescript(f'''
             CREATE TABLE occurrences_full AS
-              SELECT o.word, e.errtype, e.suggestion,
-                     e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
+              SELECT o.word, e.errtype,
+                     COALESCE(o.occ_sugg, e.suggestion) AS suggestion,
+                     COALESCE(o.occ_score, e.score) AS score,
+                     o.ctx_hits, o.sugg_local, o.book_repeat,
                      o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet,
                      COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc,
-                     {tanach.ENRICH_COLS}
+                     o.evidence AS evidence, {tanach.ENRICH_COLS}
               FROM occurrences o
               JOIN errors e ON e.word = o.word
               {tanach.ENRICH_JOIN}
@@ -254,10 +256,13 @@ def _default_enrich(con):
     con.execute(tanach.EVIDENCE_SCHEMA)
     con.executescript(f'''
         CREATE TABLE occurrences_full AS
-          SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
+          SELECT o.word, e.errtype,
+                 COALESCE(o.occ_sugg, e.suggestion) AS suggestion,
+                 COALESCE(o.occ_score, e.score) AS score, o.ctx_hits,
                  o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet,
-                 '' AS origin, o.doc AS doc, {tanach.ENRICH_COLS}
+                 '' AS origin, o.doc AS doc, o.evidence AS evidence,
+                 {tanach.ENRICH_COLS}
           FROM occurrences o JOIN errors e ON e.word = o.word
           {tanach.ENRICH_JOIN};
         CREATE TABLE space_errors_full AS
