@@ -76,21 +76,31 @@ def list_db_books(db_path=None, query='', limit=200):
     db_path = db_path or OTZARIA_DB
     if not os.path.isfile(db_path):
         raise BookNotFound(f'קובץ מסד הנתונים לא נמצא: {db_path}')
-    con = _connect_ro(db_path)
+    sql = ('SELECT b.id, b.title, COALESCE(s.name, \'\'), b.totalLines '
+           'FROM book b LEFT JOIN source s ON s.id = b.sourceId')
+    params = []
+    if query:
+        sql += ' WHERE b.title LIKE ?'
+        params.append('%' + query + '%')
+    sql += ' ORDER BY b.title LIMIT ?'
+    params.append(int(limit))
     try:
-        sql = ('SELECT b.id, b.title, COALESCE(s.name, \'\'), b.totalLines '
-               'FROM book b LEFT JOIN source s ON s.id = b.sourceId')
-        params = []
-        if query:
-            sql += ' WHERE b.title LIKE ?'
-            params.append('%' + query + '%')
-        sql += ' ORDER BY b.title LIMIT ?'
-        params.append(int(limit))
-        return [{'key': str(r[0]), 'title': r[1], 'origin': r[2] or 'Unknown',
-                 'lines': r[3], 'source': 'db'}
-                for r in con.execute(sql, params)]
-    finally:
-        con.close()
+        con = _connect_ro(db_path)
+        try:
+            return [{'key': str(r[0]), 'title': r[1],
+                     'origin': r[2] or 'Unknown', 'lines': r[3],
+                     'source': 'db'}
+                    for r in con.execute(sql, params)]
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        # not SQLite at all ("file is not a database"), not Otzaria's ("no
+        # such table: book"), or damaged: the CLI and the UI's book picker
+        # show this, never a traceback
+        raise BookNotFound(
+            f'לא ניתן לקרוא את רשימת הספרים מהקובץ {db_path}: {e}\n'
+            'ייתכן שאינו מסד הספרים של אוצריא (seforim.db) או שהוא '
+            'פגום.') from e
 
 
 def list_library_books(library_dir=None, query='', limit=200):

@@ -46,7 +46,7 @@ from fractions import Fraction
 from urllib.parse import urlsplit
 
 from .normalize import TOKEN_RE, clean
-from .textsource import OtzariaDB, ReadStats
+from .textsource import OtzariaDB, ReadStats, db_read_errors
 
 # --- thresholds --------------------------------------------------------------
 MIN_CONTEXT = 5            # aligned context tokens around the word
@@ -430,7 +430,7 @@ class TanachIndex:
         idx = cls()
         if stats is not None:
             idx.stats = stats
-        with OtzariaDB(db_path) as odb:
+        with OtzariaDB(db_path) as odb, db_read_errors(db_path):
             idx._build(odb)
         return idx
 

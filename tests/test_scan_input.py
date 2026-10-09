@@ -17,8 +17,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from magiah import cli, core, corpus_hybrid
+from magiah import book_source, cli, core, corpus_hybrid
 from magiah.config import Config
+from magiah.textsource import OtzariaDB, ReadStats, TextSourceError
 
 TUNE = ['--workers', '1', '--n-chunks', '1']
 OUTPUTS = ('lexicon.pkl', 'flagged.pkl', 'report.db', 'coverage_lexicon.json',
@@ -218,6 +219,120 @@ class NoTextReadTest(unittest.TestCase):
             self.assertIn('לא קרא אף שורת טקסט', err)
             self.assertFalse(os.path.exists(
                 os.path.join(d, 'out', core.LEXICON_F)))
+
+
+def make_paged_db(path, rows=3000):
+    """An Otzaria-style database (text in line_content) big enough that
+    damaging its last pages leaves `line` - and so the chunk ranges - intact
+    and breaks only the content read inside a chunk."""
+    con = sqlite3.connect(path)
+    con.executescript('''
+        CREATE TABLE source(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE book(id INTEGER PRIMARY KEY, title TEXT, sourceId INT,
+                          totalLines INT);
+        CREATE TABLE line(id INTEGER PRIMARY KEY, bookId INT,
+                          lineIndex INT, heRef TEXT);
+        CREATE TABLE line_content(id INTEGER PRIMARY KEY, content TEXT);
+        INSERT INTO source VALUES(1, 'Sefaria');
+        INSERT INTO book VALUES(1, 'ספר', 1, 3000);
+    ''')
+    text = 'בראשית ברא אלהים את השמים ואת הארץ ' * 8
+    con.executemany('INSERT INTO line VALUES(?,1,?,?)',
+                    [(i, i, f'ספר {i}') for i in range(1, rows + 1)])
+    con.executemany('INSERT INTO line_content VALUES(?,?)',
+                    [(i, text) for i in range(1, rows + 1)])
+    con.commit()
+    con.close()
+
+
+def damage_pages(path, first_from_end=60, count=3, page=4096):
+    """Zero a few pages near the end of the file (line_content's leaves)."""
+    pages = os.path.getsize(path) // page
+    with open(path, 'r+b') as f:
+        for n in range(pages - first_from_end, pages - first_from_end + count):
+            f.seek(n * page)
+            f.write(b'\x00' * page)
+
+
+class DamagedDatabaseTest(unittest.TestCase):
+    """sqlite3.DatabaseError reaches the user as Hebrew, exit code 1."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='magiah_baddb_')
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        self.out = os.path.join(self.tmp.name, 'out')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_book_list_of_a_file_that_is_not_sqlite(self):
+        with open(self.db, 'wb') as f:
+            f.write(b'this is not sqlite' * 100)
+        rc, err = run_cli('book', '--book-list', '', '--otzaria', '--db',
+                          self.db, '--out', self.out)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+        self.assertIn('לא ניתן לקרוא את רשימת הספרים', err)
+        self.assertIn(self.db, err)
+        # the UI's book picker gets the same message (BookNotFound -> 400)
+        with self.assertRaises(book_source.BookNotFound):
+            book_source.list_db_books(self.db, '')
+
+    def test_book_list_of_a_database_that_is_not_otzaria(self):
+        con = sqlite3.connect(self.db)
+        con.execute('CREATE TABLE other(x)')
+        con.commit()
+        con.close()
+        rc, err = run_cli('book', '--book-list', '', '--otzaria', '--db',
+                          self.db, '--out', self.out)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+        self.assertIn('לא ניתן לקרוא את רשימת הספרים', err)
+
+    def test_page_damaged_mid_read_in_a_worker(self):
+        make_paged_db(self.db)
+        damage_pages(self.db)
+        rc, err = run_cli('lexicon', '--otzaria', '--db', self.db,
+                          '--out', self.out, '--workers', '1',
+                          '--n-chunks', '4')
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+        self.assertIn('שגיאה בקריאת מסד הנתונים', err)
+        self.assertIn('malformed', err)
+        self.assertFalse(os.path.exists(os.path.join(self.out,
+                                                     core.LEXICON_F)))
+
+    def test_page_damaged_book_scan(self):
+        make_paged_db(self.db)
+        damage_pages(self.db)
+        rc, err = run_cli('book', '--book', '1', '--otzaria', '--db',
+                          self.db, '--out', self.out)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+        self.assertIn('שגיאה בקריאת מסד הנתונים', err)
+
+    def test_reader_methods_raise_text_source_error(self):
+        make_paged_db(self.db)
+        damage_pages(self.db)
+        with OtzariaDB(self.db) as odb:
+            with self.assertRaises(TextSourceError):
+                list(odb.iter_range(1, 3001, ReadStats()))
+            with self.assertRaises(TextSourceError):
+                odb.book_lines(1)
+            with self.assertRaises(TextSourceError):
+                odb.line_texts(range(1, 3001))
+
+    def test_other_database_errors_are_hebrew_too(self):
+        # e.g. report.db damaged under the report stage
+        os.makedirs(self.out)
+        with mock.patch.object(core, 'report', side_effect=sqlite3
+                               .DatabaseError('database disk image is '
+                                              'malformed')):
+            rc, err = run_cli('report', '--textdir', self.tmp.name,
+                              '--out', self.out)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+        self.assertIn('שגיאה בקריאת מסד נתונים', err)
 
 
 if __name__ == '__main__':
