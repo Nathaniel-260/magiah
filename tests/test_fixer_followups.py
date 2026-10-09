@@ -17,7 +17,7 @@ from test_anchor_write import TempCase, finding                 # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# the mapped tokenizer
+# the mapped tokenizer and per-line work
 # ---------------------------------------------------------------------------
 
 class TestControlCharactersInALine(TempCase):
@@ -47,6 +47,62 @@ class TestControlCharactersInALine(TempCase):
                 patcher.apply_edits(d, [plan])
                 self.assertEqual(d.encode(), (line.replace(
                     'יותבת', 'יושבת') + '\n').encode('utf-8'))
+
+
+class TestPerLineWorkIsShared(TempCase):
+    """Anchoring cost (findings on a line) x (line length): 50 findings on
+    one 200 KB line took 22-26 s. Each line is now tokenized once."""
+
+    def test_a_long_line_is_tokenized_once_for_all_its_findings(self):
+        words = []
+        typos = ['קדבנ' + chr(0x05D0 + i) for i in range(20)]
+        for i in range(3000):
+            words.append(typos[i // 150] if i % 150 == 75 else 'שלום')
+        line = ' '.join(words)
+        d = self.doc('פתיחה\n' + line + '\nסוף\n')
+        rows = [dict(finding(line, t, 'קרבן', lineno=1, fid=i + 1),
+                     occurrence=0, expected_count=1)
+                for i, t in enumerate(typos)]
+        calls = []
+        real = normalize.token_spans_full
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+        normalize.token_spans_full = counting
+        try:
+            patcher.anchor_rows(d, rows)
+        finally:
+            normalize.token_spans_full = real
+        self.assertEqual([r['anchor'].get('code') for r in rows
+                          if not r['anchor']['ok']], [])
+        self.assertEqual([r['anchor']['start'] for r in rows],
+                         [line.index(t) for t in typos])
+        self.assertEqual(calls.count(len(line)), 1, calls)
+
+    def test_twins_are_still_found_past_an_entity_newline(self):
+        """Nearby lines are searched as one joined text; an entity that
+        decodes to a newline must not shift the line numbers found."""
+        line = 'אמר רבי יותבת בן זומא'
+        for first in ('פתיחה', 'א&#10;ב&#x0A;ג'):
+            with self.subTest(first=first):
+                d = self.doc('\n'.join((first, line, 'כותרת', line)) + '\n')
+                with self.assertRaises(patcher.PatchError) as cm:
+                    patcher.plan_edit(d, finding(line, 'יותבת', 'יושבת',
+                                                 lineno=1))
+                self.assertEqual(cm.exception.code, 'ambiguous_line')
+                self.assertEqual(cm.exception.extra['candidate_lines'],
+                                 [1, 3])
+
+    def test_an_edited_line_is_not_answered_from_the_cache(self):
+        line = 'אמר רבי יותבת בן זומא'
+        d = self.doc(line + '\n')
+        f = finding(line, 'יותבת', 'יושבת')
+        plan = patcher.plan_edit(d, f)
+        patcher.apply_edits(d, [plan])
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'token_not_found')
 
 
 if __name__ == '__main__':

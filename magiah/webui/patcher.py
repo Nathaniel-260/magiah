@@ -50,6 +50,7 @@ import json
 import os
 import re
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 from .. import book_source, normalize
@@ -226,7 +227,12 @@ class FileDoc:
         # bytes on disk when read (BOM included); with the fingerprint, what a
         # book scan's record is compared against
         self.size = size
-        self._clean = {}                # lineno -> clean(line), for scans
+        # Per-line work shared by every finding of the book (anchoring a page
+        # costs findings x line length otherwise). Each entry is checked
+        # against the line's current text, so an edited line is recomputed.
+        self._clean = {}                # lineno -> (line, clean, token set)
+        self._info = OrderedDict()      # line text -> _LineInfo, LRU
+        self._cleans = None             # clean() of every line
 
     def __len__(self):
         return len(self.lines)
@@ -379,21 +385,21 @@ def render_replacement(mode, wrong_raw, correction):
     return correction
 
 
-def _snippet_identifies(line, snippet):
+def _snippet_identifies(line_toks, snippet):
     """Strict token-overlap identity, for snippets that are not a window.
 
-    Hebrew religious texts repeat long formulas verbatim across many
-    verses ("וידבר ה' אל משה לאמר דבר אל בני ישראל ואמרת אלהם…"), and a
-    tolerant overlap test passes on every parallel verse. Identity therefore
-    needs most of the snippet's tokens: requiring a large majority is what
-    separates "the same verse, moved" from "its twin, three verses down".
+    ``line_toks`` is the set of the line's tokens. Hebrew religious texts
+    repeat long formulas verbatim across many verses ("וידבר ה' אל משה
+    לאמר דבר אל בני ישראל ואמרת אלהם…"), and a tolerant overlap test passes
+    on every parallel verse. Identity therefore needs most of the snippet's
+    tokens: requiring a large majority is what separates "the same verse,
+    moved" from "its twin, three verses down".
     """
     if not snippet:
         return False           # cannot identify anything without evidence
     toks = [t for t in normalize.tokenize(snippet) if len(t) > 1]
     if len(toks) < 3:
         return False           # too little to identify a line by
-    line_toks = set(normalize.tokenize(line))
     hits = sum(1 for t in toks if t in line_toks)
     return hits >= max(3, int(len(toks) * 0.75))
 
@@ -413,33 +419,81 @@ LEVEL_WINDOW = 'window'        # the snippet IS this occurrence's window
 LEVEL_TOKENS = 'tokens'        # legacy: most snippet tokens are on the line
 
 
-def _occurrences(line, word):
+class _LineInfo:
+    """One line's clean text and token spans, computed once and shared by
+    every finding that looks at the line."""
+    __slots__ = ('clean', 'spans', '_by_tok')
+
+    def __init__(self, text):
+        self.clean, self.spans = normalize.token_spans_full(text)
+        self._by_tok = None
+
+    def by_tok(self):
+        """token -> indexes of its spans, in order."""
+        if self._by_tok is None:
+            idx = {}
+            for i, sp in enumerate(self.spans):
+                idx.setdefault(sp[0], []).append(i)
+            self._by_tok = idx
+        return self._by_tok
+
+    def occurrences(self, word):
+        """``[(raw_s, raw_e, clean_s, clean_e), ...]`` of `word`, which may
+        span several tokens (the extra_space family)."""
+        want = word.split()
+        if not want:
+            return []
+        spans, k, out = self.spans, len(want), []
+        for i in self.by_tok().get(want[0], ()):
+            if i + k <= len(spans) and all(
+                    spans[i + j][0] == want[j] for j in range(1, k)):
+                out.append((spans[i][1], spans[i + k - 1][2], spans[i][3],
+                            spans[i + k - 1][4]))
+        return out
+
+
+# lines kept per document: anchoring walks the book in reading order, so a
+# small window of recent lines catches every repeat
+_INFO_CACHE = 256
+
+
+def _line_info(doc, text):
+    """The :class:`_LineInfo` of `text`, from `doc`'s cache when it has one."""
+    cache = getattr(doc, '_info', None)
+    if cache is None:
+        return _LineInfo(text)
+    info = cache.get(text)
+    if info is None:
+        info = cache[text] = _LineInfo(text)
+        if len(cache) > _INFO_CACHE:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(text)
+    return info
+
+
+def _occurrences(line, word, doc=None):
     """``(clean_text, [(raw_s, raw_e, clean_s, clean_e), ...])`` of `word`,
     which may span several tokens (the extra_space family)."""
-    want = word.split()
-    clean_text, spans = normalize.token_spans_full(line)
-    out = []
-    for i in range(len(spans) - len(want) + 1):
-        win = spans[i:i + len(want)]
-        if [t[0] for t in win] == want:
-            out.append((win[0][1], win[-1][2], win[0][3], win[-1][4]))
-    return clean_text, out
+    info = _line_info(doc, line)
+    return info.clean, info.occurrences(word)
 
 
-def _identify(line, word, snippet):
+def _identify(line, word, snippet, doc=None):
     """``(occurrences, identified_indexes, level)`` for one candidate line.
 
     ``level`` is None when the snippet does not identify the line at all."""
-    clean_text, occs = _occurrences(line, word)
+    info = _line_info(doc, line)
+    occs = info.occurrences(word)
     if not snippet or not occs:
         return occs, [], None
-    r = SNIPPET_RADIUS
+    clean_text, r = info.clean, SNIPPET_RADIUS
     ident = [i for i, o in enumerate(occs)
              if clean_text[max(0, o[2] - r):o[3] + r].strip() == snippet]
     if ident:
         return occs, ident, LEVEL_WINDOW
     # an older scan (or another family) may have cut the snippet differently
-    if _snippet_identifies(line, snippet):
+    if _snippet_identifies(info.by_tok(), snippet):
         return occs, list(range(len(occs))), LEVEL_TOKENS
     return occs, [], None
 
@@ -453,29 +507,70 @@ def _copies(text, word):
 
 
 def _clean_of(doc, n):
+    """``(clean_text, token set)`` of line `n`, cached while the line is
+    unchanged."""
+    line = doc.lines[n]
     c = doc._clean.get(n)
-    if c is None:
-        c = doc._clean[n] = normalize.clean(doc.lines[n])
-    return c
+    if c is None or c[0] is not line:
+        cl = normalize.clean(line)
+        c = doc._clean[n] = (line, cl, frozenset(
+            normalize.TOKEN_RE.findall(cl)))
+    return c[1], c[2]
+
+
+def _cleans(doc):
+    """clean() of every line, computed once per document (apply_edits and
+    reverse_entries, the only writers of ``doc.lines``, drop it)."""
+    if doc._cleans is None or len(doc._cleans) != len(doc.lines):
+        doc._cleans = [normalize.clean(line) for line in doc.lines]
+    return doc._cleans
+
+
+NL = chr(10)
+
+
+def _lines_with(doc, lo, hi, text):
+    """Lines in ``[lo, hi)`` whose clean text contains `text`, in order: one
+    C-speed search over the window instead of a test per line."""
+    cleans = _cleans(doc)
+    win = NL.join(cleans[lo:hi])
+    if win.count(NL) != max(0, hi - lo - 1):
+        # an entity (&#10;) decoded to a newline: count lines one by one
+        return [n for n in range(lo, hi) if text in cleans[n]]
+    out, n, last = [], lo, 0
+    pos = win.find(text)
+    while pos >= 0:
+        n += win.count(NL, last, pos)
+        out.append(n)
+        last = win.find(NL, pos)
+        if last < 0:
+            break
+        n += 1
+        last += 1
+        pos = win.find(text, last)
+    return out
 
 
 def _candidates(doc, lineno, word, snippet, skip):
     """Lines within DRIFT_WINDOW (except `skip`) that the snippet identifies,
-    as ``{level: [(n, occs, ident), ...]}``. Cheap substring prefilters keep
-    this affordable when a whole book is anchored at page load."""
+    as ``{level: [(n, occs, ident), ...]}``. Cheap prefilters keep this
+    affordable when a whole book is anchored at page load."""
     out = {LEVEL_WINDOW: [], LEVEL_TOKENS: []}
     parts = word.split()
+    if not parts:
+        return out
     lo = max(0, lineno - DRIFT_WINDOW)
     hi = min(len(doc.lines), lineno + DRIFT_WINDOW + 1)
-    for n in range(lo, hi):
+    for n in _lines_with(doc, lo, hi, parts[0]):
         if n == skip:
             continue
-        cl = _clean_of(doc, n)
-        if snippet not in cl and (
-                not all(p in cl for p in parts)
-                or not _snippet_identifies(doc.lines[n], snippet)):
+        cl, toks = _clean_of(doc, n)
+        # the word must be a token there, and the snippet must be on the
+        # line or at least most of its words
+        if not all(p in toks for p in parts) or (
+                snippet not in cl and not _snippet_identifies(toks, snippet)):
             continue
-        occs, ident, level = _identify(doc.lines[n], word, snippet)
+        occs, ident, level = _identify(doc.lines[n], word, snippet, doc)
         if level:
             out[level].append((n, occs, ident))
     return out
@@ -503,7 +598,8 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     """
     here = None
     if lineno < len(doc.lines):
-        occs, ident, level = _identify(doc.lines[lineno], word, snippet)
+        occs, ident, level = _identify(doc.lines[lineno], word, snippet,
+                                       doc)
         if level:
             here = (lineno, occs, ident, level, False)
     if here is not None and not (trusted and here[3] == LEVEL_WINDOW):
@@ -518,9 +614,9 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     if here is not None:
         return here
 
-    if lineno < len(doc.lines) and not _occurrences(doc.lines[lineno],
-                                                    word)[1] \
-            and _snippet_identifies(doc.lines[lineno], snippet):
+    if lineno < len(doc.lines) \
+            and not _occurrences(doc.lines[lineno], word, doc)[1] \
+            and _snippet_identifies(_clean_of(doc, lineno)[1], snippet):
         # The scanned passage is still sitting where it was and only the
         # word is gone (a human fixed it): never relocate onto a twin verse.
         raise PatchError('token_not_found', _msg(
@@ -542,7 +638,7 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     if lineno >= len(doc.lines):
         raise PatchError('line_gone', _msg('line_gone', n=lineno + 1),
                          id=fid)
-    if not _occurrences(doc.lines[lineno], word)[1]:
+    if not _occurrences(doc.lines[lineno], word, doc)[1]:
         raise PatchError('token_not_found', _msg(
             'token_not_found', word=word, n=lineno + 1), id=fid)
     # the word is here, but nothing proves this is the scanned sentence
@@ -554,11 +650,20 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
 # quotes AFTER a word are closing quotation marks, never part of the word.
 _GERESH = "'’׳"
 
+
 # "(x) [" right before the span and "]" after it: the exact layout the fixer's
 # bracket mode writes, "(correction) [original]". A plain ketiv/qere pair,
 # "(הנער) [הנערה]", looks the same, while Otzaria's Tanach writes ketiv/qere
 # inside mam-kq spans or as "ketiv [qere]", neither of which matches here.
-_BRACKETED_RE = re.compile(r'\([^()\[\]]*\) \[$')
+def _bracket_opened(line, start):
+    """Where "(x) [" ending exactly at `start` begins, or None. Looked up
+    backwards from `start` alone, so a long line costs nothing per word."""
+    if start < 4 or line[start - 3:start] != ') [':
+        return None
+    k = line.rfind('(', 0, start - 3)
+    if k < 0 or any(c in line[k + 1:start - 3] for c in '()[]'):
+        return None
+    return k
 
 
 def _bare(text):
@@ -624,6 +729,8 @@ def _as_scanned(line, lineno, own_edits):
         if pos is not None:
             found.append((pos, pos + len(e.get('new') or ''),
                           e.get('old') or ''))
+    if not found:
+        return line, []            # the very string: its spans are cached
     found.sort()
     parts, undone, prev, then = [], [], 0, 0
     for a, b, old in found:
@@ -639,7 +746,7 @@ def _as_scanned(line, lineno, own_edits):
     return ''.join(parts), undone
 
 
-def _scanned_copy(line, lineno, word, finding, spans, own_edits):
+def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
     """Index in `spans` (the copies of `word` on the line now) of the copy
     the finding means, chosen by the scan's order — and proven, or refused.
 
@@ -666,7 +773,7 @@ def _scanned_copy(line, lineno, word, finding, spans, own_edits):
     if rebuilt is None:
         refuse('ambiguous_occurrence')
     then, undone = rebuilt
-    clean_then, occs = _occurrences(then, word)
+    clean_then, occs = _occurrences(then, word, doc)
     if expected is not None and expected != len(occs):
         refuse('occurrence_count_changed')
     if not 0 <= occurrence < len(occs):
@@ -748,7 +855,7 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
                 manual_lines=allowed)
         lineno = want
         line = doc.lines[lineno]
-        spans = _occurrences(line, word)[1]
+        spans = _occurrences(line, word, doc)[1]
         start, end = explicit
         if not (0 <= start < end <= len(line)):
             raise PatchError('bad_offsets', _msg('bad_offsets'), id=fid)
@@ -786,15 +893,15 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
             # the whole line), or copies gone or added since the scan: only
             # the scan's own order can choose, and only with proof.
             occurrence = _scanned_copy(line, lineno, word, finding, spans,
-                                       own_edits)
+                                       own_edits, doc)
             confidence = 'indexed'
         start, end = spans[occurrence][0], spans[occurrence][1]
 
     close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
-    opened = _BRACKETED_RE.search(line[:start])
-    if opened and line[close:close + 1] == ']':
+    opened = _bracket_opened(line, start)
+    if opened is not None and line[close:close + 1] == ']':
         origin = _bracket_origin(
-            line, opened.start(), close + 1, finding.get('snippet'),
+            line, opened, close + 1, finding.get('snippet'),
             (correction, finding.get('suggestion')), own_edits)
         if origin in ('record', 'own'):
             raise PatchError('already_applied', _msg('already_applied',
@@ -907,6 +1014,7 @@ def apply_edits(doc, plans):
             line = line[:p.start] + p.new_text + line[p.end:]
         doc.lines[lineno] = line
         doc._clean.pop(lineno, None)
+        doc._cleans = None
         delta = 0
         for p in sorted(group, key=lambda p: p.start):
             p.post_start = ps = p.start + delta
@@ -997,6 +1105,7 @@ def reverse_entries(doc, entries):
     for n, line in new_lines.items():
         doc.lines[n] = line
         doc._clean.pop(n, None)
+        doc._cleans = None
     return sorted(new_lines)
 
 
