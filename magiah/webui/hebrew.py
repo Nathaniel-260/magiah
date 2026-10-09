@@ -751,6 +751,9 @@ MESSAGES = {
                                'ולנסות שוב.',
     'legacy_accept_recheck': 'החלטה ישנה: אושר עם ההצעה "{sugg}", על סמך '
                              'ראיית תנ"ך בשיטה הישנה — יש לבדוק מחדש',
+    # a stale approval: the finding was approved, then a re-scan changed
+    # its suggestion, so it is open again
+    'stale_mark': 'ההצעה השתנתה מאז שאושרה, יש לבדוק שוב',
     'import_done': 'הייבוא הושלם',
     'export_done': 'הייצוא הושלם',
 }

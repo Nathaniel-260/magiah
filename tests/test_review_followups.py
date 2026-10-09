@@ -19,8 +19,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 from magiah import book_scan, core                              # noqa: E402
-from magiah.webui import db                                     # noqa: E402
-from test_review_state import Case, ServerCase, whitelist_cfg   # noqa: E402
+from magiah.webui import db, export, hebrew                     # noqa: E402
+from test_review_state import (Case, ServerCase, make_report,   # noqa: E402
+                               whitelist_cfg)
 
 
 def hold(path, mode='BEGIN EXCLUSIVE'):
@@ -150,6 +151,42 @@ class TestResetOrder(ServerCase):
         db.reset(self.con, self.outdir)
         self.assertEqual(self.counts()[:3], [0, 0, 0])
         self.assertEqual(decisions_rows(self.outdir), dec_before)
+
+
+# ---------------------------------------------------------------------------
+# the Excel export shows a stale row's current suggestion
+# ---------------------------------------------------------------------------
+
+class TestXlsxStale(Case):
+    def test_stale_row_shows_the_current_suggestion(self):
+        import zipfile
+        make_report(self.outdir, [('אבי', 'אביו', '10', '1', 'ספר'),
+                                  ('בית', 'ביתו', '11', '1', 'ספר')])
+        db.import_all(self.outdir)
+        ids = dict(self.con.execute('SELECT word, id FROM findings'))
+        db.set_status(self.con, self.outdir, list(ids.values()), 'approved')
+        make_report(self.outdir, [('אבי', 'אבא', '10', '1', 'ספר'),
+                                  ('בית', 'ביתו', '11', '1', 'ספר')])
+        db.import_all(self.outdir)
+        self.assertEqual(self.eff(ids['אבי']), 'pending')
+        rows = {r[3]: r for r in export._all_rows(self.con, 'o1')}
+        self.assertEqual(rows['אבי'][4], 'אבא')        # not the old אביו
+        self.assertIn(hebrew.MESSAGES['stale_mark'], rows['אבי'][7])
+        self.assertEqual(rows['בית'][4], 'ביתו')       # still approved
+        self.assertNotIn(hebrew.MESSAGES['stale_mark'], rows['בית'][7])
+        path, = export.export_xlsx(self.con, self.outdir, 'o1')
+        with zipfile.ZipFile(path) as z:
+            xml = ''.join(z.read(n).decode('utf-8') for n in z.namelist()
+                          if n.startswith('xl/worksheets/'))
+        self.assertIn('אבא', xml)
+        self.assertNotIn('אביו', xml)
+
+    def test_custom_fix_on_an_open_row_is_shown(self):
+        self.add(1, 'בית', 'ביתו', '10')
+        db.set_status(self.con, self.outdir, [1], 'unsure',
+                      custom_suggestion='בתים')
+        row, = export._all_rows(self.con, 'o1')
+        self.assertEqual(row[4], 'בתים')
 
 
 if __name__ == '__main__':

@@ -38,6 +38,12 @@ DECIDER = f'''CASE
 # the suggestion as it was when approved (a re-scan may have changed it)
 APPROVED_FIX = ("COALESCE(NULLIF(r.custom_suggestion, ''), "
                 "x.approved_suggestion, f.suggestion, '')")
+# the correction a row shows: what was approved while it stands approved,
+# else the current one (a stale approval keeps its old approved_suggestion
+# in review_ext, but the row now proposes something else and is pending)
+SHOWN_FIX = (f"CASE WHEN {EFF} IN ('approved', 'fixed') THEN {APPROVED_FIX} "
+             "ELSE COALESCE(NULLIF(r.custom_suggestion, ''), f.suggestion, "
+             "'') END")
 ACTOR_HEBREW = {'human': 'אדם', 'agent': 'סוכן', 'unknown': 'לא ידוע'}
 
 # Excel sheet names: max 31 chars, no : \ / ? * [ ]
@@ -213,9 +219,9 @@ MAIN_HEADERS = ['ספר', 'מראה מקום', 'סוג שגיאה', 'המילה 
 
 _ROW_SQL = f'''
     SELECT f.source, f.ref, f.errtype, f.word,
-           {APPROVED_FIX},
+           {SHOWN_FIX},
            f.rank, f.verified, {EFF}, r.note, f.snippet, f.unit,
-           {DECIDER}
+           {DECIDER}, x.flag
     FROM findings f {JOINS} {EXT_JOIN}
     WHERE f.origin = ?'''
 
@@ -227,7 +233,9 @@ def _fmt_row(r, with_errtype=True):
     out += [r[3] or '', r[4] or '',
             r[5] if r[5] is not None else '',
             'כן' if r[6] else '',
-            hebrew.status_hebrew(r[7]),
+            hebrew.status_hebrew(r[7]) + (
+                ' — ' + hebrew.MESSAGES['stale_mark']
+                if r[12] == 'stale_approval' and r[7] == 'pending' else ''),
             r[8] or '', r[9] or '', r[10] or '',
             ACTOR_HEBREW.get(r[11], r[11] or '')]
     return out
