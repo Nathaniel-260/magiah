@@ -675,6 +675,8 @@ def _frequent_stem(w, freq, thresh):
 # ---------------------------------------------------------------------------
 
 HEB_LETTERS = 'אבגדהוזחטיכלמנסעפצקרשתךםןףץ'
+# letters that number a footnote marker (א) .. ת)); final forms do not
+NUMERAL_LETTERS = frozenset('אבגדהוזחטיכלמנסעפצקרשת')
 
 # error types whose suggestion is a single word the book itself may also use
 LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
@@ -1632,6 +1634,19 @@ def locate_line(content, freq, cfg, flagged, prof=None):
 
     # pass 2 — occurrences of flagged word types (+ OCR-profile layer)
     occ, ocr = [], []
+    paren = [0, 0]      # text scanned so far, '(' still open there
+
+    def open_paren(pos):
+        """Is a '(' before `pos` still unclosed? Positions only grow, so
+        the whole line is scanned once."""
+        i, depth = paren
+        for ch in text[i:pos]:
+            if ch == '(':
+                depth += 1
+            elif ch == ')' and depth:
+                depth -= 1
+        paren[:] = [pos, depth]
+        return depth > 0
     for k, m in enumerate(toks):
         w = m.group()
         if prof and w not in flagged:
@@ -1647,9 +1662,11 @@ def locate_line(content, freq, cfg, flagged, prof=None):
         if _editorial_adjacent(text, s, e):
             continue
         # a footnote marker glued to a word ('...א)') is notation, not an
-        # extra last letter
+        # extra last letter — but only a lone ')' after a numeral letter;
+        # one that closes a '(' ends a parenthesized word, (בספרר)
         if (e < len(text) and text[e] == ')' and fr[1] == 'edit1_ins'
-                and fr[2] == w[:-1]):
+                and fr[2] == w[:-1] and w[-1] in NUMERAL_LETTERS
+                and not open_paren(e)):
             continue
         prev = toks[k - 1].group() if k else ''
         nxt = toks[k + 1].group() if k + 1 < len(toks) else ''

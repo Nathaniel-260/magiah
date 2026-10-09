@@ -748,6 +748,33 @@ class FootnoteMarkerLetter(unittest.TestCase):
                                flagged)
         self.assertEqual(res[0], [])
 
+    FREQ = {'ספר': 100, 'גדול': 100, 'ועיין': 100, 'שם': 100, 'בספר': 100,
+            'טוב': 100}
+    BSFRR = {'בספרר': (1, 'edit1_ins', 'בספר', 100, 3.0)}
+
+    def _words(self, line):
+        res = core.locate_line(line, self.FREQ, small_cfg(), self.BSFRR)
+        return [o[0] for o in res[0]]
+
+    def test_glued_marker_after_word_is_notation(self):      # KSK style
+        self.assertEqual(self._words('ספר טוב בספרר) גדול'), [])
+
+    def test_closed_paren_earlier_does_not_count(self):
+        self.assertEqual(self._words('(א) ספר טוב בספרר) גדול'), [])
+
+    def test_extra_letter_inside_parentheses_is_reported(self):
+        self.assertEqual(self._words('ועיין שם (בספרר) גדול'), ['בספרר'])
+        self.assertEqual(self._words('ועיין (שם בספרר) גדול'), ['בספרר'])
+
+    def test_extra_letter_without_paren_is_reported(self):
+        self.assertEqual(self._words('ועיין שם בספרר גדול'), ['בספרר'])
+
+    def test_final_letter_is_not_a_marker(self):
+        flagged = {'שלומם': (1, 'edit1_ins', 'שלומ', 50, 3.0)}
+        res = core.locate_line('אמר לנו שלומם) דבר', self._lex(),
+                               small_cfg(), flagged)
+        self.assertEqual([o[0] for o in res[0]], ['שלומם'])
+
     def test_other_errors_before_paren_are_still_reported(self):
         flagged = {'שלמ': (1, 'nonfinal_end', 'שלם', 50, 3.0)}
         res = core.locate_line('אמר לנו שלמ) דבר', self._lex(), small_cfg(),
