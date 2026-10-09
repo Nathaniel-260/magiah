@@ -205,7 +205,7 @@ SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
 ADDED_COLUMNS = {
     'history': (('prev_state', 'TEXT'), ('decided_by', 'TEXT')),
 }
-SCHEMA_REV = 3
+SCHEMA_REV = 4
 
 # A book's stable identity. `source` is only a display title and several
 # books share one, so it is used only when a row has no doc at all.
@@ -304,7 +304,7 @@ def connect(outdir):
     if not SCHEMA_TABLES <= have:
         con.executescript(SCHEMA)
     if _schema_rev(con) < SCHEMA_REV:
-        _migrate(con)
+        _migrate(con, outdir)
     if not con.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
                          "AND name='idx_f_doc'").fetchone():
         # added with the single-book scan; existing databases predate it and
@@ -366,15 +366,20 @@ def _schema_rev(con):
         return 0
 
 
-def _migrate(con):
+def _migrate(con, outdir=None):
     """Bring an existing ui_review.db up to SCHEMA_REV, additively.
 
     rev 2: review rows are scoped 'occurrence' (a review row was always one
-    finding's decision), approvals record the suggestion they were made on,
-    doc-less rows get a doc where one can be derived.
+    finding's decision), approvals record the suggestion they were made on
+    (:func:`_bind_old_approvals`; one that cannot be bound is demoted to
+    'unsure'), doc-less rows get a doc where one can be derived.
     rev 3: word_rules is back to its original 3 columns (decided_by moves to
     word_rule_ext) and the keyset sort indexes exist.
+    rev 4: word-wide approvals are bound to the suggestion decisions.db
+    recorded for them (:func:`_bind_word_approvals`).
     Never touches a database of a newer revision; safe to run concurrently.
+    decisions.db (when a step writes it) commits first; a lock on it, like
+    one on ui_review.db, leaves the upgrade to the next connection.
     """
     for table, cols in ADDED_COLUMNS.items():
         have = {r[1] for r in con.execute(f'PRAGMA table_info({table})')}
@@ -384,6 +389,7 @@ def _migrate(con):
                     con.execute(f'ALTER TABLE {table} ADD COLUMN {name} {typ}')
                 except sqlite3.OperationalError:
                     pass               # another connection just added it
+    dec, gone = None, []
     try:
         cur = con.cursor()
         cur.execute('BEGIN IMMEDIATE')
@@ -394,14 +400,7 @@ def _migrate(con):
         if rev < 2:
             cur.execute('''INSERT OR IGNORE INTO review_ext(finding_id, scope)
                            SELECT finding_id, 'occurrence' FROM review''')
-            cur.execute('''UPDATE review_ext SET approved_suggestion = (
-                    SELECT COALESCE(NULLIF(r.custom_suggestion, ''),
-                                    f.suggestion, '')
-                    FROM review r JOIN findings f ON f.id = r.finding_id
-                    WHERE r.finding_id = review_ext.finding_id)
-                WHERE approved_suggestion IS NULL AND finding_id IN (
-                    SELECT finding_id FROM review
-                    WHERE status IN ('approved', 'fixed'))''')
+            dec, gone = _bind_old_approvals(con, outdir)
             _fill_missing_docs(cur, 'findings')
         if rev < 3:
             have = {r[1] for r in con.execute('PRAGMA table_info(word_rules)')}
@@ -413,23 +412,40 @@ def _migrate(con):
             for stmt in _sort_index_sql().split(';'):
                 if stmt.strip():
                     cur.execute(stmt)
+        if rev < 4 and con.execute("SELECT 1 FROM word_rules WHERE status = "
+                                   "'approved' LIMIT 1").fetchone():
+            path = outdir and os.path.join(outdir, DECISIONS_F)
+            if path and os.path.exists(path):
+                if dec is None:
+                    dec = _decisions_con(outdir,
+                                         timeout=MIGRATE_DECISIONS_TIMEOUT)
+                _bind_word_approvals(con, dec)
         cur.execute("INSERT OR REPLACE INTO meta VALUES('schema_rev', ?)",
                     (str(SCHEMA_REV),))
-        con.commit()
-    except sqlite3.OperationalError:
+        if dec is not None:
+            _commit_decisions_first(con, dec, gone)
+        else:
+            con.commit()
+    except (sqlite3.OperationalError, DecisionsLocked):
         con.rollback()                 # locked: the next connection retries
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
 
 
 DECISIONS_TIMEOUT = 30.0      # seconds to wait for a decisions.db lock
+# ...inside connect()'s schema upgrade, which a lock only postpones
+MIGRATE_DECISIONS_TIMEOUT = 2.0
 
 
-def _decisions_con(outdir):
+def _decisions_con(outdir, timeout=None):
     """decisions.db. Its `decisions` table stays exactly as the legacy tool
     created it; the explicit scope of each row lives in `decision_scope`
     (unit '*' = global, anything else = this occurrence only)."""
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F),
-                          timeout=DECISIONS_TIMEOUT)
-    con.execute(f'PRAGMA busy_timeout={int(DECISIONS_TIMEOUT * 1000)}')
+    if timeout is None:
+        timeout = DECISIONS_TIMEOUT
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=timeout)
+    con.execute(f'PRAGMA busy_timeout={int(timeout * 1000)}')
     have = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if 'decisions' not in have:
@@ -1261,6 +1277,175 @@ def _mark_stale_approvals(cur, where='1', params=()):
     return [(r[1], r[2]) for r in rows]
 
 
+# -- approvals recorded without the suggestion they approved ----------------
+# ui_review.db before schema rev 2, backups written before approved_suggestion
+# existed, and word-wide approvals of earlier versions carry no suggestion.
+# Bound to the finding's CURRENT suggestion they would approve whatever a
+# re-scan proposed since.
+
+def _accepted_in_decisions(dec, keys):
+    """{(word, unit): suggestion} of decisions.db's 'accept' rows on `keys`
+    that name a suggestion: every approval was mirrored there with the
+    correction it approved."""
+    out = {}
+    if dec is None:
+        return out
+    for word, unit in set(keys):
+        row = dec.execute("SELECT suggestion FROM decisions WHERE word = ? "
+                          "AND unit = ? AND verdict = 'accept'",
+                          (word, unit)).fetchone()
+        if row and row[0]:
+            out[(word, unit)] = row[0]
+    return out
+
+
+def _last_import(con):
+    row = con.execute(
+        "SELECT value FROM meta WHERE key = 'last_import'").fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _approval_basis(con, f, row, last_import, accepted, shared):
+    """The suggestion an approval recorded without one was made against, or
+    None when that cannot be established:
+
+    * the user's own correction, when there is one;
+    * the finding's current suggestion, when the findings were not
+      (re)imported since the approval was made (``last_import`` is older
+      than the approval's ``updated_at``, or there was no import at all);
+    * the suggestion of decisions.db's 'accept' row on the finding's
+      (word, unit), when this UI wrote that row and no other approval shares
+      the key (`shared`), so the row is this approval's own mirror.
+    """
+    if row.get('custom_suggestion'):
+        return row['custom_suggestion']
+    upd = row.get('updated_at')
+    if last_import is None or (upd and str(upd) >= last_import):
+        return f['suggestion'] or ''
+    key = (f['word'] or '', f['unit'] or '')
+    if key in accepted and key not in shared and _owns_decision(con, *key):
+        return accepted[key]
+    return None
+
+
+def _shared_keys(pairs):
+    """The (word, unit) keys more than one of `pairs` stands on."""
+    seen, shared = set(), set()
+    for word, unit in pairs:
+        key = (word or '', unit or '')
+        (shared if key in seen else seen).add(key)
+    return shared
+
+
+def _recheck_note(msg, sugg, note):
+    """A demoted approval's note: why it must be checked again, then the
+    note it had."""
+    text = hebrew.MESSAGES[msg].format(sugg=sugg or '—')
+    return text + (' · ' + note if note else '')
+
+
+def _bind_old_approvals(con, outdir):
+    """Schema rev 2: bind the approvals of an older ui_review.db, which
+    recorded no suggestion, to the one each was made against
+    (:func:`_approval_basis`). An approval that cannot be bound is demoted
+    to 'unsure' with a note, as migrate_legacy_decisions demotes an accept it
+    cannot trust, and its decisions.db mirror is withdrawn (rows this UI
+    owns only). A 'fixed' row is never demoted (the book was corrected);
+    it is bound where possible.
+
+    Returns (dec, gone): the decisions.db connection holding the withdrawal
+    (None when nothing was withdrawn), for the caller to commit first.
+    """
+    rows = con.execute('''
+        SELECT f.id, f.word, f.unit, f.suggestion, r.status, r.note,
+               r.custom_suggestion, r.updated_at
+        FROM review r JOIN findings f ON f.id = r.finding_id
+        LEFT JOIN review_ext x ON x.finding_id = r.finding_id
+        WHERE r.status IN ('approved', 'fixed')
+          AND x.approved_suggestion IS NULL''').fetchall()
+    shared = _shared_keys((r['word'], r['unit']) for r in rows)
+    last = _last_import(con)
+    dec = None
+    if outdir and any(_approval_basis(con, r, dict(r), last, {}, shared)
+                      is None for r in rows) and \
+            os.path.exists(os.path.join(outdir, DECISIONS_F)):
+        # a short wait: this runs inside connect(); a lock makes the next
+        # connection retry the whole migration
+        dec = _decisions_con(outdir, timeout=MIGRATE_DECISIONS_TIMEOUT)
+        try:
+            dec.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError:
+            dec.close()
+            raise
+    accepted = _accepted_in_decisions(
+        dec, [(r['word'] or '', r['unit'] or '') for r in rows])
+    demoted = []
+    for r in rows:
+        basis = _approval_basis(con, r, dict(r), last, accepted, shared)
+        if basis is not None:
+            con.execute('UPDATE review_ext SET approved_suggestion = ? '
+                        'WHERE finding_id = ?', (basis, r['id']))
+        elif r['status'] == 'approved':
+            con.execute("UPDATE review SET status = 'unsure', note = ? "
+                        'WHERE finding_id = ?',
+                        (_recheck_note('unbound_approval_recheck',
+                                       r['suggestion'], r['note']), r['id']))
+            demoted.append((r['word'], r['unit']))
+    gone = []
+    if dec is not None:
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, demoted))
+    return dec, gone
+
+
+def _bind_word_approvals(con, dec):
+    """Word-wide approvals (word_rules 'approved', from earlier versions of
+    this UI and from the old tool's global accepts) approve whatever any
+    finding of the word proposes, now or after a re-scan. Where decisions.db's
+    global row (unit '*') names the suggestion that was approved, the
+    approval becomes an approved replacement rule on that (word, suggestion)
+    pair (unless that pair already has a rule of its own, which outranked
+    the word rule anyway).
+
+    Without such a suggestion the rule is left as it is: there is nothing it
+    can be bound to, and dropping or demoting it would throw away a decision
+    the user made on purpose. set_status no longer creates one, the rule
+    stays visible in the finding's history and can be revoked there, and it
+    never reaches the detector (only a global not_error does). Returns how
+    many were bound."""
+    words = [r[0] for r in con.execute(
+        "SELECT word FROM word_rules WHERE status = 'approved'")]
+    accepted = _accepted_in_decisions(dec, [(w, '*') for w in words])
+    bound = 0
+    for word in words:
+        sugg = accepted.get((word, '*'))
+        if not sugg:
+            continue
+        rule = _get_rule(con, 'word', {'word': word})
+        key = {'word': word, 'suggestion': sugg}
+        if _get_rule(con, 'replacement', key) is None:
+            _put_rule(con, 'replacement', key,
+                      {'status': 'approved', 'decided_by': rule['decided_by'],
+                       'updated_at': rule['updated_at']})
+        _put_rule(con, 'word', {'word': word}, None)
+        bound += 1
+    return bound
+
+
+def _restored_approval_dropped(con, fid, rv):
+    """A backed-up approval that a refresh has since dropped as resting on
+    the old Tanach heuristic (``legacy_recheck``) must not come back with
+    the backup: the refresh logged the drop after the approval was made, or
+    the finding is a legacy row now and the backup does not show it was
+    already marked so when it was approved."""
+    if con.execute("SELECT 1 FROM history WHERE action = 'legacy_recheck' "
+                   'AND finding_id = ? AND ts >= ? LIMIT 1',
+                   (fid, rv.get('updated_at') or '')).fetchone():
+        return True
+    lg = con.execute(f'SELECT {_legacy_lg()} FROM findings WHERE id = ?',
+                     (fid,)).fetchone()[0]
+    return lg != 0 and not rv.get('legacy_marked')
+
+
 def _mark_stale_ids(con, ids):
     if not ids:
         return []
@@ -1327,9 +1512,16 @@ def migrate_legacy_decisions(con, outdir):
         _own_decision(con, word, unit)
         if unit == '*':
             # the old tool writes '*' only for "reject everywhere"; this UI
-            # mirrors every word-wide status there, an approval included
-            con.execute('INSERT OR REPLACE INTO word_rules(word, status, '
-                        'updated_at) VALUES(?,?,?)', (word, status, ts))
+            # mirrored every word-wide status there, an approval included.
+            # An approval naming its suggestion is bound to that pair, as a
+            # replacement rule (see _bind_word_approvals)
+            if status == 'approved' and sugg:
+                _put_rule(con, 'replacement',
+                          {'word': word, 'suggestion': sugg},
+                          {'status': status, 'updated_at': ts})
+            else:
+                con.execute('INSERT OR REPLACE INTO word_rules(word, status, '
+                            'updated_at) VALUES(?,?,?)', (word, status, ts))
             out['word_rules'] += 1
             continue
         fids = con.execute(
@@ -2655,7 +2847,8 @@ def write_backup(con, outdir):
         SELECT v.finding_id, v.status, v.note, v.custom_suggestion,
                v.updated_at, f.family, f.word, f.unit, f.errtype, f.ref,
                x.scope, x.approved_suggestion, x.decided_by, x.flag,
-               x.prev_decision
+               x.prev_decision,
+               COALESCE(f.extra, '') LIKE '%tanach_legacy%' AS legacy_marked
         FROM review v JOIN findings f ON f.id = v.finding_id
         LEFT JOIN review_ext x ON x.finding_id = v.finding_id''')]
     word_rules = [dict(r) for r in con.execute(
@@ -2739,7 +2932,16 @@ def list_backups(outdir):
 def restore_backup(con, outdir, filename):
     """Re-import a backup written by write_backup. Review rows are matched
     best-effort by finding identity (family, word, unit, errtype, ref);
-    restored statuses are re-synced into decisions.db."""
+    restored statuses are re-synced into decisions.db.
+
+    An approval comes back bound to the suggestion it was approved against.
+    A backup written before that was recorded binds it by
+    :func:`_approval_basis`; one that cannot be bound comes back 'unsure'
+    with a note (``unbound_recheck``). An approval a refresh dropped as
+    resting on the old Tanach heuristic comes back 'unsure' with the note
+    migrate_legacy_decisions gives such an accept (``legacy_recheck``).
+    Word-wide approvals are bound as in the schema upgrade
+    (:func:`_bind_word_approvals`)."""
     base = os.path.basename(filename)
     if not re.fullmatch(r'ui_backup_[\w.-]+\.json', base):
         raise ValueError(hebrew.MESSAGES['bad_request'])
@@ -2756,9 +2958,22 @@ def restore_backup(con, outdir, filename):
     except BaseException:
         con.rollback()
         raise
-    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0}
+    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0,
+           'unbound_recheck': 0, 'legacy_recheck': 0}
     warnings, restored = [], []
     try:
+        approvals = [rv for rv in data.get('review', [])
+                     if rv.get('status') in ('approved', 'fixed')]
+        shared = _shared_keys((rv.get('word'), rv.get('unit'))
+                              for rv in approvals)
+        # read before this restore rewrites the rows it reads
+        accepted = _accepted_in_decisions(
+            dec, [(rv.get('word') or '', rv.get('unit') or '')
+                  for rv in approvals if not rv.get('approved_suggestion')])
+        word_accepted = _accepted_in_decisions(
+            dec, [(wr.get('word'), '*') for wr in data.get('word_rules', [])
+                  if wr.get('status') == 'approved'])
+        last = _last_import(con)
         for rv in data.get('review', []):
             fids = con.execute('''
                 SELECT id FROM findings
@@ -2772,13 +2987,35 @@ def restore_backup(con, outdir, filename):
                 continue
             for (fid,) in fids:
                 row = {k: rv.get(k) for k in REVIEW_COLS + EXT_FIELDS}
+                f = con.execute('SELECT * FROM findings WHERE id = ?',
+                                (fid,)).fetchone()
+                demote = None
+                if row['status'] == 'approved' and \
+                        _restored_approval_dropped(con, fid, rv):
+                    demote = 'legacy_recheck'
+                    sugg = (row['custom_suggestion']
+                            or row['approved_suggestion'] or f['suggestion'])
+                elif row['status'] in ('approved', 'fixed') and \
+                        not row['approved_suggestion']:
+                    basis = _approval_basis(con, f, row, last, accepted,
+                                            shared)
+                    if basis is not None:
+                        row['approved_suggestion'] = basis
+                    elif row['status'] == 'approved':
+                        demote = 'unbound_recheck'
+                        sugg = f['suggestion']
+                if demote:
+                    note = _recheck_note(
+                        'legacy_accept_recheck' if demote == 'legacy_recheck'
+                        else 'unbound_approval_recheck', sugg, row['note'])
+                    row.update(status='unsure', note=note,
+                               approved_suggestion=None, flag=None)
+                    out[demote] += 1
                 row['updated_at'] = row['updated_at'] or _now()
                 row['scope'] = row['scope'] or 'occurrence'
                 _put_review(con, fid, row)
                 restored.append(fid)
-                f = con.execute('SELECT * FROM findings WHERE id = ?',
-                                (fid,)).fetchone()
-                w = _sync_decision(con, dec, f, rv['status'],
+                w = _sync_decision(con, dec, f, row['status'],
                                    row['approved_suggestion']
                                    or row['custom_suggestion'],
                                    decided_by=row['decided_by'],
@@ -2787,6 +3024,15 @@ def restore_backup(con, outdir, filename):
                     warnings.append(w)
                 out['review'] += 1
         for wr in data.get('word_rules', []):
+            sugg = (word_accepted.get((wr['word'], '*'))
+                    if wr.get('status') == 'approved' else None)
+            if sugg:
+                # bound to the pair it approved (see _bind_word_approvals)
+                key = {'word': wr['word'], 'suggestion': sugg}
+                if _get_rule(con, 'replacement', key) is None:
+                    _put_rule(con, 'replacement', key, wr)
+                out['word_rules'] += 1
+                continue
             _put_rule(con, 'word', {'word': wr['word']}, wr)
             fake = {'word': wr['word'], 'unit': '*', 'errtype': '',
                     'suggestion': '', 'source': '', 'ref': ''}
