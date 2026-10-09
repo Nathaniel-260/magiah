@@ -1743,15 +1743,16 @@ def locate(spec, cfg, out_dir):
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
     prof_path = os.path.join(out_dir, OCR_PROFILES_F)
-    psource = calibration_source(out_dir)
-    if os.path.exists(prof_path):
-        if psource:
-            loads['ocr_profiles'] = prof_path
-            print(f'[locate] OCR profiles in use (source: {psource})',
-                  flush=True)
-        else:
-            print(f'[locate] {OCR_PROFILES_F} has no provenance - ignored',
-                  flush=True)
+    # the same rule as the book scan (load_ocr_profiles): only a file whose
+    # hash calibration_meta.json vouches for
+    psource = _vouched(out_dir, OCR_PROFILES_F)
+    if psource:
+        loads['ocr_profiles'] = prof_path
+        print(f'[locate] OCR profiles in use (source: {psource})',
+              flush=True)
+    elif os.path.exists(prof_path):
+        print(f'[locate] {OCR_PROFILES_F} has no provenance or does not '
+              f'match it - ignored', flush=True)
     with _pool(spec, cfg, loads) as pool:
         for i, (occ, joins, ocr, st) in enumerate(
                 pool.imap_unordered(_locate_chunk, chunks), 1):

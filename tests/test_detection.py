@@ -795,5 +795,46 @@ class FrequentPairSplit(unittest.TestCase):
         self.assertEqual(self._found(res['findings']), want)
 
 
+
+class TamperedOcrProfiles(unittest.TestCase):
+    """An ocr_profiles.pkl that no longer matches calibration_meta.json is
+    ignored by the full scan exactly as by the book scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='magiah_tamper_')
+        self.lib = os.path.join(self.tmp, 'lib')
+        self.out = os.path.join(self.tmp, 'out')
+        os.makedirs(self.out)
+        write_lib(self.lib, {BOOK_A: A_LINES, BOOK_D: D_LINES,
+                             f'{LIB_TOP}/b.txt': B_LINES})
+        self.spec = {'type': 'library', 'path': self.lib}
+        self.cfg = small_cfg()
+        write_profiles(self.out, {BOOK_D: {'כב': 8}})
+        # replaced after calibration vouched for it: the meta still says
+        # human_review, but its hash no longer matches
+        with open(os.path.join(self.out, core.OCR_PROFILES_F), 'wb') as f:
+            pickle.dump(PROFILES, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_full_and_book_scan_both_ignore_it(self):
+        self.assertEqual(core.load_ocr_profiles(self.out), ({}, None))
+        run_full(self.spec, self.cfg, self.out)
+        with open(os.path.join(self.out, 'coverage_locate.json'),
+                  encoding='utf-8') as f:
+            self.assertEqual(json.load(f)['ocr_profiles'], 'none')
+        full = report_rows(self.out, BOOK_A)
+        self.assertTrue(full)
+        self.assertFalse([r for r in report_rows(self.out)
+                          if r['errtype'] == 'ocr_profile'])
+        res = book_scan.scan_book(self.out, 'library', BOOK_A, cfg=self.cfg,
+                                  library_dir=self.lib, spec=self.spec,
+                                  verify_ctx=True)
+        self.assertEqual(res['calibration']['ocr_profiles'], 'none')
+        norm = FullVsBookParity()._norm
+        self.assertEqual(norm(full), norm(res['findings']))
+
+
 if __name__ == '__main__':
     unittest.main()
