@@ -1098,6 +1098,14 @@ def evidence_kind(errtype, sugg, sugg_freq, ctx_hits, sugg_local, tanach,
     return 'none'
 
 
+def occurrence_evidence(fr, ctx_hits, sugg_local, tanach):
+    """Evidence kind of one located occurrence of the flagged entry `fr`
+    (corpus scope). A verse reading that differs from the suggestion
+    (tanach_sugg) is an alternative beside the finding, not its suggestion:
+    a suspicion with nothing to propose stays a suspicion."""
+    return evidence_kind(fr[1], fr[2], fr[3], ctx_hits, sugg_local, tanach)
+
+
 def book_repeat_flag(errtype, n_located, only_this_book):
     """All of a word's (2+) occurrences sit in one book: the author's own
     spelling rather than a typo. Corpus scope: located occurrences span one
@@ -1891,7 +1899,7 @@ def locate(spec, cfg, out_dir):
                         + ctx_counts.get((sugg, nxt), 0))
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
-            ev = evidence_kind(fr[1], tsugg or fr[2], fr[3], hits, local, tan)
+            ev = occurrence_evidence(fr, hits, local, tan)
             rows.append((w, uid, doc, hits, local,
                          1 if w in repeat_words else 0, tan, tsugg, snip,
                          ev, None, None))

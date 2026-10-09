@@ -467,6 +467,16 @@ class StructuralEvidenceKinds(PipelineFixture):
         self.assertEqual(ek('edit1_sub', 'ספר', 9, 0, 0, 3), 'tanach')
         self.assertEqual(ek('edit1_sub', 'ספר', 9, 0, 0, 4), 'none')
 
+    def test_verse_reading_does_not_fill_an_empty_suggestion(self):
+        suspicion = (1, 'final_midword', '', 0, 3.0)
+        self.assertEqual(core.occurrence_evidence(suspicion, 0, 0, 4),
+                         'suspicion')
+        self.assertEqual(core.occurrence_evidence(suspicion, 0, 0, 3),
+                         'tanach')
+        structural = (1, 'final_midword', 'כנס', 9, 5.0)
+        self.assertEqual(core.occurrence_evidence(structural, 0, 0, 4),
+                         'structural')
+
 
 def _lex(freq, **kw):
     return core.Lexicon(freq, small_cfg(**kw), {})
