@@ -14,7 +14,7 @@ import os
 import sqlite3
 
 from . import tanach
-from .textsource import OtzariaDB, ReadStats, iter_file_lines
+from .textsource import OtzariaDB, ReadStats, TextSourceError, iter_file_lines
 
 LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
 
@@ -64,6 +64,18 @@ def default_otzaria_db():
 
 
 OTZARIA_DB = default_otzaria_db()
+
+
+def check_source(spec):
+    """Raise TextSourceError (Hebrew) when the folder `spec` reads is missing
+    or cannot be listed — cheap checks only, run before anything is written
+    (a missing database is reported when it is opened)."""
+    if spec.get('type') in ('library', 'hybrid'):
+        from .corpus_hybrid import LibraryCorpus
+        LibraryCorpus({'type': 'library', 'path': spec.get('path')}
+                      ).check_root()
+    elif spec.get('type') == 'textdir':
+        TextDirCorpus(spec).check_root()
 
 
 def make_corpus(spec):
@@ -225,10 +237,29 @@ class TextDirCorpus:
         return sorted(glob.glob(os.path.join(self.path, self.pattern),
                                 recursive=True))
 
+    def check_root(self):
+        """Raise TextSourceError (Hebrew) unless the folder can be listed."""
+        if not os.path.isdir(self.path):
+            raise TextSourceError(
+                f'תיקיית הטקסטים לא נמצאה: {self.path}\n'
+                'יש לבדוק את הנתיב (‎--textdir‎) ולהריץ שוב. התוצרים הקודמים '
+                'לא שונו.')
+        try:
+            os.listdir(self.path)
+        except OSError as e:
+            raise TextSourceError(
+                f'לא ניתן לקרוא את תיקיית הטקסטים: {self.path} ({e})\n'
+                'התוצרים הקודמים לא שונו.') from e
+
     def chunks(self, n):
+        self.check_root()
         files = self._files()
         if not files:
-            return []
+            # a wrong folder, not an empty corpus: scanning it would empty
+            # the results
+            raise TextSourceError(
+                f'לא נמצאו קובצי טקסט ({self.pattern}) בתיקייה: {self.path}'
+                '\nהתוצרים הקודמים לא שונו.')
         n = min(n, len(files))
         return [files[i::n] for i in range(n)]
 

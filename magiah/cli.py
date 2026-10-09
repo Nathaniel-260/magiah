@@ -7,7 +7,7 @@ import sys
 
 from . import core, runstate
 from .config import Config
-from .corpus import OTZARIA_DB
+from .corpus import OTZARIA_DB, check_source
 from .corpus_hybrid import DEFAULT_LIBRARY
 from .textsource import TextSourceError
 
@@ -235,6 +235,14 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
+    if args.command in ('lexicon', 'detect', 'locate', 'all'):
+        # a folder that is not there is refused before run_config.json is
+        # rewritten with it, and before any stage starts
+        try:
+            check_source(spec)
+        except TextSourceError as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
     _save_run_config(out_dir, spec, cfg, prev)
 
     if args.command == 'review':

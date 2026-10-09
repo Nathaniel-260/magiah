@@ -393,6 +393,23 @@ def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None,
     raise PartialRead('\n'.join(lines))
 
 
+def _require_text(stage, stats):
+    """A pass that read no text at all writes no output.
+
+    An empty input is a wrong source (a library folder without books, an
+    empty table), not a corpus without typos: its empty output would replace
+    the last good one, and a refresh of the review would then drop every
+    finding. Called after :func:`_fail_if_partial`, before anything is
+    written."""
+    if stats.lines:
+        return
+    raise StageError(
+        f'שלב "{_STAGE_HE.get(stage, stage)}" לא קרא אף שורת טקסט מהקלט, '
+        'ולכן לא נכתבה תוצאה והתוצרים הקודמים נשארו כמות שהם.\n'
+        'יש לבדוק את מקור הנתונים (מסד הנתונים, תיקיית הספרייה או תיקיית '
+        'הטקסטים) ולהריץ שוב.')
+
+
 def ref_text(r):
     """One unread row, for a person: book, reference and its id or path."""
     where = ', '.join(x for x in (r.get('book'), r.get('ref')) if x)
@@ -614,6 +631,7 @@ def build_lexicon(spec, cfg, out_dir):
     policy = _policy(spec, cfg, out_dir)
     # coverage first: a partial lexicon must not replace the last good one
     _fail_if_partial('lexicon', stats, out_dir, extra, policy=policy)
+    _require_text('lexicon', stats)
     _replace_atomically(os.path.join(out_dir, LEXICON_F),
                         _dump_pickle(dict(lex)))
     _write_coverage(out_dir, _coverage_info('lexicon', stats, extra,
@@ -1431,13 +1449,13 @@ def detect(spec, cfg, out_dir):
     print(f'[detect] split candidates to verify: {len(cand_list):,} '
           f'({len(split_cands):,} words)  ({time.time()-t0:.0f}s)',
           flush=True)
+    # the input is checked (chunks) before the first file is written
+    chunks = make_corpus(spec).chunks(cfg.n_chunks)
     splits_path = os.path.join(out_dir, SPLITS_F)
     with open(splits_path, 'wb') as f:
         pickle.dump(cand_list, f, protocol=4)
-    corpus = make_corpus(spec)
     counts = Counter()
     vstats = ReadStats()
-    chunks = corpus.chunks(cfg.n_chunks)
     with _pool(spec, cfg, {'split_cands': splits_path}) as pool:
         for i, (c, st) in enumerate(
                 pool.imap_unordered(_split_verify_chunk, chunks), 1):
@@ -1461,6 +1479,7 @@ def detect(spec, cfg, out_dir):
     print(f'[verify] confirmed {n_ok:,}/{len(split_cands):,} split words',
           flush=True)
     _fail_if_partial('detect', vstats, out_dir, policy=policy)
+    _require_text('detect', vstats)
     _replace_atomically(os.path.join(out_dir, SPLIT_ALTS_F),
                         _dump_pickle(alts_out))
 
@@ -1792,6 +1811,7 @@ def locate(spec, cfg, out_dir):
     # spend more time on it
     passes = {}                         # name -> ReadStats of each later pass
     _fail_if_partial('locate', lstats, out_dir, policy=policy)
+    _require_text('locate', lstats)
 
     # --- Tanach reference check (Otzaria only) ----------------------------
     # Verified verse matches go to a separate review file (the reference

@@ -23,7 +23,8 @@ import sqlite3
 
 from . import tanach
 from .corpus import OTZARIA_DB
-from .textsource import OtzariaDB, ReadStats, connect_ro, iter_file_lines
+from .textsource import (OtzariaDB, ReadStats, TextSourceError, connect_ro,
+                         iter_file_lines)
 
 DEFAULT_LIBRARY = r'C:\OTZ\otzaria-library'
 SEFARIA_SOURCE = 'Sefaria'
@@ -147,11 +148,35 @@ class LibraryCorpus:
         top = rel.split('/', 1)[0]
         return top or FALLBACK_ORIGIN
 
+    def check_root(self):
+        """Raise TextSourceError (Hebrew) unless the library folder exists
+        and can be listed. :meth:`_files` reads a missing folder as an empty
+        library, and a scan of nothing would replace every result."""
+        root = self.path
+        if not os.path.isdir(root):
+            raise TextSourceError(
+                f'תיקיית הספרייה לא נמצאה: {root}\n'
+                'יש לבדוק את הנתיב (‎--library‎, או בממשק: תיקיית הספרייה) '
+                'ולהריץ שוב. התוצרים הקודמים לא שונו.')
+        try:
+            os.listdir(root)
+        except OSError as e:
+            raise TextSourceError(
+                f'לא ניתן לקרוא את תיקיית הספרייה: {root} ({e})\n'
+                'התוצרים הקודמים לא שונו.') from e
+
     # -- corpus interface --------------------------------------------------
     def chunks(self, n):
+        """Chunks of the book files. A library with no book file at all is
+        refused (TextSourceError): it is a wrong folder, not an empty
+        corpus — scanning it would empty the results."""
+        self.check_root()
         files = self._files()
         if not files:
-            return []
+            raise TextSourceError(
+                f'לא נמצאו קובצי ספרים (.txt) לסריקה בתיקיית הספרייה: '
+                f'{self.path}\nייתכן שזו תיקייה שגויה. התוצרים הקודמים לא '
+                'שונו.')
         n = min(n, len(files))
         return [files[i::n] for i in range(n)]
 

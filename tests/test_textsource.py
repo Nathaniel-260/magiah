@@ -77,6 +77,17 @@ def _base_schema(con):
     ''')
 
 
+def make_library_dir(path):
+    """A library repo with one book: an empty one is refused as a source
+    (corpus_hybrid.LibraryCorpus.chunks), so a hybrid corpus needs one even
+    where only its database part is under test."""
+    os.makedirs(os.path.join(path, 'DictaToOtzaria'), exist_ok=True)
+    with open(os.path.join(path, 'DictaToOtzaria', 'ספר.txt'), 'w',
+              encoding='utf-8') as f:
+        f.write('שורה מקובץ\n')
+    return path
+
+
 def make_inline_db(path):
     """The pre-schema-6 layout: text in line.content."""
     con = sqlite3.connect(path)
@@ -221,12 +232,12 @@ class Schema6Test(unittest.TestCase):
 
     def test_hybrid_db_part_reads_only_sefaria_books(self):
         p = self._db()
-        lib = os.path.join(self.dir, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.dir, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': p})
         units = []
         for ch in corpus.chunks(1):
-            units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
+            if ch[0] == 'db':
+                units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
         corpus.close()
         self.assertEqual(sorted(units), ['1', '2'])     # book 1 = Sefaria
 
@@ -644,8 +655,7 @@ class ReadStatsCountedTest(unittest.TestCase):
     def test_hybrid_counts_skipped_version_lines(self):
         db = os.path.join(self.tmp.name, 'clean.db')
         make_schema6_db(db)
-        lib = os.path.join(self.tmp.name, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': db})
         for ch in corpus.chunks(2):
             list(corpus.iter_texts_docs(ch))
@@ -757,8 +767,7 @@ class BookFilteredReadTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _hybrid(self):
-        lib = os.path.join(self.tmp.name, 'lib')
-        os.makedirs(lib, exist_ok=True)
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
         return HybridCorpus({'type': 'hybrid', 'path': lib, 'db': self.db})
 
     def test_version_counts_match_the_in_subquery_form(self):
