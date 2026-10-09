@@ -6,7 +6,9 @@ import json
 import os
 import pickle
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -18,10 +20,42 @@ from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
 from magiah.webui import db as webui_db
 
+
+
+class _ZstandardFixtures:
+    """The slice of ``compression.zstd`` the fixtures use, on the
+    ``zstandard`` package — the decoder Python < 3.14 reads seforim.db with
+    (pyproject: ``zstandard; python_version < '3.14'``). Without it the
+    zstd fixtures could not be written there, and the reader's only backend
+    on those interpreters would go untested."""
+
+    def __init__(self, zs):
+        self._zs = zs
+
+    def train_dict(self, samples, size):
+        return self.ZstdDict(self._zs.train_dictionary(size, samples)
+                             .as_bytes())
+
+    def ZstdDict(self, content):
+        d = types.SimpleNamespace(dict_content=bytes(content))
+        d.compression_dict = self._zs.ZstdCompressionDict(d.dict_content)
+        return d
+
+    def compress(self, data, zstd_dict):
+        return self._zs.ZstdCompressor(
+            dict_data=zstd_dict.compression_dict).compress(data)
+
+
 try:
     from compression import zstd as _zstd
 except ImportError:                                  # Python < 3.14
-    _zstd = None
+    try:
+        import zstandard
+    except ImportError:          # neither backend: the reader cannot decode
+        _zstd = None             # either, so the zstd tests are skipped
+    else:
+        _zstd = _ZstandardFixtures(zstandard)
+NO_ZSTD = 'needs a zstd backend (compression.zstd, or zstandard before 3.14)'
 
 LINES = [
     (1, 1, 'בראשית ברא אלהים את השמים ואת הארץ'),
@@ -124,7 +158,7 @@ class InlineLayoutTest(unittest.TestCase):
             self.assertFalse(os.path.exists(p))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class Schema6Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -147,6 +181,14 @@ class Schema6Test(unittest.TestCase):
             got = {lid: t for lid, _, t in odb.iter_range(1, 5, st)}
         self.assertEqual(got, {i: t for i, _, t in LINES})
         self.assertEqual(st.decode_errors, 0)
+
+    def test_the_backend_this_interpreter_ships_with_is_tested(self):
+        # before 3.14 the decoder is `zstandard`: the fixtures are written
+        # with it there instead of skipping every zstd test
+        with OtzariaDB(self._db()) as odb:
+            self.assertEqual(odb.backend,
+                             'compression.zstd' if sys.version_info >= (3, 14)
+                             else 'zstandard')
 
     def test_text_row_in_compressed_db_passes_through(self):
         p = self._db(plain_id=3)
@@ -306,7 +348,7 @@ def _coverage(out, stage):
         return json.load(f)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class PartialOutputTest(unittest.TestCase):
     """A stage that could not read its whole input must not replace its last
     good output, and nothing downstream may consume output whose latest
@@ -431,7 +473,7 @@ class PartialOutputTest(unittest.TestCase):
         self.assertIn('מיקום', err.getvalue())
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class MissingContentRowTest(unittest.TestCase):
     """A `line` row without its `line_content` row is unread, not absent."""
 
@@ -466,7 +508,7 @@ class MissingContentRowTest(unittest.TestCase):
             book_source.load_book('db', '2', db_path=self.db)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class OpenFailureTest(unittest.TestCase):
     """A database that fails to open is released and reported in Hebrew."""
 
@@ -533,7 +575,7 @@ class OpenFailureTest(unittest.TestCase):
         self.assertFalse(os.path.exists(missing))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class ReadStatsCountedTest(unittest.TestCase):
     """Every pass that reads the corpus counts what it could not read."""
 
@@ -698,7 +740,7 @@ def _plan(con, sql, args):
                       con.execute('EXPLAIN QUERY PLAN ' + sql, args))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class BookFilteredReadTest(unittest.TestCase):
     """Reads restricted to some books: the same rows, with a chunk's id range
     — not the list of the selected books' lines — driving the scan."""

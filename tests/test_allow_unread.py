@@ -24,8 +24,8 @@ from magiah.textsource import OtzariaDB, ReadStats
 from magiah.webui import db as uidb, hebrew, scanner, server
 
 from test_tanach import BIBLE, make_bible_db
-from test_textsource import (_corrupt_row, _coverage, _otzaria_spec, _zstd,
-                             make_schema6_db)
+from test_textsource import (NO_ZSTD, _corrupt_row, _coverage, _otzaria_spec,
+                             _zstd, make_schema6_db)
 
 # the keys a complete lexicon record had before --allow-unread existed
 COMPLETE_LEXICON_KEYS = {'stage', 'complete', 'unread', *ReadStats.FIELDS,
@@ -49,7 +49,7 @@ def _report_coverage(out):
         con.close()
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class _Case(unittest.TestCase):
     """A schema-6 database with two unreadable rows: line 2 (book 1) is a
     broken zstd frame and line 4 (book 2) has no line_content row."""

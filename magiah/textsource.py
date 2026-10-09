@@ -61,7 +61,12 @@ def _make_decoder(dict_bytes):
             'מסד הנתונים דחוס ב-zstd, ואין בסביבה מפענח zstd.\n'
             'יש להתקין את החבילה zstandard (pip install zstandard) '
             'או להשתמש ב-Python 3.14 ומעלה.')
-    dctx = _zs.ZstdDecompressor(dict_data=_zs.ZstdCompressionDict(dict_bytes))
+    # a full dictionary (magic number + entropy tables), as compression.zstd
+    # requires: under the default DICT_TYPE_AUTO, bytes that are no
+    # dictionary at all were taken as raw content, the database opened, and
+    # every row then failed to decode one by one instead of the open failing
+    dctx = _zs.ZstdDecompressor(dict_data=_zs.ZstdCompressionDict(
+        dict_bytes, dict_type=_zs.DICT_TYPE_FULLDICT))
 
     def decode(data):
         # frames carry their content size; max_output_size guards the rare
