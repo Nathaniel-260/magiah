@@ -592,15 +592,35 @@ class TestDriftedLines(TempCase):
 
     def test_genuine_drift_still_relocates_in_a_formulaic_book(self):
         """The strict identity test must not make drift useless: a real
-        insertion in a formulaic book still relocates correctly."""
+        insertion in a formulaic book still relocates correctly — on the
+        scan's own snippet window, which pins the sentence."""
         lines = self._formulaic(n10=self.VERSE_A)
         lines.insert(0, 'שורה שנוספה')
         d = self.doc('\n'.join(lines) + '\n')
         plan = patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
                                      'correction': 'נגעים',
-                                     'snippet': self.VERSE_A})
+                                     'snippet': scan_snippet(self.VERSE_A,
+                                                             'נגעימ')})
         self.assertEqual(plan.lineno, 11)
         self.assertTrue(plan.drifted)
+        self.assertEqual(plan.confidence, 'moved')
+
+    def test_shared_words_alone_never_relocate(self):
+        """A snippet that is not the scan's window (here the whole verse)
+        only shows that most words are shared, which a parallel verse does
+        too: the moved line is offered for a click, never written."""
+        lines = self._formulaic(n10=self.VERSE_A)
+        lines.insert(0, 'שורה שנוספה')
+        d = self.doc('\n'.join(lines) + '\n')
+        f = {'id': 1, 'lineno': 10, 'word': 'נגעימ', 'correction': 'נגעים',
+             'snippet': self.VERSE_A}
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'moved_unproven')
+        self.assertEqual(cm.exception.extra['candidate_lines'], [11])
+        a, b = normalize.phrase_spans(d.lines[11], 'נגעימ')[0][1:]
+        plan = patcher.plan_edit(d, f, explicit=(a, b))
+        self.assertEqual((plan.lineno, plan.confidence), (11, 'manual'))
 
     def test_an_unchanged_book_is_fixed_in_place(self):
         lines = self._formulaic(n10=self.VERSE_A)

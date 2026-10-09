@@ -72,6 +72,7 @@ CONFLICT_CODES = frozenset((
     'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
     'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
     'backup_corrupt', 'journal_conflict', 'journal_pending',
+    'moved_unproven',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -625,16 +626,22 @@ def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
     cands = (_candidates(doc, lineno, word, snippet, skip=lineno)
              if snippet else {LEVEL_WINDOW: [], LEVEL_TOKENS: []})
     strong = cands[LEVEL_WINDOW]
-    # a legacy (token-overlap) match is only trusted when the word occurs
-    # once there; a window match pins the occurrence by itself
-    weak = [c for c in cands[LEVEL_TOKENS] if len(c[1]) == 1]
-    pool = strong or weak
-    if len(pool) == 1:
-        n, occs, ident = pool[0]
-        return (n, occs, ident,
-                LEVEL_WINDOW if strong else LEVEL_TOKENS, True)
-    if len(pool) > 1:
-        raise _ambiguous_line(word, lineno, [c[0] for c in pool], fid)
+    if len(strong) == 1:
+        # the scan's exact window around the word, on another line: the
+        # same sentence, moved
+        n, occs, ident = strong[0]
+        return n, occs, ident, LEVEL_WINDOW, True
+    if len(strong) > 1:
+        raise _ambiguous_line(word, lineno, [c[0] for c in strong], fid)
+    weak = cands[LEVEL_TOKENS]
+    if weak:
+        # Only most of the words are shared. When the scanned verse was
+        # deleted or moved out of reach, that is exactly what its parallel
+        # verse looks like, so nothing is relocated on it: a human may
+        # point at the word there, if it really is the same place.
+        raise PatchError('moved_unproven', _msg(
+            'moved_unproven', word=word, n=lineno + 1), id=fid,
+            candidate_lines=sorted(c[0] for c in weak))
     if lineno >= len(doc.lines):
         raise PatchError('line_gone', _msg('line_gone', n=lineno + 1),
                          id=fid)

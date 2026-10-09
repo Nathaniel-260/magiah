@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magiah import normalize                                    # noqa: E402
 from magiah.webui import patcher                                # noqa: E402
-from test_anchor_write import TempCase, finding                 # noqa: E402
+from test_anchor_write import TempCase, finding, scan_snippet   # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,50 @@ class TestPerLineWorkIsShared(TempCase):
         with self.assertRaises(patcher.PatchError) as cm:
             patcher.plan_edit(d, f)
         self.assertEqual(cm.exception.code, 'token_not_found')
+
+
+# ---------------------------------------------------------------------------
+# identity of the line and of the copy
+# ---------------------------------------------------------------------------
+
+class TestNoRelocationOntoAParallelVerse(TempCase):
+    """The scanned verse S is deleted, or moved beyond the drift window;
+    its parallel verse P (most words shared, the same typo once) is close
+    by. The fix used to be written on P, marked only 'moved'."""
+
+    P = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בבקר'
+    S = 'ולכן צריך לעמוד כעבד לפני רבו קדבן היא בערב'
+
+    def plan(self, lines):
+        d = self.doc('\n'.join(lines) + '\n')
+        return d, {'id': 2, 'lineno': 2, 'word': 'קדבן', 'correction': 'קרבן',
+                   'snippet': scan_snippet(self.S, 'קדבן'), 'occurrence': 0,
+                   'expected_count': 1}
+
+    def test_deleted_or_moved_far_is_refused_with_a_pick(self):
+        for label, lines in (
+                ('deleted', ['פתיחה', self.P, 'ויהי ערב ויהי בקר יום אחד']),
+                ('moved 70 lines down', ['פתיחה', self.P, 'ויהי ערב'] +
+                 ['מילוי %d' % i for i in range(70)] + [self.S])):
+            with self.subTest(label):
+                d, f = self.plan(lines)
+                with self.assertRaises(patcher.PatchError) as cm:
+                    patcher.plan_edit(d, f)
+                self.assertEqual(cm.exception.code, 'moved_unproven')
+                self.assertIn(cm.exception.code, patcher.CONFLICT_CODES)
+                self.assertEqual(patcher.manual_lines(d, f), [1])
+                rows = patcher.anchor_rows(d, [dict(f, unit='x')])
+                self.assertFalse(rows[0]['anchor']['ok'])
+                self.assertEqual(rows[0]['anchor']['manual_lines'], [1])
+
+    def test_the_same_sentence_moved_is_still_followed(self):
+        # its window is exact there, so the parallel verse nearby does not
+        # get in the way
+        d, f = self.plan([self.P, 'פתיחה', 'שורה שנוספה', 'ויהי ערב',
+                          self.S])
+        plan = patcher.plan_edit(d, f)
+        self.assertEqual((plan.lineno, plan.confidence), (4, 'moved'))
+        self.assertTrue(plan.drifted)
 
 
 if __name__ == '__main__':
