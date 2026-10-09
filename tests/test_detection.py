@@ -14,7 +14,6 @@ import tracemalloc
 import unittest
 
 from magiah import book_scan, core
-from magiah.book_source import BookText
 from magiah.config import Config
 
 LIB_TOP = 'Src'
@@ -308,17 +307,29 @@ class LongLineGuard(unittest.TestCase):
             path = os.path.join(tmp, 'long.txt')
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(line + '\n')
-            tracemalloc.start()
-            t0 = time.time()
-            res = book_scan.scan_book(tmp, 'file', path, cfg=Config(),
-                                      library_dir=os.path.join(tmp, 'nolib'))
-            elapsed = time.time() - t0
-            _, peak = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+
+            def scan():
+                return book_scan.scan_book(
+                    tmp, 'file', path, cfg=Config(),
+                    library_dir=os.path.join(tmp, 'nolib'))
+
+            # time without tracemalloc, which slows the scan several-fold;
+            # ~10 s locally, while anything quadratic in the line would take
+            # hours, so the bound is loose enough for a slow CI runner
+            t0 = time.perf_counter()
+            res = scan()
+            elapsed = time.perf_counter() - t0
             hits = [r for r in res['findings'] if r['word'] == 'ספד']
             self.assertEqual(len(hits), 2)              # nothing truncated
             self.assertTrue(all(len(r['snippet']) <= 100 for r in hits))
-            self.assertLess(elapsed, 30)
+            self.assertLess(elapsed, 60)
+            # memory in a second, traced run
+            tracemalloc.start()
+            try:
+                scan()
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
             # tokens of the line are held transiently; per-token contexts
             # (~0.47M snippets) would push this far past the bound
             self.assertLess(peak, 150 * 1024 * 1024, peak)

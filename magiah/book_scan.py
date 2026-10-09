@@ -51,7 +51,6 @@ are scored with ``max(freq, 1)`` as denominator by the shared rules.
 """
 import os
 import pickle
-import sqlite3
 import tempfile
 import time
 from collections import Counter
