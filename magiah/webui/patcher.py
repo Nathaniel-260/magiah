@@ -307,8 +307,10 @@ def doc_from_bytes(path, data):
     if len(lines) > 1 and lines[-1] == '' and ends[-1] == '':
         lines.pop()
         ends.pop()
-    elif not raw:
+    elif not raw and not bom:
         lines, ends = [], []           # an empty file has no lines at all
+    # A file holding only a BOM keeps one empty line: the scanner decodes
+    # the BOM as a character of line 1, and the numbering must agree.
     doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp,
                   size=size)
     if doc.encode() != ((b'\xef\xbb\xbf' + data) if bom else data):
@@ -1048,8 +1050,16 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
         # the line moved since the scan; the corrector should be told, even
         # though the match itself was corroborated
         confidence = 'moved'
-    plan = EditPlan(fid, lineno, start, end, old_raw,
-                    render_replacement(mode, old_raw, correction), mode,
+    new_text = render_replacement(mode, old_raw, correction)
+    try:
+        new_text.encode(doc.encoding)
+    except UnicodeEncodeError:
+        # a cp1255 book cannot hold teamim (or any character outside its
+        # code page): refuse in Hebrew here, not with a codec error later
+        raise PatchError('unencodable', _msg(
+            'unencodable', word=word, n=lineno + 1, enc=doc.encoding),
+            id=fid)
+    plan = EditPlan(fid, lineno, start, end, old_raw, new_text, mode,
                     occurrence, total, confidence, '<' in old_raw)
     plan.drifted = drifted
     plan.needs_vocalization = needs_voc

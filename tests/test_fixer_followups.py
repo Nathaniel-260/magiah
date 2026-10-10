@@ -283,6 +283,39 @@ class TestBracketsWithACustomCorrection(TempCase):
         self.assertEqual(p.confidence, 'manual')
 
 
+class TestFileEdgeCases(TempCase):
+
+    def test_a_bom_only_file_is_numbered_like_the_scanner(self):
+        from magiah import textsource
+        for data in (b'\xef\xbb\xbf', b'\xef\xbb\xbf\n', b'', b'\n',
+                     b'\xef\xbb\xbf\xd7\x90'):
+            with self.subTest(data=data):
+                p = os.path.join(self.tmp, 'b.txt')
+                with open(p, 'wb') as f:
+                    f.write(data)
+                d = patcher.read_doc(p)
+                scanned = textsource.split_lines(data.decode('utf-8'))
+                self.assertEqual(len(d.lines), len(scanned))
+                self.assertEqual(d.encode(), data)
+
+    def test_teamim_in_a_cp1255_book_are_refused_in_hebrew(self):
+        line = 'אמר רבי יותבת בן זומא'
+        p = os.path.join(self.tmp, 'b.txt')
+        with open(p, 'wb') as f:
+            f.write((line + '\n').encode('cp1255'))
+        d = patcher.read_doc(p)
+        self.assertEqual(d.encoding, 'cp1255')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, finding(line, 'יותבת', 'יוֹשֶׁ֣בֶת'))
+        self.assertEqual(cm.exception.code, 'unencodable')
+        self.assertTrue(any('א' <= c <= 'ת' for c in str(cm.exception)))
+        # nikud alone is in the code page and is written
+        plan = patcher.plan_edit(d, finding(line, 'יותבת', 'יוֹשֶׁבֶת'))
+        patcher.apply_edits(d, [plan])
+        self.assertEqual(d.encode().decode('cp1255'),
+                         line.replace('יותבת', 'יוֹשֶׁבֶת') + '\n')
+
+
 # ---------------------------------------------------------------------------
 # recorded edits after lines moved
 # ---------------------------------------------------------------------------
