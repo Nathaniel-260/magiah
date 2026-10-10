@@ -5,9 +5,11 @@ import io
 import json
 import os
 import pickle
+import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -330,6 +332,92 @@ class LineSplittingTest(unittest.TestCase):
             b = book_source.load_book('library', 'MoreBooks/ב.txt',
                                       library_dir=lib)
             self.assertEqual(len(b), 1)
+
+    def _counting_walks(self):
+        calls = []
+        real = LibraryCorpus._files
+
+        def files(corpus, dirs=None):
+            calls.append(corpus.path)
+            return real(corpus, dirs)
+        return calls, mock.patch.object(LibraryCorpus, '_files', files)
+
+    def _write(self, *parts):
+        os.makedirs(os.path.dirname(os.path.join(*parts)), exist_ok=True)
+        with open(os.path.join(*parts), 'w', encoding='utf-8') as f:
+            f.write('שורה\n')
+
+    def _age(self, lib):
+        """Date every folder a minute back: a walk trusts only folders not
+        modified around the time it ran (book_source._walk_library)."""
+        past = time.time() - 60
+        for d, _, _ in os.walk(lib):
+            os.utime(d, (past, past))
+
+    def test_picker_walks_the_library_once_while_it_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            self._write(lib, 'MoreBooks', 'ב', 'ספר ב.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            with patch:
+                for q in ('', 'ספר', 'א', 'ב', 'ספר א'):
+                    book_source.list_library_books(lib, q)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                [b['key'] for b in book_source.list_library_books(lib, '')],
+                ['MoreBooks/א/ספר א.txt', 'MoreBooks/ב/ספר ב.txt'])
+
+    def test_picker_sees_every_kind_of_change(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            calls, patch = self._counting_walks()
+
+            def after(change):
+                """A trusted walk, then `change`: the next query must see
+                it through the changed folder's modification time."""
+                self._age(lib)
+                book_source.list_library_books(lib, '')
+                n = len(calls)
+                change()
+                keys = [b['key'] for b in
+                        book_source.list_library_books(lib, '')]
+                self.assertEqual(len(calls), n + 1)
+                return keys
+            with patch:
+                # a book deep in a folder that already existed
+                self.assertIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'א', 'ספר ג.txt')))
+                # a new folder, and a new origin at the top
+                self.assertIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'חדש',
+                                        'ספר ד.txt')))
+                self.assertIn('OtherRepo/ספר ה.txt', after(
+                    lambda: self._write(lib, 'OtherRepo', 'ספר ה.txt')))
+                # removed, renamed, a whole folder removed
+                self.assertNotIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: os.remove(os.path.join(lib, 'MoreBooks', 'א',
+                                                   'ספר ג.txt'))))
+                self.assertEqual(after(lambda: os.rename(
+                    os.path.join(lib, 'OtherRepo', 'ספר ה.txt'),
+                    os.path.join(lib, 'OtherRepo', 'ספר ו.txt'))),
+                    ['MoreBooks/א/ספר א.txt', 'MoreBooks/חדש/ספר ד.txt',
+                     'OtherRepo/ספר ו.txt'])
+                self.assertNotIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: shutil.rmtree(os.path.join(lib, 'MoreBooks',
+                                                       'חדש'))))
+
+    def test_a_walk_racing_a_change_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'ספר א.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            # every folder looks modified after the walk began
+            with patch, mock.patch.object(book_source.time, 'time_ns',
+                                          return_value=0):
+                book_source.list_library_books(lib, '')
+                book_source.list_library_books(lib, '')
+            self.assertEqual(len(calls), 2)
 
 
 BROKEN_FRAME = b'\x28\xb5\x2f\xfd' + b'\x00' * 9

@@ -96,8 +96,12 @@ class LibraryCorpus:
         (DictaToOtzaria/ערוך/..., extraBooks/דיקטה ערוך/...)."""
         return any(s in _CURATED_DIRS for s in rel.split('/'))
 
-    def _files(self):
+    def _files(self, dirs=None):
         """Sorted repo-relative paths (forward slashes) of all book files.
+
+        `dirs`, if a list, receives every folder whose listing the result
+        depends on (the root and each folder walked), so a caller can tell
+        from their modification times whether the result is still current.
 
         Rule (verified against the repo layout, commit ca69c56):
         * one top-level folder per source (skip the non-book folders in
@@ -116,6 +120,8 @@ class LibraryCorpus:
             tops = sorted(os.listdir(root))
         except OSError:
             return []
+        if dirs is not None:
+            dirs.append(root)
         out = []
         for top in tops:
             if top in EXCLUDED_TOP or top.startswith('.'):
@@ -125,6 +131,8 @@ class LibraryCorpus:
                 continue
             rels = []
             for dirpath, dirnames, filenames in os.walk(top_path):
+                if dirs is not None:
+                    dirs.append(dirpath)
                 dirnames[:] = sorted(d for d in dirnames
                                      if not _SKIP_DIR_RE.match(d)
                                      and not (top == 'extraBooks'

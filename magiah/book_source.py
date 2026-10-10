@@ -25,6 +25,7 @@ right rows instead of creating a parallel `local:` copy of the same book.
 import hashlib
 import os
 import sqlite3
+import time
 
 from . import core
 from .corpus import OTZARIA_DB
@@ -111,7 +112,7 @@ def list_library_books(library_dir=None, query='', limit=200):
     lib = LibraryCorpus({'type': 'library', 'path': library_dir})
     q = (query or '').strip()
     out = []
-    for rel in sorted(_scanned_files(library_dir, lib, refresh=True)):
+    for rel in _scanned(library_dir, lib, refresh=True).ordered:
         title = os.path.splitext(rel.rsplit('/', 1)[-1])[0]
         if q and q not in title and q not in rel:
             continue
@@ -127,23 +128,75 @@ def list_library_books(library_dir=None, query='', limit=200):
 # reading one book
 # ---------------------------------------------------------------------------
 
+class _ScannedFiles:
+    """One walk of a library: its book files (as a set and in order) and
+    the modification time of every folder the walk listed."""
+
+    __slots__ = ('files', 'ordered', 'stamp')
+
+    def __init__(self, files, stamp):
+        self.files = frozenset(files)
+        self.ordered = tuple(sorted(self.files))
+        self.stamp = stamp            # None: must be walked again
+
+    def current(self):
+        """Whether no listed folder changed since the walk. Adding,
+        removing or renaming a file or folder changes its parent folder's
+        modification time, so a stat per folder (~1/10 of the entries)
+        replaces walking ~17k files."""
+        if self.stamp is None:
+            return False
+        try:
+            return all(os.stat(d).st_mtime_ns == m
+                       for d, m in self.stamp.items())
+        except OSError:                   # a folder is gone
+            return False
+
+
 _scanned_cache = {}
+_RACE_MARGIN_NS = 3 * 10 ** 9
+
+
+def _walk_library(lib):
+    dirs = []
+    started = time.time_ns()
+    files = lib._files(dirs)
+    stamp = {}
+    try:
+        for d in dirs:
+            stamp[d] = os.stat(d).st_mtime_ns
+    except OSError:
+        stamp = None
+    # a folder changed while it was being walked may have been listed
+    # before the change: this walk vouches for nothing, take the next anew.
+    # "While" with a margin: file system and clock ticks can be coarse
+    # (FAT: 2 s; Windows clock before 3.13: ~16 ms)
+    if stamp is not None and any(m >= started - _RACE_MARGIN_NS
+                                 for m in stamp.values()):
+        stamp = None
+    return _ScannedFiles(files, stamp)
+
+
+def _scanned(library_dir, lib, refresh=False):
+    """The repo files a scan actually reads, cached per library dir.
+
+    ``LibraryCorpus._files()`` walks ~17k files, and the book picker asks on
+    every keystroke. The repo DOES change mid-session (a user adds a book
+    and scans it), so with `refresh` the cached walk is used only while no
+    folder it listed has changed (:meth:`_ScannedFiles.current`); without
+    it, the cache is taken as is, and a miss is re-checked with `refresh`
+    before a book is refused.
+    """
+    key = os.path.abspath(library_dir)
+    hit = _scanned_cache.get(key)
+    if hit is None or (refresh and not hit.current()):
+        hit = _walk_library(lib)
+        _scanned_cache[key] = hit
+    return hit
 
 
 def _scanned_files(library_dir, lib, refresh=False):
-    """The repo files a scan actually reads, cached per library dir.
-
-    ``LibraryCorpus._files()`` walks ~17k files; a book scan asks for this
-    twice, so the walk is cached. The repo DOES change mid-session (a user
-    adds a book and scans it), so the picker always refreshes and a cache
-    miss is re-checked before a book is refused.
-    """
-    key = os.path.abspath(library_dir)
-    hit = None if refresh else _scanned_cache.get(key)
-    if hit is None:
-        hit = frozenset(lib._files())
-        _scanned_cache[key] = hit
-    return hit
+    return _scanned(library_dir, lib, refresh).files
 
 
 def _connect_ro(path):
