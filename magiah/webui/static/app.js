@@ -482,7 +482,9 @@ async function setStatus(ids, status, opts) {
   } catch (e) {
     for (const [r, st, cs, nt] of snapshot) { r.effective_status = st; r.custom_suggestion = cs; r.note = nt; }
     repaintStatuses(ids);
-    toast("שמירת הסטטוס נכשלה: " + e.message, "err");
+    // a conflict is not a failure: the server says who decided it meanwhile
+    if (e.status === 409 && e.code === "status_conflict") toast(e.message, "warn", 8000);
+    else toast("שמירת הסטטוס נכשלה: " + e.message, "err");
     throw e;
   }
 }
@@ -1036,6 +1038,12 @@ function cardQueue() {
       },
       countRemaining: async () =>
         totalOf(await api("/api/findings?" + filterParams({ statuses: remainingStatuses(), page: 1, page_size: 1 }))),
+      // the cards a rule may just have decided, as they stand now
+      fetchRows: (ids, recheck) => {
+        const p = filterParams({ page: 1, page_size: 500, statuses: recheck ? remainingStatuses() : S.filters.statuses });
+        p.set("ids", ids.join(","));
+        return api("/api/findings?" + p);
+      },
       save: (row, status, opts) => setStatus([row.id], status, Object.assign({ expect_status: effStatus(row) }, opts)),
     });
   }

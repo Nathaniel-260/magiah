@@ -1878,6 +1878,17 @@ def _findings_where(filters):
     if filters.get('origin'):
         where.append('f.origin = ?')
         params.append(filters['origin'])
+    if filters.get('ids'):
+        # a known set of findings (the card queue re-checking its cards)
+        ids = filters['ids']
+        if isinstance(ids, str):
+            ids = ids.split(',')
+        try:
+            ids = [int(i) for i in ids if str(i).strip()]
+        except ValueError:
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        where.append('f.id IN (SELECT value FROM json_each(?))')
+        params.append(json.dumps(ids))
     if filters.get('book_key'):
         sql, p = _book_key_where(filters['book_key'])
         where.append(sql)
@@ -2130,11 +2141,36 @@ def get_finding(con, fid):
 
 class StatusConflict(ValueError):
     """The finding is no longer in the state the client acted on (G3): a
-    double click, or another tab/reviewer got there first."""
+    double click, another tab or reviewer got there first, or a rule (word,
+    book, replacement) set since decides it. `cause` maps each finding id to
+    'decision' or the kind of rule that decides it now; the message names
+    the rule when one does."""
 
-    def __init__(self, current):
-        super().__init__(hebrew.MESSAGES['status_conflict'])
+    def __init__(self, current, cause=None):
+        cause = cause or {}
+        rules = [(k, current.get(i)) for i, k in cause.items()
+                 if k in hebrew.RULE_LABELS]
+        if rules:
+            kind, st = rules[0]
+            msg = hebrew.MESSAGES['status_conflict_rule'].format(
+                rule=hebrew.RULE_LABELS[kind], status=hebrew.status_hebrew(st))
+        else:
+            msg = hebrew.MESSAGES['status_conflict']
+        super().__init__(msg)
         self.current = current
+        self.cause = cause
+
+
+def _conflict_cause(f):
+    """What decides finding row `f` (see set_status) now: its own decision,
+    or the narrowest rule whose status is its effective status."""
+    if f['own_status'] is not None or f['eff'] == 'pending':
+        return 'decision'
+    for kind, col in (('book', 'book_rule'), ('replacement', 'repl_rule'),
+                      ('word', 'word_rule')):
+        if f[col] == f['eff']:
+            return kind
+    return 'decision'
 
 
 def _own_decision(con, word, unit):
@@ -2320,13 +2356,18 @@ def set_status(con, outdir, ids, status, note=None, custom_suggestion=None,
         found = []
         for fid in ids:
             f = con.execute(f'''
-                SELECT f.*, {EFF} AS eff FROM findings f {JOINS}
-                WHERE f.id = ?''', (fid,)).fetchone()
+                SELECT f.*, {EFF} AS eff, r.status AS own_status,
+                       rb.status AS book_rule, rr.status AS repl_rule,
+                       w.status AS word_rule
+                FROM findings f {JOINS} WHERE f.id = ?''', (fid,)).fetchone()
             if f is not None:
                 found.append(f)
         if expect_status is not None and any(f['eff'] != expect_status
                                              for f in found):
-            raise StatusConflict({str(f['id']): f['eff'] for f in found})
+            raise StatusConflict(
+                {str(f['id']): f['eff'] for f in found},
+                {str(f['id']): _conflict_cause(f) for f in found
+                 if f['eff'] != expect_status})
         return _set_status_locked(con, outdir, ids, found, status, note,
                                   custom_suggestion, scope, decided_by)
     except BaseException:

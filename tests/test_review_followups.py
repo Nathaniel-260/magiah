@@ -20,7 +20,8 @@ sys.path.insert(0, HERE)
 
 from magiah import book_scan, core                              # noqa: E402
 from magiah.webui import db, export, hebrew                     # noqa: E402
-from test_review_state import (Case, ServerCase, book_result,   # noqa: E402
+from test_review_state import (HARNESS, NODE, Case,            # noqa: E402
+                               ServerCase, book_result,
                                make_report, whitelist_cfg)
 
 
@@ -588,6 +589,85 @@ class TestDoclessBookKey(Case):
                          ['not_error', 'not_error', 'pending', 'pending',
                           'not_error', 'pending', 'not_error'])
 
+
+# ---------------------------------------------------------------------------
+# the card queue after a rule decision
+# ---------------------------------------------------------------------------
+
+@unittest.skipIf(NODE is None, 'node is not installed')
+class TestCardQueueRules(ServerCase):
+    """Cards a rule decided leave the queue; a conflict a rule caused says
+    so. Drives static/cardqueue.js through node against the server."""
+
+    def setUp(self):
+        super().setUp()
+        # בית on the three best-ranked cards and once far down; one word
+        # per other card
+        for i, rank in ((1, 10.0), (2, 9.9), (3, 9.8), (20, 1.0)):
+            self.add(i, 'בית', 'ביתו', str(i), rank=rank)
+        for i in range(4, 20):
+            self.add(i, 'מלה%d' % i, 'מילה%d' % i, str(i), rank=5.0)
+
+    def run_js(self, scenario):
+        import json
+        import subprocess
+        out = subprocess.run(
+            [NODE, HARNESS, 'http://127.0.0.1:%d' % self.port, scenario],
+            capture_output=True, timeout=120)
+        self.assertEqual(out.returncode, 0,
+                         out.stderr.decode('utf-8', 'replace')[-2000:])
+        return json.loads(out.stdout.decode('utf-8'))
+
+    def test_a_word_rule_drops_the_words_other_cards(self):
+        res = self.run_js('rule_settles')
+        self.assertEqual(res['word_cards_before'], 4)
+        self.assertEqual(res['word_cards_after'], 0)   # queue and skip pile
+        self.assertEqual(res['conflicts'], 0)
+        self.assertEqual(res['state'], 'done')
+        self.assertEqual(res['visited'], 16)
+        self.assertEqual([self.eff(i) for i in (1, 2, 3, 20)],
+                         ['not_error'] * 4)
+
+    def test_a_conflict_a_rule_caused_names_the_rule(self):
+        res = self.run_js('rule_elsewhere')
+        self.assertEqual((res['error'], res['code'], res['cause']),
+                         (409, 'status_conflict', 'word'))
+        self.assertIn(hebrew.RULE_LABELS['word'], res['message'])
+        self.assertNotIn('לחיצה כפולה', res['message'])
+        self.assertTrue(res['head_left'])
+        # the word's other cards went with it: no further conflict
+        self.assertEqual(res['conflicts'], 1)
+        self.assertEqual(res['state'], 'done')
+
+    def test_a_double_click_conflict_keeps_its_message(self):
+        code, _ = self.call('/api/status', {'ids': [4], 'status': 'approved',
+                                            'expect_status': 'pending'})
+        self.assertEqual(code, 200)
+        code, res = self.call('/api/status', {'ids': [4],
+                                              'status': 'approved',
+                                              'expect_status': 'pending'})
+        self.assertEqual((code, res['cause']), (409, {'4': 'decision'}))
+        self.assertEqual(res['error'], hebrew.MESSAGES['status_conflict'])
+
+    def test_each_rule_kind_is_named(self):
+        for scope, label in (('book', 'book'), ('replacement',
+                                                'replacement')):
+            with self.subTest(scope=scope):
+                db.reset(self.con, self.outdir)
+                db.set_status(self.con, self.outdir, [2], 'not_error',
+                              scope=scope)
+                code, res = self.call('/api/status', {
+                    'ids': [1], 'status': 'approved',
+                    'expect_status': 'pending'})
+                self.assertEqual((code, res['cause']), (409, {'1': label}))
+                self.assertIn(hebrew.RULE_LABELS[label], res['error'])
+
+    def test_ids_filter_returns_those_still_in_the_filter(self):
+        db.set_status(self.con, self.outdir, [1], 'not_error', scope='word')
+        code, res = self.call('/api/findings?status=pending&ids=1,2,4,20')
+        self.assertEqual(code, 200)
+        self.assertEqual([r['id'] for r in res['rows']], [4])
+        self.assertEqual(self.call('/api/findings?ids=1,x')[0], 400)
 
 if __name__ == '__main__':
     unittest.main()
