@@ -183,8 +183,12 @@ def _resolve_book(con, outdir, key, rows):
         kind, path, _ln = patcher.resolve_unit(unit)
         return kind, path, None
     if not key.startswith('file:'):
-        kind, path = patcher.resolve_key(key)
-        return kind, path, None
+        # neither a library file nor a scanned local one: refused exactly as
+        # patcher.resolve_key refuses it, without resolving anything
+        if ':' not in key:
+            raise patcher.PatchError(
+                'bad_unit', hebrew.FIXER_MESSAGES['bad_unit'].format(unit=key))
+        raise patcher.PatchError('db_book')
     configured = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
     by_scope = {}
     for row in rows:
