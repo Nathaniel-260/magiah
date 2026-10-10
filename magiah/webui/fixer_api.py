@@ -249,10 +249,12 @@ def doc(con, outdir, q):
                                origin=q.get('origin'))
 
     if key.startswith('db:'):
-        # a book with no file: the worklist is still useful for export
+        # a book with no file (its units name no file, so no item matches
+        # the key): the page explains why nothing is listed or editable
         return {'book': {'key': key, 'editable': False, 'kind': 'db'},
                 'editable': False, 'items': items, 'lines': [],
-                'line_count': 0, 'message': hebrew.FIXER_MESSAGES['db_book']}
+                'line_count': 0,
+                'message': hebrew.FIXER_MESSAGES['db_book_view']}
 
     _kind, path, _root = _resolve_book(con, outdir, key, items)
     # never wait on a busy file just to draw a page; a writer settles it

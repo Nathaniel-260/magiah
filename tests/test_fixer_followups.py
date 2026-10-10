@@ -6,6 +6,8 @@ library. The shared fixtures come from test_anchor_write.
 """
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -14,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magiah import normalize                                    # noqa: E402
-from magiah.webui import db, journal, patcher                   # noqa: E402
+from magiah.webui import (db, fixer_api, hebrew, journal,     # noqa: E402
+                          patcher)
 from test_anchor_write import (FixerEnv, TempCase, finding, raw,  # noqa: E402
                                scan_snippet, write)
 
@@ -658,6 +661,88 @@ class TestNamesPastMaxPath(FixerEnv):
         self.assertEqual(cm.exception.code, 'path_too_long')
         self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
         self.assertEqual(journal.pending(self.outdir), [])
+
+
+# ---------------------------------------------------------------------------
+# the fixer view
+# ---------------------------------------------------------------------------
+
+APP_JS = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), 'magiah', 'webui', 'static', 'app.js')
+
+
+def _js_function(src, name):
+    """The source of ``function name(...) {...}`` in app.js."""
+    start = src.index('function %s(' % name)
+    depth, i = 0, src.index('{', start)
+    while True:
+        if src[i] == '{':
+            depth += 1
+        elif src[i] == '}':
+            depth -= 1
+            if not depth:
+                return src[start:i + 1]
+        i += 1
+
+
+class TestFixerView(FixerEnv):
+
+    def setUp(self):
+        super().setUp()
+        with open(APP_JS, encoding='utf-8') as f:
+            self.src = f.read()
+
+    @unittest.skipIf(shutil.which('node') is None, 'node is not installed')
+    def test_needs_vocalization_is_shown_and_kept_out_of_the_batch(self):
+        """The doc view computed anchor.needs_vocalization; nothing showed
+        it, and the server's refusal then failed the whole batch."""
+        line = self.src[self.src.index('const VOCALIZED_RE'):]
+        script = '\n'.join((
+            'const S = {fixModeOverride: new Map(), fixMode: "replace"};',
+            'const effStatus = r => r.st || "approved";',
+            'const effFix = r => r.suggestion;',
+            line[:line.index('\n')],
+            _js_function(self.src, 'rowMode'),
+            _js_function(self.src, 'needsVocalization'),
+            _js_function(self.src, 'canApply'),
+            'const a = {ok: true, needs_vocalization: true};',
+            'const out = [',
+            '  canApply({id: 1, anchor: a, suggestion: "יושבת"}),',
+            '  canApply({id: 2, anchor: a, correction: "יוֹשֶׁבֶת"}),',
+            '  (S.fixModeOverride.set(3, "bracket"),',
+            '   canApply({id: 3, anchor: a, suggestion: "יושבת"})),',
+            '  canApply({id: 4, anchor: {ok: true}, suggestion: "יושבת"}),',
+            '  needsVocalization({id: 5, anchor: a, suggestion: "יושבת"})];',
+            'console.log(JSON.stringify(out));'))
+        r = subprocess.run(['node', '-e', script], capture_output=True,
+                           text=True, encoding='utf-8')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout),
+                         [False, True, True, True, True])
+        row = _js_function(self.src, 'fixRowNode')
+        self.assertIn('needsVocalization(r)', row)
+        self.assertIn('מנוקדת', row)
+
+    def test_a_moved_anchor_is_warned_about(self):
+        row = _js_function(self.src, 'fixRowNode')
+        self.assertIn('confidence === "moved"', row)
+        self.assertIn('moved_from', row)
+        self.assertIn('השורה זזה מאז הסריקה', row)
+
+    def test_a_db_book_explains_why_nothing_is_listed(self):
+        con = self.con()
+        try:
+            d = fixer_api.doc(con, self.outdir, {'key': 'db:o|ספר מהמסד'})
+        finally:
+            con.close()
+        self.assertFalse(d['editable'])
+        self.assertEqual(d['message'],
+                         hebrew.FIXER_MESSAGES['db_book_view'])
+        self.assertIn('מסד הנתונים', d['message'])
+        lst = _js_function(self.src, 'renderFixList')
+        self.assertLess(lst.index('editable === false'),
+                        lst.index('אין ממצאים לתיקון בספר זה'))
+        self.assertIn('S.fixDoc.message', lst)
 
 
 if __name__ == '__main__':

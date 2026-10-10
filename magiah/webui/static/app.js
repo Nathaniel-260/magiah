@@ -1415,7 +1415,20 @@ function moveFixSelection(delta) {
 /* a row can be written only when the server managed to anchor it */
 function canApply(r) {
   return !!(r && r.anchor && r.anchor.ok && (r.correction || effFix(r)) &&
-            effStatus(r) !== "fixed");
+            effStatus(r) !== "fixed" && !needsVocalization(r));
+}
+
+/* nikud and teamim as patcher's normalize.has_marks counts them (marks and
+ * the vocalized presentation forms) */
+const VOCALIZED_RE = /[֑-ׇֽֿׁׂׅ̣ׄ̇͏יִ-ײַשׁ-פֿ]/;
+
+/* The word in the file is vocalized and replace mode would write a plain
+ * correction over it (the server's anchor.needs_vocalization, re-checked
+ * against the correction and mode chosen here since). */
+function needsVocalization(r) {
+  if (!(r && r.anchor && r.anchor.ok && r.anchor.needs_vocalization)) return false;
+  if (rowMode(r) !== "replace" || effStatus(r) === "fixed") return false;
+  return !VOCALIZED_RE.test(r.correction || effFix(r) || "");
 }
 
 function rowMode(r) {
@@ -1758,6 +1771,14 @@ function renderFixList(scroll) {
     updateFixProgress();
     return;
   }
+  if (S.fixDoc && S.fixDoc.editable === false) {
+    // a book from the database has no file to write: say so, rather than
+    // the "nothing to fix" an empty worklist would otherwise claim
+    box.append(el("div", { class: "fixer-empty" }, S.fixDoc.message ||
+      "ספר זה מגיע ממסד הנתונים ולא מקובץ טקסט, ולכן אי אפשר לתקן אותו כאן."));
+    updateFixProgress();
+    return;
+  }
   if (!S.fixRows.length) {
     box.append(el("div", { class: "fixer-empty" }, "אין ממצאים לתיקון בספר זה 🎉"));
     updateFixProgress();
@@ -1871,6 +1892,21 @@ function fixRowNode(r, idx, editable) {
     // against — probably fine, but worth a human glance before writing
     main.append(el("div", { class: "fix-warn weak-warn" },
       "⚠ הקטע בקובץ אינו תואם במלואו לקטע שנסרק — כדאי לוודא לפני ההחלה."));
+  } else if (r.anchor && r.anchor.confidence === "moved") {
+    // the sentence was found on another line than the scan saw it on
+    const from = r.anchor.moved_from;
+    main.append(el("div", { class: "fix-warn weak-warn" },
+      "⚠ השורה זזה מאז הסריקה" +
+      (from != null ? " (נסרקה בשורה " + fmtNum(from + 1) + ")" : "") +
+      " — הקטע זוהה בשורה " + fmtNum(r.lineno + 1) +
+      " לפי ההקשר המלא שלו. כדאי לוודא שזה המקום הנכון לפני ההחלה."));
+  }
+  if (needsVocalization(r)) {
+    // replacing would strip the word's nikud; the server refuses that, and
+    // one refusal fails the whole batch — so it is said here, before
+    main.append(el("div", { class: "fix-warn" },
+      "⚠ המילה בקובץ מנוקדת והתיקון אינו מנוקד — החלפה הייתה מוחקת את הניקוד, " +
+      "ולכן לא תיכתב. יש להקליד תיקון מנוקד («✏ תיקון ידני») או לבחור במצב «סוגריים»."));
   }
   if (r.anchor && r.anchor.ok && r.anchor.spans_markup) {
     // replacing takes the tag with the word (fine); bracketing would wrap
