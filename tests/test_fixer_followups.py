@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magiah import normalize                                    # noqa: E402
-from magiah.webui import journal, patcher                       # noqa: E402
+from magiah.webui import db, journal, patcher                   # noqa: E402
 from test_anchor_write import (FixerEnv, TempCase, finding, raw,  # noqa: E402
                                scan_snippet, write)
 
@@ -560,6 +560,58 @@ class TestLockOwnership(FixerEnv):
             journal.os.open = real_open
         self.assertEqual(cm.exception.code, 'file_busy')
         self.assertEqual(sorted(os.listdir(self.lib)), ['ספר.txt'])
+
+
+class TestBookScanSourceIsNeverStale(FixerEnv):
+    """A book scan's rows and its source record are two commits. A crash
+    between them left the new rows under the previous scan's root and
+    fingerprint; now they are left with no source (refused)."""
+
+    def result(self, root):
+        path = write(os.path.join(root, 'ספר.txt'), self.TEXT)
+        return {'doc': 'ספר.txt', 'title': 'ספר', 'kind': 'library',
+                'path': path, 'findings': [], 'space_errors': [],
+                'file_sha': patcher.fingerprint(path),
+                'file_size': len(raw(path))}
+
+    def source(self):
+        con = self.con()
+        try:
+            return db.get_source_root(con, 'doc:ספר.txt')
+        finally:
+            con.close()
+
+    def test_a_crash_between_the_commits_leaves_no_source(self):
+        db.merge_book_scan(self.outdir, self.result(self.lib))
+        self.assertEqual(self.source()['root'], os.path.abspath(self.lib))
+        other = os.path.join(self.tmp, 'libB')
+        real = db.record_book_scan_source
+
+        def crash(*a, **kw):
+            raise KeyboardInterrupt
+        db.record_book_scan_source = crash
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                db.merge_book_scan(self.outdir, self.result(other))
+        finally:
+            db.record_book_scan_source = real
+        self.assertIsNone(self.source())
+
+    def test_a_failed_merge_keeps_the_previous_source(self):
+        db.merge_book_scan(self.outdir, self.result(self.lib))
+        before = self.source()
+        real = db.import_book_scan
+
+        def locked(*a, **kw):
+            raise RuntimeError('decisions.db is locked')
+        db.import_book_scan = locked
+        try:
+            with self.assertRaises(RuntimeError):
+                db.merge_book_scan(self.outdir, self.result(self.lib))
+        finally:
+            db.import_book_scan = real
+        self.assertEqual(self.source()['root'], before['root'])
+        self.assertEqual(self.source()['file_sha'], before['file_sha'])
 
 
 class TestNamesPastMaxPath(FixerEnv):
