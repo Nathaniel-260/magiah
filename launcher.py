@@ -29,18 +29,26 @@ def _app_dir():
 
 
 def _resolve_outdir(argv):
+    """Where the data folder lives. Created if missing, whichever way it was
+    named: sqlite cannot open a database inside a directory that is not there,
+    so a not-yet-created --out folder would leave every request failing with a
+    500 and a UI that loads but shows nothing."""
     # 1. --out argument (supports "--out X" and "--out=X")
     for i, a in enumerate(argv):
         if a == '--out' and i + 1 < len(argv):
-            return os.path.abspath(argv[i + 1])
+            return _ensure(argv[i + 1])
         if a.startswith('--out='):
-            return os.path.abspath(a[len('--out='):])
+            return _ensure(a[len('--out='):])
     # 2. environment variable
     env = os.environ.get('MAGIAH_OUT')
     if env:
-        return os.path.abspath(env)
-    # 3. magiah_data next to the exe (create if missing)
-    d = os.path.join(_app_dir(), 'magiah_data')
+        return _ensure(env)
+    # 3. magiah_data next to the exe
+    return _ensure(os.path.join(_app_dir(), 'magiah_data'))
+
+
+def _ensure(path):
+    d = os.path.abspath(path)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -125,7 +133,12 @@ def main():
         sys.argv = ['magiah'] + argv
         return cli_main() or 0
 
-    outdir = _resolve_outdir(sys.argv[1:])
+    try:
+        outdir = _resolve_outdir(sys.argv[1:])
+    except OSError as e:
+        _pause('לא ניתן ליצור את תיקיית הנתונים. בדוק את הנתיב שנתת ב־--out '
+               'ואת ההרשאות לתיקייה. פרטים: %s' % e)
+        return 1
     _ensure_zstd()
     port = _free_port()
 
