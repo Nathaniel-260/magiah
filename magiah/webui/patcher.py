@@ -6,7 +6,8 @@ The one rule this module exists to enforce
 **A correction must never land on an unrelated passage.** Everything below is
 an identity check; whenever identity is uncertain the module REFUSES and the
 human is asked. Silence is never an option, and a partial write never happens:
-:func:`plan_all` validates every edit before :func:`write_doc` touches a byte.
+:func:`plan_all` validates every edit before a byte is written — and the only
+writer, ``fixer_api``, writes under the book's lock and its journal.
 
 Why a plain ``line.replace(word, fix)`` would corrupt books
 ----------------------------------------------------------
@@ -19,19 +20,22 @@ like::
 
 so the stored ``word`` (``יהמו``) does not occur literally in the raw line at
 all, while a short ``word`` may well occur *inside the markup*. ``snippet`` is
-no better: it is ``' '.join(tokens)`` of NORMALIZED tokens, not a slice of the
-file. Neither can be used to locate anything.
+a window of the CLEANED line, not a slice of the file, so it cannot locate
+anything in the raw text — but it can prove which line and which occurrence a
+finding means (see :func:`_identify`).
 
 The anchor is therefore computed by re-tokenizing the raw line with
 :func:`normalize.token_spans`, which reports the raw span each token occupies.
 The span is the only thing ever replaced, so nikud, tags and punctuation
 outside it survive byte for byte.
 
-Identity, and the four ways it can go wrong
--------------------------------------------
+Identity, and the ways it can go wrong
+--------------------------------------
 * the file changed since it was opened  -> ``file_changed`` (fingerprint)
 * the line is gone / shorter file        -> ``line_gone``
 * the word is no longer there            -> ``token_not_found``
+* the word is there, the sentence is not -> ``line_mismatch``
+* the sentence is on several lines       -> ``ambiguous_line``
 * the word occurs N times                -> ``occurrence_count_changed`` or
   ``ambiguous_occurrence``; the human clicks the right one and the offsets
   then come from the server, never from the client
@@ -41,14 +45,16 @@ on ``source``: ``source`` is only the filename stem, and in the real corpus the
 stem ``'פרק א'`` belongs to 35 different books. Writing by ``source`` would
 scatter edits across all of them.
 """
+import bisect
 import hashlib
 import json
 import os
 import re
-import shutil
+import uuid
+from collections import OrderedDict
 from datetime import datetime
 
-from .. import book_source, normalize
+from .. import book_source, core, normalize
 from ..corpus_hybrid import DEFAULT_LIBRARY, parse_file_unit
 from . import hebrew
 
@@ -64,7 +70,10 @@ CONFLICT_CODES = frozenset((
     'file_changed', 'line_gone', 'token_not_found',
     'occurrence_count_changed', 'ambiguous_occurrence', 'overlapping_edits',
     'unit_mismatch', 'file_changed_since_edit', 'word_spans_markup',
-    'not_approved',
+    'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
+    'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
+    'backup_corrupt', 'journal_conflict', 'journal_pending',
+    'moved_unproven', 'copy_moved', 'bracket_unproven',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -76,7 +85,10 @@ ENCODINGS = ('utf-8', 'cp1255')
 
 UTF8_BOM = '﻿'
 
-_BACKUP_RE = re.compile(r'^[\w.\- ]+\.\d{8}-\d{6}\.[0-9a-f]{8}\.bak$')
+# old names: <stem>.<YYYYmmdd-HHMMSS>.<pathtag>.bak; new names add microseconds
+# and a random suffix, so two backups in one second can never collide
+_BACKUP_RE = re.compile(
+    r'^[\w.\- ]+\.\d{8}-\d{6}(?:-\d{6})?\.[0-9a-f]{8}(?:\.[0-9a-f]{8})?\.bak$')
 
 
 class PatchError(ValueError):
@@ -92,6 +104,41 @@ class PatchError(ValueError):
         super().__init__(message or hebrew.FIXER_MESSAGES.get(code, code))
 
 
+class AccessDenied(PermissionError):
+    """A file or folder the fixer must read or write refuses access: the book
+    is locked by another program or read-only, or its folder does not allow
+    new files. Waiting cannot help, so it is reported at once (HTTP 423),
+    with a Hebrew message and a machine code, like a :class:`PatchError`.
+    """
+
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+def denied_folder(folder):
+    return AccessDenied('folder_not_writable',
+                        _msg('folder_not_writable', folder=folder))
+
+
+def denied_file(path):
+    return AccessDenied('access_denied', _msg('access_denied', path=path))
+
+
+# Windows without long-path support refuses names past MAX_PATH, and the
+# fixer's temp and lock files add up to 45 characters to the book's name.
+MAX_PATH = 260
+MAX_PATH_APPLIES = os.name == 'nt'
+
+
+def name_too_long(name):
+    return MAX_PATH_APPLIES and len(os.path.abspath(name)) >= MAX_PATH
+
+
+def denied_long(path):
+    return AccessDenied('path_too_long', _msg('path_too_long', path=path))
+
+
 def _msg(code, **fmt):
     text = hebrew.FIXER_MESSAGES.get(code, code)
     return text.format(**fmt) if fmt else text
@@ -101,6 +148,37 @@ def _msg(code, **fmt):
 # locating the file
 # ---------------------------------------------------------------------------
 
+def contained_path(path, root, code='outside_library'):
+    """`path` normalized, provided it lies strictly INSIDE `root`; otherwise
+    a :class:`PatchError` with `code`.
+
+    The single containment guard for every path built from request data:
+    callers must use the returned (normalized) value from here on, never the
+    `path` they passed in. Normalizing first collapses '..' segments, so the
+    prefix test cannot be walked around; the root itself is refused too (it
+    is a folder, never a book or a backup).
+    """
+    base = os.path.normpath(os.path.abspath(root))
+    full = os.path.normpath(os.path.abspath(path))
+    if not full.startswith(base.rstrip(os.sep) + os.sep):
+        raise PatchError(code, _msg(code))
+    return full
+
+
+def _library_file(rel, library_dir, unit):
+    """The book file a library-relative path names, contained in the
+    library (see :func:`contained_path`)."""
+    library_dir = library_dir or DEFAULT_LIBRARY
+    rel = book_source.canonical_rel(rel)
+    # '.', '..' and 'x.txt/..' all normalize to something that names a
+    # DIRECTORY (often the library root itself) rather than a book
+    if not rel or rel in ('.', '..') or rel.split('/')[-1] in ('.', '..'):
+        raise PatchError('bad_unit', _msg('bad_unit', unit=unit))
+    # a crafted '../..' relpath must never read or write outside the repo
+    return contained_path(os.path.join(library_dir, *rel.split('/')),
+                          library_dir)
+
+
 def resolve_unit(unit, library_dir=None):
     """``unit`` -> ``(kind, abspath, lineno0)``; kind is 'library' | 'local'.
 
@@ -108,20 +186,10 @@ def resolve_unit(unit, library_dir=None):
     units carry no file at all and raise ``db_book`` so the caller can offer
     export instead of editing.
     """
-    library_dir = library_dir or DEFAULT_LIBRARY
     parsed = parse_file_unit(unit)
     if parsed is not None:
         rel, lineno = parsed
-        rel = book_source.canonical_rel(rel)
-        # '.', '..' and 'x.txt/..' all normalize to something that names a
-        # DIRECTORY (often the library root itself) rather than a book
-        if not rel or rel in ('.', '..') or rel.split('/')[-1] in ('.', '..'):
-            raise PatchError('bad_unit', _msg('bad_unit', unit=unit))
-        path = os.path.join(library_dir, *rel.split('/'))
-        # a crafted '../..' relpath must never read or write outside the repo
-        if book_source._rel_within(path, library_dir) is None:
-            raise PatchError('outside_library', _msg('outside_library'))
-        return 'library', path, lineno
+        return 'library', _library_file(rel, library_dir, unit), lineno
     parsed = book_source.parse_local_unit(unit)
     if parsed is not None:
         path, lineno = parsed
@@ -171,6 +239,19 @@ def resolve_key(key, library_dir=None):
     return _kind, path
 
 
+def resolve_file_key(key, library_dir=None):
+    """A ``file:<rel>`` key -> the library book's absolute path.
+
+    For keys that arrive in a request: unlike :func:`resolve_key` it has no
+    way to yield a ``local:`` path, so the only path it can return is one
+    :func:`contained_path` accepted inside `library_dir`."""
+    parsed = (parse_file_unit(key + ':0')
+              if isinstance(key, str) and key.startswith('file:') else None)
+    if parsed is None:
+        raise PatchError('bad_unit', _msg('bad_unit', unit=key))
+    return _library_file(parsed[0], library_dir, key)
+
+
 # ---------------------------------------------------------------------------
 # reading
 # ---------------------------------------------------------------------------
@@ -184,14 +265,24 @@ class FileDoc:
     endings round-trips unchanged.
     """
 
-    def __init__(self, path, raw, encoding, lines, line_ends, bom=False):
+    def __init__(self, path, raw, encoding, lines, line_ends, bom=False,
+                 fingerprint=None, size=None):
         self.path = path
         self.raw = raw                  # decoded text, BOM excluded
         self.encoding = encoding
         self.lines = lines
         self.line_ends = line_ends
         self.bom = bom                  # re-emitted verbatim on write
-        self.fingerprint = fingerprint_bytes(self.encode())
+        self.fingerprint = fingerprint or fingerprint_bytes(self.encode())
+        # bytes on disk when read (BOM included); with the fingerprint, what a
+        # book scan's record is compared against
+        self.size = size
+        # Per-line work shared by every finding of the book (anchoring a page
+        # costs findings x line length otherwise). Each entry is checked
+        # against the line's current text, so an edited line is recomputed.
+        self._clean = {}                # lineno -> (line, clean, token set)
+        self._info = OrderedDict()      # line text -> _LineInfo, LRU
+        self._cleans = None             # clean() of every line
 
     def __len__(self):
         return len(self.lines)
@@ -211,8 +302,8 @@ class FileDoc:
 _SPLIT_RE = re.compile(r'(\r\n|\r|\n)')
 
 
-def read_doc(path):
-    """Read a book file, preserving everything needed to write it back."""
+def read_bytes(path):
+    """The book's exact bytes, after the is-a-book checks."""
     if not os.path.isfile(path):
         raise PatchError('not_a_file', _msg('not_a_file', path=path))
     if not path.lower().endswith('.txt'):
@@ -222,8 +313,22 @@ def read_doc(path):
         raise PatchError('too_big', _msg(
             'too_big', mb=size / 1e6,
             limit=book_source.MAX_BOOK_BYTES / 1e6))
-    with open(path, 'rb') as f:
-        data = f.read()
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except PermissionError as e:       # opened exclusively by another program
+        raise denied_file(path) from e
+
+
+def read_doc(path):
+    """Read a book file, preserving everything needed to write it back."""
+    return doc_from_bytes(path, read_bytes(path))
+
+
+def doc_from_bytes(path, data):
+    """Parse bytes already read, so the fingerprint and the text a plan is
+    made against are guaranteed to be the same version of the file."""
+    fp, size = fingerprint_bytes(data), len(data)
     # the BOM is a property of the file, kept aside so it is neither lost nor
     # invented on write
     bom = data.startswith(b'\xef\xbb\xbf')
@@ -250,15 +355,25 @@ def read_doc(path):
     if len(lines) > 1 and lines[-1] == '' and ends[-1] == '':
         lines.pop()
         ends.pop()
-    elif not raw:
+    elif not raw and not bom:
         lines, ends = [], []           # an empty file has no lines at all
-    return FileDoc(path, raw, encoding, lines, ends, bom)
+    # A file holding only a BOM keeps one empty line: the scanner decodes
+    # the BOM as a character of line 1, and the numbering must agree.
+    doc = FileDoc(path, raw, encoding, lines, ends, bom, fingerprint=fp,
+                  size=size)
+    if doc.encode() != ((b'\xef\xbb\xbf' + data) if bom else data):
+        # a decode/encode round trip that is not byte-exact would rewrite
+        # bytes outside every span; refuse rather than write such a file
+        raise PatchError('undecodable', _msg('undecodable', path=path))
+    return doc
 
 
 def fingerprint_bytes(text_or_bytes):
     data = (text_or_bytes.encode('utf-8')
             if isinstance(text_or_bytes, str) else text_or_bytes)
-    return 'sha256:' + hashlib.sha256(data).hexdigest()[:32]
+    # one definition with the book scan, which records the fingerprint of the
+    # bytes it read for _locate_line's "unchanged since the scan" test
+    return book_source.file_fingerprint(data)
 
 
 def fingerprint(path):
@@ -266,15 +381,6 @@ def fingerprint(path):
     editors preserve it and FAT rounds it to two seconds."""
     with open(path, 'rb') as f:
         return fingerprint_bytes(f.read())
-
-
-def check_fingerprint(path, expected):
-    if not expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    actual = fingerprint(path)
-    if actual != expected:
-        raise PatchError('file_changed', _msg('file_changed'))
-    return actual
 
 
 # ---------------------------------------------------------------------------
@@ -298,14 +404,23 @@ class EditPlan:
         self.confidence = confidence
         self.spans_markup = spans_markup
         self.drifted = False        # set when the line moved since the scan
+        self.needs_vocalization = False
+        # filled by apply_edits: where new_text sits in the WRITTEN line and
+        # the text around it, which is what undo and idempotency verify
+        self.post_start = None
+        self.ctx_l = self.ctx_r = None
 
     def to_dict(self):
-        return {'id': self.finding_id, 'lineno': self.lineno,
-                'start': self.start, 'end': self.end, 'old': self.old_raw,
-                'new': self.new_text, 'mode': self.mode,
-                'occurrence': self.occurrence,
-                'confidence': self.confidence,
-                'spans_markup': self.spans_markup}
+        d = {'id': self.finding_id, 'lineno': self.lineno,
+             'start': self.start, 'end': self.end, 'old': self.old_raw,
+             'new': self.new_text, 'mode': self.mode,
+             'occurrence': self.occurrence,
+             'confidence': self.confidence,
+             'spans_markup': self.spans_markup}
+        if self.post_start is not None:
+            d.update(post_start=self.post_start, ctx_l=self.ctx_l,
+                     ctx_r=self.ctx_r)
+        return d
 
 
 def render_replacement(mode, wrong_raw, correction):
@@ -322,114 +437,538 @@ def render_replacement(mode, wrong_raw, correction):
     return correction
 
 
-def _snippet_supports(line_clean, snippet, tok_index_hint=None):
-    """Does the report's snippet corroborate this line?
+def _snippet_identifies(line_toks, snippet):
+    """Strict token-overlap identity, for snippets that are not a window.
 
-    The snippet is a join of normalized tokens, so it will not match the line
-    literally; we only ask whether a few of its tokens are present. A negative
-    answer NEVER refuses — it downgrades confidence, because false negatives
-    are expected (the snippet spans neighbouring lines' tokens too).
-    """
-    if not snippet:
-        return True
-    toks = [t for t in normalize.tokenize(snippet) if len(t) > 1]
-    if not toks:
-        return True
-    line_toks = set(normalize.tokenize(line_clean))
-    hits = sum(1 for t in toks if t in line_toks)
-    return hits >= max(2, len(toks) // 4)
-
-
-def _snippet_identifies(line, snippet):
-    """Strict variant of :func:`_snippet_supports`, for RELOCATING a finding.
-
-    The tolerant test above is right for downgrading confidence, but far too
-    weak to prove "this is the same passage". Hebrew religious texts repeat
-    long formulas verbatim across many verses ("וידבר ה' אל משה לאמר דבר אל
-    בני ישראל ואמרת אלהם…"), and that shared formula alone clears the tolerant
-    threshold — so every parallel verse looks like a match and the finding
-    lands on whichever one happens to be nearest.
-
-    Identity therefore rests on what the verses do NOT share: most of the
-    snippet's tokens must be present, and the distinctive ones — those absent
-    from the passage's neighbours — matter most. Requiring a large majority is
-    what separates "the same verse, moved" from "its twin, three verses down".
+    ``line_toks`` is the set of the line's tokens. Hebrew religious texts
+    repeat long formulas verbatim across many verses ("וידבר ה' אל משה
+    לאמר דבר אל בני ישראל ואמרת אלהם…"), and a tolerant overlap test passes
+    on every parallel verse. Identity therefore needs most of the snippet's
+    tokens: requiring a large majority is what separates "the same verse,
+    moved" from "its twin, three verses down".
     """
     if not snippet:
         return False           # cannot identify anything without evidence
     toks = [t for t in normalize.tokenize(snippet) if len(t) > 1]
     if len(toks) < 3:
         return False           # too little to identify a line by
-    line_toks = set(normalize.tokenize(line))
     hits = sum(1 for t in toks if t in line_toks)
     return hits >= max(3, int(len(toks) * 0.75))
 
+
+# The scanner stores ``clean(line)[s - 45:e + 45].strip()`` around the flagged
+# word (core._locate_chunk, book_scan._read_book_tokens). Re-cutting that
+# window at a candidate occurrence and comparing it EXACTLY is the identity
+# proof: it pins the line and the occurrence on it, not just shared words.
+SNIPPET_RADIUS = 45
 
 # How far to look for a line that drifted. Books get lines inserted and
 # removed between a scan and a fix; a few dozen lines covers ordinary editing
 # while staying far too small to reach an unrelated chapter.
 DRIFT_WINDOW = 60
 
+LEVEL_WINDOW = 'window'        # the snippet IS this occurrence's window
+LEVEL_TOKENS = 'tokens'        # legacy: most snippet tokens are on the line
 
-def _find_drifted_line(doc, lineno, word, snippet):
-    """The line this finding now sits on, after the file was edited.
 
-    Two situations look identical from the word's absence alone, and they need
-    opposite answers:
+class _LineInfo:
+    """One line's clean text and token spans, computed once and shared by
+    every finding that looks at the line."""
+    __slots__ = ('clean', 'spans', '_by_tok', '_at')
 
-    * the passage MOVED (a line was inserted above it) -> relocate
-    * the passage is still there and only the WORD is gone, because a human
-      already corrected it -> there is nothing to do, refuse
+    def __init__(self, text):
+        self.clean, self.spans = normalize.token_spans_full(text)
+        self._by_tok = self._at = None
 
-    Telling them apart is not optional. Hebrew religious texts are full of
-    parallel verses sharing a formula ("וידבר ה' אל משה לאמר…"), so in the
-    second case the nearest surviving occurrence of the word is typically a
-    DIFFERENT verse that satisfies every other test — and correcting it would
-    be exactly the unrelated-passage edit this module exists to prevent.
-    The discriminator is the scanned line itself: if the snippet still matches
-    it, the passage never moved, so nothing may be relocated.
+    def index_at(self, clean_start):
+        """Index of the token starting at `clean_start`, or None."""
+        if self._at is None:
+            self._at = {sp[3]: i for i, sp in enumerate(self.spans)}
+        return self._at.get(clean_start)
 
-    Beyond that, a candidate is only accepted when it is unambiguous: the word
-    occurs there exactly once, exactly one nearby line qualifies, and the
-    snippet corroborates it. Returns None whenever anything is in doubt.
-    """
-    if not snippet:
-        return None            # nothing to corroborate with: do not guess
-    # the scanned passage is still sitting where it was -> it did not drift
-    if lineno < len(doc.lines) and _snippet_identifies(doc.lines[lineno],
-                                                       snippet):
-        return None
+    def by_tok(self):
+        """token -> indexes of its spans, in order."""
+        if self._by_tok is None:
+            idx = {}
+            for i, sp in enumerate(self.spans):
+                idx.setdefault(sp[0], []).append(i)
+            self._by_tok = idx
+        return self._by_tok
+
+    def occurrences(self, word):
+        """``[(raw_s, raw_e, clean_s, clean_e), ...]`` of `word`, which may
+        span several tokens (the extra_space family)."""
+        want = word.split()
+        if not want:
+            return []
+        spans, k, out = self.spans, len(want), []
+        for i in self.by_tok().get(want[0], ()):
+            if i + k <= len(spans) and all(
+                    spans[i + j][0] == want[j] for j in range(1, k)):
+                out.append((spans[i][1], spans[i + k - 1][2], spans[i][3],
+                            spans[i + k - 1][4]))
+        return out
+
+
+# lines kept per document: anchoring walks the book in reading order, so a
+# small window of recent lines catches every repeat
+_INFO_CACHE = 256
+
+
+def _line_info(doc, text):
+    """The :class:`_LineInfo` of `text`, from `doc`'s cache when it has one."""
+    cache = getattr(doc, '_info', None)
+    if cache is None:
+        return _LineInfo(text)
+    info = cache.get(text)
+    if info is None:
+        info = cache[text] = _LineInfo(text)
+        if len(cache) > _INFO_CACHE:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(text)
+    return info
+
+
+def _occurrences(line, word, doc=None):
+    """``(clean_text, [(raw_s, raw_e, clean_s, clean_e), ...])`` of `word`,
+    which may span several tokens (the extra_space family)."""
+    info = _line_info(doc, line)
+    return info.clean, info.occurrences(word)
+
+
+def _identify(line, word, snippet, doc=None):
+    """``(occurrences, identified_indexes, level)`` for one candidate line.
+
+    ``level`` is None when the snippet does not identify the line at all."""
+    info = _line_info(doc, line)
+    occs = info.occurrences(word)
+    if not snippet or not occs:
+        return occs, [], None
+    clean_text, r = info.clean, SNIPPET_RADIUS
+    ident = [i for i, o in enumerate(occs)
+             if clean_text[max(0, o[2] - r):o[3] + r].strip() == snippet]
+    if ident:
+        return occs, ident, LEVEL_WINDOW
+    # an older scan (or another family) may have cut the snippet differently
+    if _snippet_identifies(info.by_tok(), snippet):
+        return occs, list(range(len(occs))), LEVEL_TOKENS
+    return occs, [], None
+
+
+def _neighbours(text, word):
+    """``{(token before, token after), ...}`` of each copy of `word` in
+    `text` (None at either end)."""
+    want = word.split()
+    toks = normalize.tokenize(text or '')
+    k = len(want)
+    return {(toks[i - 1] if i else None,
+             toks[i + k] if i + k < len(toks) else None)
+            for i in range(len(toks) - k + 1) if toks[i:i + k] == want}
+
+
+def _same_neighbour(a, b, before):
+    """Two neighbouring tokens agree; at a window's edge one may be cut
+    short (the end of the word before, the start of the word after)."""
+    if a == b:
+        return True
+    if a is None or b is None:
+        return False
+    return (a.endswith(b) or b.endswith(a)) if before else \
+        (a.startswith(b) or b.startswith(a))
+
+
+def _neighbours_agree(clean_text, occ, snippet, word):
+    """Does the copy at `occ` stand between the same words as a copy of the
+    word in the scan's snippet? Cheap evidence for the single-copy path,
+    where the line is identified by its words only."""
+    r = SNIPPET_RADIUS
+    here = _neighbours(clean_text[max(0, occ[2] - r):occ[3] + r], word)
+    then = _neighbours(snippet, word)
+    return any(_same_neighbour(p, q, True) and _same_neighbour(n, m, False)
+               for p, n in here for q, m in then)
+
+
+def _copies(text, word):
+    """How many times `word` (one token or several) occurs in `text`."""
+    want = word.split()
+    toks = normalize.tokenize(text or '')
+    return sum(1 for i in range(len(toks) - len(want) + 1)
+               if toks[i:i + len(want)] == want)
+
+
+def _clean_of(doc, n):
+    """``(clean_text, token set)`` of line `n`, cached while the line is
+    unchanged."""
+    line = doc.lines[n]
+    c = doc._clean.get(n)
+    if c is None or c[0] is not line:
+        cl = normalize.clean(line)
+        c = doc._clean[n] = (line, cl, frozenset(
+            normalize.TOKEN_RE.findall(cl)))
+    return c[1], c[2]
+
+
+def _cleans(doc):
+    """clean() of every line, computed once per document (apply_edits and
+    reverse_entries, the only writers of ``doc.lines``, drop it)."""
+    if doc._cleans is None or len(doc._cleans) != len(doc.lines):
+        doc._cleans = [normalize.clean(line) for line in doc.lines]
+    return doc._cleans
+
+
+NL = chr(10)
+
+
+def _lines_with(doc, lo, hi, text):
+    """Lines in ``[lo, hi)`` whose clean text contains `text`, in order: one
+    C-speed search over the window instead of a test per line."""
+    cleans = _cleans(doc)
+    win = NL.join(cleans[lo:hi])
+    if win.count(NL) != max(0, hi - lo - 1):
+        # an entity (&#10;) decoded to a newline: count lines one by one
+        return [n for n in range(lo, hi) if text in cleans[n]]
+    out, n, last = [], lo, 0
+    pos = win.find(text)
+    while pos >= 0:
+        n += win.count(NL, last, pos)
+        out.append(n)
+        last = win.find(NL, pos)
+        if last < 0:
+            break
+        n += 1
+        last += 1
+        pos = win.find(text, last)
+    return out
+
+
+def _candidates(doc, lineno, word, snippet, skip):
+    """Lines within DRIFT_WINDOW (except `skip`) that the snippet identifies,
+    as ``{level: [(n, occs, ident), ...]}``. Cheap prefilters keep this
+    affordable when a whole book is anchored at page load."""
+    out = {LEVEL_WINDOW: [], LEVEL_TOKENS: []}
+    parts = word.split()
+    if not parts:
+        return out
     lo = max(0, lineno - DRIFT_WINDOW)
     hi = min(len(doc.lines), lineno + DRIFT_WINDOW + 1)
-    hits = []
-    for n in range(lo, hi):
-        if n == lineno:
+    for n in _lines_with(doc, lo, hi, parts[0]):
+        if n == skip:
             continue
-        line = doc.lines[n]
-        if len(normalize.phrase_spans(line, word)) != 1:
+        cl, toks = _clean_of(doc, n)
+        # the word must be a token there, and the snippet must be on the
+        # line or at least most of its words
+        if not all(p in toks for p in parts) or (
+                snippet not in cl and not _snippet_identifies(toks, snippet)):
             continue
-        if not _snippet_identifies(line, snippet):
-            continue
-        hits.append(n)
-        if len(hits) > 1:
-            return None        # several candidates -> ambiguous, refuse
-    return hits[0] if len(hits) == 1 else None
+        occs, ident, level = _identify(doc.lines[n], word, snippet, doc)
+        if level:
+            out[level].append((n, occs, ident))
+    return out
 
 
-def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
+def _ambiguous_line(word, n, lines, fid):
+    return PatchError('ambiguous_line',
+                      _msg('ambiguous_line', word=word, n=n + 1), id=fid,
+                      candidate_lines=sorted(lines))
+
+
+def _locate_line(doc, lineno, word, snippet, fid, trusted=False):
+    """``(lineno, occs, ident, level, drifted)`` — the one line this finding
+    provably refers to, or a refusal.
+
+    An occurrence of the word at the old line number proves nothing: a line
+    inserted above shifts a DIFFERENT sentence that happens to contain the
+    word into that slot. So the line must be identified by the snippet; if it
+    is not, the finding is looked for nearby (unambiguous matches only).
+    ``trusted`` means the file is byte-identical to the bytes the scan read
+    (fingerprint and size recorded when the scan read them), so the line
+    number itself is evidence and identical twins nearby do not matter — but
+    only when the snippet window matches that line EXACTLY as well. A token-
+    level match there is a parallel verse as easily as the scanned one.
+    """
+    here = None
+    if lineno < len(doc.lines):
+        occs, ident, level = _identify(doc.lines[lineno], word, snippet,
+                                       doc)
+        if level:
+            here = (lineno, occs, ident, level, False)
+    if here is not None and not (trusted and here[3] == LEVEL_WINDOW):
+        # an identical twin nearby means the line number alone is deciding,
+        # and a line number is exactly what an insertion invalidates
+        twins = _candidates(doc, lineno, word, snippet, skip=lineno)
+        same = [c[0] for c in twins[here[3]]]
+        if here[3] == LEVEL_TOKENS:
+            same += [c[0] for c in twins[LEVEL_WINDOW]]
+        if same:
+            raise _ambiguous_line(word, lineno, [lineno] + same, fid)
+    if here is not None:
+        return here
+
+    if lineno < len(doc.lines) \
+            and not _occurrences(doc.lines[lineno], word, doc)[1] \
+            and _snippet_identifies(_clean_of(doc, lineno)[1], snippet):
+        # The scanned passage is still sitting where it was and only the
+        # word is gone (a human fixed it): never relocate onto a twin verse.
+        raise PatchError('token_not_found', _msg(
+            'token_not_found', word=word, n=lineno + 1), id=fid)
+
+    cands = (_candidates(doc, lineno, word, snippet, skip=lineno)
+             if snippet else {LEVEL_WINDOW: [], LEVEL_TOKENS: []})
+    strong = cands[LEVEL_WINDOW]
+    if len(strong) == 1:
+        # the scan's exact window around the word, on another line: the
+        # same sentence, moved
+        n, occs, ident = strong[0]
+        return n, occs, ident, LEVEL_WINDOW, True
+    if len(strong) > 1:
+        raise _ambiguous_line(word, lineno, [c[0] for c in strong], fid)
+    weak = cands[LEVEL_TOKENS]
+    if weak:
+        # Only most of the words are shared. When the scanned verse was
+        # deleted or moved out of reach, that is exactly what its parallel
+        # verse looks like, so nothing is relocated on it: a human may
+        # point at the word there, if it really is the same place.
+        raise PatchError('moved_unproven', _msg(
+            'moved_unproven', word=word, n=lineno + 1), id=fid,
+            candidate_lines=sorted(c[0] for c in weak))
+    if lineno >= len(doc.lines):
+        raise PatchError('line_gone', _msg('line_gone', n=lineno + 1),
+                         id=fid)
+    if not _occurrences(doc.lines[lineno], word, doc)[1]:
+        raise PatchError('token_not_found', _msg(
+            'token_not_found', word=word, n=lineno + 1), id=fid)
+    # the word is here, but nothing proves this is the scanned sentence
+    raise PatchError('line_mismatch', _msg('line_mismatch', word=word,
+                                           n=lineno + 1), id=fid)
+
+
+# geresh-like marks that end an abbreviation (ר' / וכו׳). Gershayim and double
+# quotes AFTER a word are closing quotation marks, never part of the word.
+_GERESH = "'’׳"
+
+
+# "(x) [" right before the span and "]" after it: the exact layout the fixer's
+# bracket mode writes, "(correction) [original]". A plain ketiv/qere pair,
+# "(הנער) [הנערה]", looks the same, while Otzaria's Tanach writes ketiv/qere
+# inside mam-kq spans or as "ketiv [qere]", neither of which matches here.
+def _bracket_opened(line, start):
+    """Where "(x) [" ending exactly at `start` begins, or None. Looked up
+    backwards from `start` alone, so a long line costs nothing per word."""
+    if start < 4 or line[start - 3:start] != ') [':
+        return None
+    k = line.rfind('(', 0, start - 3)
+    if k < 0 or any(c in line[k + 1:start - 3] for c in '()[]'):
+        return None
+    return k
+
+
+def _bare(text):
+    """Text compared without marks, spacing or a trailing geresh."""
+    return normalize.clean(text or '').strip().rstrip("'\"")
+
+
+def _bracket_origin(line, a, b, snippet, corrections, own_edits):
+    """Where ``line[a:b]`` — "(x) [word]" — came from: ``'record'`` or
+    ``'own'`` (the fixer's output), ``'later'`` (unexplained brackets that
+    came after the scan), or ``'scanned'`` (the book's own ketiv/qere).
+
+    The text alone cannot tell the fixer's output from a ketiv/qere pair,
+    and the two mistakes are not alike: taking a real pair for the fixer's
+    output only refuses a correction, while taking the fixer's output for a
+    pair nests brackets into it or overwrites the original half — data lost.
+    So every doubt counts as the fixer's, in this order:
+
+    1. a live record of the fixer that wrote this very text, on any line
+       and whatever its context now (lines move, and a hand edit next to
+       the brackets breaks the recorded context; a false match only
+       refuses) — ``'record'``;
+    2. the parenthesized text is what this finding writes, or the detector's
+       suggestion for it — ``'own'``. Bracket output keeps the original typo
+       inside "[...]", so every later scan flags it again, and a scan in a new
+       folder has no record of it. A ketiv equal to the correction is refused
+       here too: a refusal is the price of never nesting into the fixer's
+       brackets;
+    3. the layout is missing from the scan's snippet: brackets that came
+       after the scan with nothing to explain them — ``'later'``;
+    4. otherwise the pair was there when the book was scanned and no record
+       explains it — ``'scanned'``. It may be the book's own ketiv/qere, or
+       the fixer's output with a custom correction scanned again in a new
+       folder (a custom correction can be anything, so the text cannot rule
+       it out). plan_edit refuses it, and corrects it only when a human
+       points at the word.
+    """
+    text = line[a:b]
+    for e, _at in own_edits or ():
+        if e.get('new') == text:
+            return 'record'
+    paren = _bare(text[1:text.index(') [')])
+    if paren and any(paren == _bare(c) for c in corrections if c):
+        return 'own'
+    layout = normalize.clean(text).strip()
+    if not (snippet and layout and layout in snippet):
+        return 'later'
+    return 'scanned'
+
+
+def _as_scanned(line, lineno, own_edits):
+    """The line with the fixer's own live edits on it undone: as the scan
+    saw it, as far as the fixer had a hand in it. ``own_edits`` holds
+    ``(entry, (lineno, pos) or None)`` pairs (see :func:`_located`).
+
+    Returns ``(text, undone)`` with each undone edit as ``(now_start,
+    now_end, then_start, then_end)``. An edit no longer found where its
+    record says (edited around by hand since) is left as it is: wherever it
+    matters, the exact checks made on the result then fail, which is the
+    point. None when two records overlap — nothing is proven then.
+    """
+    found = []
+    for e, at in own_edits or ():
+        if at is not None and at[0] == lineno:
+            found.append((at[1], at[1] + len(e.get('new') or ''),
+                          e.get('old') or ''))
+    if not found:
+        return line, []            # the very string: its spans are cached
+    found.sort()
+    parts, undone, prev, then = [], [], 0, 0
+    for a, b, old in found:
+        if a < prev:
+            return None
+        parts.append(line[prev:a])
+        then += a - prev
+        undone.append((a, b, then, then + len(old)))
+        parts.append(old)
+        then += len(old)
+        prev = b
+    parts.append(line[prev:])
+    return ''.join(parts), undone
+
+
+def _scanner_skips(text, clean_text, occ, word, finding, doc=None):
+    """Would the scan have passed over this copy without a finding? The
+    same rules as core.locate_line, on the same clean text (a join of two
+    words, which needs the lexicon, is not modelled: such a copy is
+    counted, and a count that then disagrees refuses)."""
+    if len(word.split()) != 1:
+        return False                 # a split word is not reported per token
+    s, e = occ[2], occ[3]
+    if core._editorial_adjacent(clean_text, s, e):
+        return True
+    errtype = finding.get('errtype')
+    if (e < len(clean_text) and clean_text[e] == ')'
+            and errtype == 'edit1_ins'
+            and (finding.get('suggestion') or '') == word[:-1]
+            and word[-1] in core.NUMERAL_LETTERS):
+        depth = 0                    # a footnote marker unless '(' is open
+        for ch in clean_text[:e]:
+            if ch == '(':
+                depth += 1
+            elif ch == ')' and depth:
+                depth -= 1
+        if not depth:
+            return True
+    if errtype in ('missing_space', 'final_midword'):
+        return False
+    info = _line_info(doc, text)
+    k = info.index_at(s)
+    return k is not None and any(
+        0 <= k - j and info.spans[k - j][0] in core.NAME_TRIGGERS
+        for j in (1, 2))
+
+
+def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
+    """Index in `spans` (the copies of `word` on the line now) of the copy
+    the finding means, chosen by the scan's order — and proven, or refused.
+
+    Counting the copies that are left proves nothing: a copy fixed by hand
+    and another one typed in keep the count while shifting every copy after
+    them. So the line is rebuilt as the scan saw it (the fixer's own edits on
+    it undone); there the word must occur as often as the scan counted, and
+    the copy at the finding's place in that order must have the scan's
+    snippet window EXACTLY. Only then is it mapped back onto the line as it
+    is now. Anything less is refused, with the copies offered for a click.
+    """
+    fid = finding.get('id')
+    expected = finding.get('expected_count')
+    occurrence = finding.get('occurrence') or 0
+    snippet = finding.get('snippet')
+
+    def refuse(code):
+        raise PatchError(code, _msg(code, word=word, n=lineno + 1,
+                                    k=len(spans)),
+                         id=fid, candidates=[[s[0], s[1]] for s in spans],
+                         located_line=lineno)
+
+    rebuilt = _as_scanned(line, lineno, own_edits)
+    if rebuilt is None:
+        refuse('ambiguous_occurrence')
+    then, undone = rebuilt
+    clean_then, occs = _occurrences(then, word, doc)
+    # the scan numbered only the copies it reports; one it skips (after a
+    # title, before a geresh, next to a bracket) has no finding and no
+    # number, so it must not be counted — the exact window below is still
+    # what proves the copy
+    occs = [o for o in occs if not _scanner_skips(then, clean_then, o, word,
+                                                 finding, doc)]
+    if expected is not None and expected != len(occs):
+        refuse('occurrence_count_changed')
+    if not 0 <= occurrence < len(occs):
+        refuse('ambiguous_occurrence')
+    o, r = occs[occurrence], SNIPPET_RADIUS
+    if not snippet or \
+            clean_then[max(0, o[2] - r):o[3] + r].strip() != snippet:
+        refuse('ambiguous_occurrence')
+    shift = 0
+    for a, b, ta, tb in undone:
+        if tb <= o[0]:
+            shift += (b - a) - (tb - ta)
+        elif ta < o[1]:
+            # the fixer already rewrote this very copy (for another finding)
+            raise PatchError('already_applied', _msg(
+                'already_applied', n=lineno + 1), id=fid)
+    hit = [i for i, s in enumerate(spans)
+           if (s[0], s[1]) == (o[0] + shift, o[1] + shift)]
+    if len(hit) != 1:
+        refuse('ambiguous_occurrence')
+    return hit[0]
+
+
+def manual_lines(doc, finding):
+    """The lines on which a human may point at this finding's word: the
+    located line, or the snippet-identified candidates of an ambiguous one.
+    Empty when no line is identified — a click cannot supply that proof."""
+    lineno = finding.get('lineno')
+    word = (finding.get('word') or '').strip()
+    if lineno is None or lineno < 0 or not word:
+        return []
+    try:
+        return [_locate_line(doc, lineno, word, finding.get('snippet'),
+                             finding.get('id'),
+                             finding.get('trusted', False))[0]]
+    except PatchError as e:
+        return list(e.extra.get('candidate_lines') or [])
+
+
+def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
+              check_vocalization=True, own_edits=None):
     """Verify one finding against the file and return an :class:`EditPlan`.
 
-    ``finding`` is a dict with ``id, unit/lineno, word, correction`` and the
-    server-computed ``occurrence``/``expected_count``. ``explicit`` is an
+    ``finding`` is a dict with ``id, lineno, word, correction, snippet`` and
+    the server-computed ``occurrence``/``expected_count``. ``explicit`` is an
     ``(start, end)`` pair supplied only when the human pointed at the word
     themselves, which resolves an ambiguity that the automatic rules refused.
+    ``own_edits`` are this book's live recorded edits (file_edits detail
+    entries): proof of which text in the file is the fixer's own output.
     """
     fid = finding.get('id')
     lineno = finding.get('lineno')
     word = (finding.get('word') or '').strip()
     correction = (finding.get('correction') or '').strip()
+    own_edits = _located(doc, own_edits)
     if not correction:
         raise PatchError('no_correction', _msg('no_correction'), id=fid)
+    if '\n' in correction or '\r' in correction:
+        raise PatchError('bad_correction', _msg('bad_correction'), id=fid)
     if not word:
         raise PatchError('token_not_found', _msg(
             'token_not_found', word='', n=(lineno or 0) + 1), id=fid)
@@ -439,29 +978,21 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
         raise PatchError('line_gone', _msg(
             'line_gone', n=(lineno or 0) + 1), id=fid)
 
-    # The book may have been edited since the scan — lines inserted or removed
-    # shift every finding below them. Rather than refuse everything (which
-    # would force a full re-scan for one added line), look for the line the
-    # finding drifted to. _find_drifted_line only accepts an unambiguous,
-    # snippet-corroborated match, so a failure to relocate still refuses.
-    drifted = False
-    if lineno >= len(doc.lines) or not normalize.phrase_spans(
-            doc.lines[lineno], word):
-        moved = None
-        if explicit is None:
-            moved = _find_drifted_line(doc, lineno, word,
-                                       finding.get('snippet'))
-        if moved is None:
-            if lineno >= len(doc.lines):
-                raise PatchError('line_gone', _msg(
-                    'line_gone', n=lineno + 1), id=fid)
-        else:
-            lineno, drifted = moved, True
-
-    line = doc.lines[lineno]
-    spans = normalize.phrase_spans(line, word)
-
+    drifted = copy_moved = False
     if explicit is not None:
+        # A human click resolves WHICH occurrence, never WHICH sentence: it is
+        # only accepted on a line the snippet identifies.
+        allowed = manual_lines(doc, finding)
+        want = finding.get('explicit_lineno')
+        if want is None and len(allowed) == 1:
+            want = allowed[0]
+        if want is None or want not in allowed:
+            raise PatchError('line_mismatch', _msg(
+                'line_mismatch', word=word, n=lineno + 1), id=fid,
+                manual_lines=allowed)
+        lineno = want
+        line = doc.lines[lineno]
+        spans = _occurrences(line, word, doc)[1]
         start, end = explicit
         if not (0 <= start < end <= len(line)):
             raise PatchError('bad_offsets', _msg('bad_offsets'), id=fid)
@@ -469,41 +1000,79 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
         if normalize.clean(line[start:end]).strip() != word:
             raise PatchError('token_not_found', _msg(
                 'token_not_found', word=word, n=lineno + 1), id=fid)
+        # a click on the letters alone still takes the word's trailing marks
+        end = normalize.mark_end(line, end)
         occurrence = next((i for i, s in enumerate(spans)
-                           if s[1] == start and s[2] == end), -1)
+                           if s[0] == start and s[1] == end), -1)
         total = len(spans)
         confidence = 'manual'
     else:
+        lineno, spans, ident, level, drifted = _locate_line(
+            doc, lineno, word, finding.get('snippet'), fid,
+            finding.get('trusted', False))
+        line = doc.lines[lineno]
         total = len(spans)
-        if total == 0:
-            raise PatchError('token_not_found', _msg(
-                'token_not_found', word=word, n=lineno + 1), id=fid)
-        expected = finding.get('expected_count')
-        occurrence = finding.get('occurrence') or 0
-        # A changed count means the line is not the line the finding was made
-        # against — someone edited it in between. This is checked BEFORE the
-        # single-candidate shortcut on purpose: if the scan saw two copies of
-        # the word and only one is left, the survivor is not necessarily the
-        # one this finding meant, and "there is only one now" is exactly the
-        # kind of reasoning that silently corrects the wrong occurrence.
-        if expected is not None and expected != total:
-            raise PatchError(
-                'occurrence_count_changed',
-                _msg('occurrence_count_changed', word=word, n=lineno + 1),
-                id=fid,
-                candidates=[[s[1], s[2]] for s in spans])
-        if total == 1:
-            occurrence, confidence = 0, 'exact'
+        if level == LEVEL_WINDOW and len(ident) == 1 \
+                and _copies(finding.get('snippet'), word) == 1:
+            # The window pins the occurrence, whatever else changed — when
+            # the window holds this one copy only. A window holding several
+            # copies can equal the snippet around ANOTHER of them once the
+            # line shifts: on a short line every window is clipped at the
+            # line's ends, so a word typed at the start makes the last
+            # copy's window equal the old whole line. Then the scan's order
+            # must decide, with proof (_scanned_copy).
+            occurrence, confidence = ident[0], 'exact'
+        elif total == 1 and finding.get('expected_count') in (None, 1):
+            # the one copy, on a line identified by its words: as scanned —
+            # if it still stands between the words it stood between. A
+            # copy fixed by hand and the typo typed again elsewhere leaves
+            # one copy too, on a line that still shares the words.
+            # (Refused below, after the bracket checks: the fixer's own
+            # brackets around the copy change its neighbours too.)
+            copy_moved = not _neighbours_agree(
+                _line_info(doc, line).clean, spans[0],
+                finding.get('snippet'), word)
+            occurrence, confidence = 0, 'weak'
         else:
-            if not (0 <= occurrence < total):
-                raise PatchError(
-                    'ambiguous_occurrence',
-                    _msg('ambiguous_occurrence', word=word, n=lineno + 1,
-                         k=total),
-                    id=fid,
-                    candidates=[[s[1], s[2]] for s in spans])
+            # Several copies to choose from (on a short line every window is
+            # the whole line), or copies gone or added since the scan: only
+            # the scan's own order can choose, and only with proof.
+            occurrence = _scanned_copy(line, lineno, word, finding, spans,
+                                       own_edits, doc)
             confidence = 'indexed'
-        start, end = spans[occurrence][1], spans[occurrence][2]
+        start, end = spans[occurrence][0], spans[occurrence][1]
+
+    close = end + 1 if line[end:end + 1] and line[end] in _GERESH else end
+    opened = _bracket_opened(line, start)
+    if opened is not None and line[close:close + 1] == ']':
+        origin = _bracket_origin(
+            line, opened, close + 1, finding.get('snippet'),
+            (correction, finding.get('suggestion')), own_edits)
+        if origin in ('record', 'own'):
+            raise PatchError('already_applied', _msg('already_applied',
+                                                     n=lineno + 1), id=fid)
+        if origin == 'later':
+            raise PatchError('already_bracketed', _msg(
+                'already_bracketed', word=word, n=lineno + 1), id=fid)
+        if explicit is None:
+            # no record: the fixer's own output, written with a correction
+            # of the user's, reads exactly like a ketiv/qere pair
+            raise PatchError('bracket_unproven', _msg(
+                'bracket_unproven', word=word, n=lineno + 1), id=fid,
+                candidates=[[start, end]], located_line=lineno)
+    if copy_moved:
+        raise PatchError('copy_moved', _msg(
+            'copy_moved', word=word, n=lineno + 1), id=fid,
+            candidates=[[s[0], s[1]] for s in spans], located_line=lineno)
+
+    # A trailing geresh belongs to the abbreviation. It stays attached to the
+    # correction; a correction that brings its own replaces it (never two).
+    if end < len(line) and line[end] in _GERESH:
+        if correction[-1] in _GERESH:
+            end += 1
+        elif mode == MODE_BRACKET:
+            correction += line[end]
+            end += 1
 
     old_raw = line[start:end]
     # A word can span markup: ויל<big>ך</big> tokenizes to the single token
@@ -517,22 +1086,36 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None):
         raise PatchError('word_spans_markup',
                          _msg('word_spans_markup', word=word,
                               n=lineno + 1), id=fid)
-    if confidence != 'manual' and not _snippet_supports(
-            line, finding.get('snippet')):
-        confidence = 'weak'
+    # Nikud is never invented: a plain correction would silently de-vocalize a
+    # vocalized word, so replace mode needs a vocalized correction (or brackets).
+    needs_voc = (mode == MODE_REPLACE and normalize.has_marks(old_raw)
+                 and not normalize.has_marks(correction))
+    if needs_voc and check_vocalization:
+        raise PatchError('needs_vocalization',
+                         _msg('needs_vocalization', word=word, n=lineno + 1),
+                         id=fid)
     if drifted:
         # the line moved since the scan; the corrector should be told, even
         # though the match itself was corroborated
         confidence = 'moved'
-    plan = EditPlan(fid, lineno, start, end, old_raw,
-                    render_replacement(mode, old_raw, correction), mode,
+    new_text = render_replacement(mode, old_raw, correction)
+    try:
+        new_text.encode(doc.encoding)
+    except UnicodeEncodeError:
+        # a cp1255 book cannot hold teamim (or any character outside its
+        # code page): refuse in Hebrew here, not with a codec error later
+        raise PatchError('unencodable', _msg(
+            'unencodable', word=word, n=lineno + 1, enc=doc.encoding),
+            id=fid)
+    plan = EditPlan(fid, lineno, start, end, old_raw, new_text, mode,
                     occurrence, total, confidence, '<' in old_raw)
     plan.drifted = drifted
+    plan.needs_vocalization = needs_voc
     return plan
 
 
 def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
-             explicit=None):
+             explicit=None, own_edits=None):
     """Plan every edit, collecting failures instead of raising on the first.
 
     Returns ``(plans, failures)``. The caller writes ONLY when `failures` is
@@ -541,11 +1124,12 @@ def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
     modes = modes or {}
     explicit = explicit or {}
     plans, failures = [], []
+    own_edits = _located(doc, own_edits)
     for f in findings:
         fid = f.get('id')
         try:
             plans.append(plan_edit(doc, f, modes.get(fid, default_mode),
-                                   explicit.get(fid)))
+                                   explicit.get(fid), own_edits=own_edits))
         except PatchError as e:
             failures.append(dict({'id': fid, 'code': e.code,
                                   'message': str(e)}, **e.extra))
@@ -571,6 +1155,10 @@ def _overlaps(plans):
     return out
 
 
+# characters of context recorded on each side of a written span
+CTX_CHARS = 24
+
+
 def apply_edits(doc, plans):
     """Splice every plan into ``doc.lines``.
 
@@ -589,8 +1177,156 @@ def apply_edits(doc, plans):
         for p in sorted(group, key=lambda p: p.start, reverse=True):
             line = line[:p.start] + p.new_text + line[p.end:]
         doc.lines[lineno] = line
+        doc._clean.pop(lineno, None)
+        doc._cleans = None
+        delta = 0
+        for p in sorted(group, key=lambda p: p.start):
+            p.post_start = ps = p.start + delta
+            delta += len(p.new_text) - (p.end - p.start)
+            pe = ps + len(p.new_text)
+            p.ctx_l = line[max(0, ps - CTX_CHARS):ps]
+            p.ctx_r = line[pe:pe + CTX_CHARS]
         changed.append(lineno)
     return changed
+
+
+# ---------------------------------------------------------------------------
+# recorded edits: idempotency and span-level undo
+# ---------------------------------------------------------------------------
+
+def _post_starts(entries):
+    """Fill ``post_start`` for records written before it was stored, from the
+    pre-edit offsets of the edits that shared each line."""
+    by_line = {}
+    for e in entries:
+        by_line.setdefault(e.get('lineno'), []).append(e)
+    for group in by_line.values():
+        delta = 0
+        for e in sorted(group, key=lambda e: e.get('start') or 0):
+            if e.get('post_start') is None and e.get('start') is not None:
+                e['post_start'] = e['start'] + delta
+            delta += len(e.get('new') or '') - (
+                (e.get('end') or 0) - (e.get('start') or 0))
+    return entries
+
+
+def _locate_entry(line, e):
+    """Where the recorded new text sits now, verified by its context; None
+    when it cannot be pinned down unambiguously."""
+    new, ps = e.get('new') or '', e.get('post_start')
+    cl, cr = e.get('ctx_l'), e.get('ctx_r')
+    if ps is None or cl is None or cr is None or not new:
+        return None
+    if ps >= len(cl) and line[ps - len(cl):ps + len(new) + len(cr)] \
+            == cl + new + cr:
+        return ps
+    # a later edit on the same line shifted it: accept a unique match
+    needle = cl + new + cr
+    hits = [m.start() for m in re.finditer(re.escape(needle), line)]
+    return hits[0] + len(cl) if len(hits) == 1 else None
+
+
+def locate_entries(doc, entries):
+    """Where each recorded edit sits now: ``(lineno, pos)`` or None, in
+    the order of `entries`.
+
+    Its recorded line is only a hint: lines inserted or removed above an
+    edit since it was written move it. So an entry not found on its own
+    line (by its text and context, :func:`_locate_entry`) is looked for in
+    the whole book, and accepted only where its text with its context
+    occurs exactly once, at a place no other entry holds or also found.
+    A twin line with the same text is therefore a refusal, never a guess.
+    """
+    out, claimed, lost = [None] * len(entries), set(), []
+    for i, e in enumerate(entries):
+        n = e.get('lineno')
+        if isinstance(n, int) and 0 <= n < len(doc.lines):
+            pos = _locate_entry(doc.lines[n], e)
+            if pos is not None:
+                out[i] = (n, pos)
+                claimed.add(out[i])
+                continue
+        lost.append(i)
+    if not lost:
+        return out
+    joined = NL.join(doc.lines)
+    starts, at = [], 0
+    for line in doc.lines:
+        starts.append(at)
+        at += len(line) + 1
+    found = {}
+    for i in lost:
+        e = entries[i]
+        new, cl, cr = e.get('new') or '', e.get('ctx_l'), e.get('ctx_r')
+        if not new or cl is None or cr is None or e.get('post_start') is None:
+            continue
+        needle = cl + new + cr
+        if NL in needle:
+            continue
+        j = joined.find(needle)
+        if j < 0 or joined.find(needle, j + 1) >= 0:
+            continue
+        n = bisect.bisect_right(starts, j) - 1
+        found.setdefault((n, j - starts[n] + len(cl)), []).append(i)
+    for place, who in found.items():
+        # two records whose text and context are the same (the fixer's
+        # output on twin lines) cannot tell which place is whose
+        if len(who) == 1 and place not in claimed:
+            out[who[0]] = place
+    return out
+
+
+class _Located(list):
+    """``[(entry, (lineno, pos) or None), ...]``: recorded edits with where
+    each sits now, located once for every finding planned against a doc."""
+
+
+def _located(doc, own_edits):
+    if isinstance(own_edits, _Located):
+        return own_edits
+    entries = [e for e in own_edits or () if isinstance(e, dict)]
+    return _Located(zip(entries, locate_entries(doc, entries)))
+
+
+def entry_in_place(doc, e):
+    """Is this recorded (live) edit still visibly applied in `doc`?"""
+    return locate_entries(doc, [e])[0] is not None
+
+
+def reverse_entries(doc, entries, others=()):
+    """Put each recorded edit's original text back, touching nothing else.
+
+    Every span must still hold exactly what was written, with the same
+    context on both sides, wherever its line has moved to
+    (:func:`locate_entries`; `others` are the book's other live records,
+    whose places are not up for grabs); if any one is not found, nothing
+    is changed and ``file_changed_since_edit`` is raised.
+    """
+    entries = _post_starts([dict(e) for e in entries])
+    others = [dict(e) for e in others or () if isinstance(e, dict)]
+    where = locate_entries(doc, entries + others)[:len(entries)]
+    by_line = {}
+    for e, at in zip(entries, where):
+        if at is None:
+            raise PatchError('file_changed_since_edit',
+                             _msg('file_changed_since_edit'))
+        by_line.setdefault(at[0], []).append((at[1], e))
+    new_lines = {}
+    for n, located in by_line.items():
+        line = doc.lines[n]
+        located.sort(key=lambda x: x[0], reverse=True)
+        for i in range(1, len(located)):
+            if located[i][0] + len(located[i][1]['new']) > located[i - 1][0]:
+                raise PatchError('file_changed_since_edit',
+                                 _msg('file_changed_since_edit'))
+        for pos, e in located:
+            line = line[:pos] + e['old'] + line[pos + len(e['new']):]
+        new_lines[n] = line
+    for n, line in new_lines.items():
+        doc.lines[n] = line
+        doc._clean.pop(n, None)
+        doc._cleans = None
+    return sorted(new_lines)
 
 
 # ---------------------------------------------------------------------------
@@ -598,61 +1334,112 @@ def apply_edits(doc, plans):
 # ---------------------------------------------------------------------------
 
 def backup_path(outdir, path):
-    """A backup name that keeps same-named books apart.
+    """A backup name that keeps same-named books AND same-second writes apart.
 
     The stem alone is not unique — 'פרק א' names 35 different books — so the
-    path's hash is part of the filename.
+    path's hash is part of the filename; microseconds plus a random suffix
+    keep two backups of one book taken in the same second apart.
     """
     bdir = os.path.join(outdir, FIXER_BACKUP_DIR)
     stem = os.path.splitext(os.path.basename(path))[0]
     safe = re.sub(r'[^\w.\- ]+', '_', stem)[:60] or 'book'
     tag = hashlib.sha256(os.path.abspath(path).encode('utf-8')).hexdigest()[:8]
-    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-    return os.path.join(bdir, '%s.%s.%s.bak' % (safe, ts, tag))
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    name = '%s.%s.%s.%s.bak' % (safe, ts, tag, uuid.uuid4().hex[:8])
+    return contained_path(os.path.join(bdir, name), bdir, 'bad_backup')
 
 
-def write_doc(doc, outdir):
-    """Back the file up, then replace it atomically.
+def temp_path_for(path):
+    """A temp name next to `path` (os.replace is atomic only within one
+    filesystem) that no other thread or process will pick."""
+    return '%s.%s.tmp' % (path, uuid.uuid4().hex)
 
-    Order matters: the backup is taken FIRST, so any later failure — a locked
-    file, a full disk, a crash — leaves the user with both the untouched
-    original and a copy. The new text goes to a temp file in the same
-    directory (``os.replace`` is only atomic within one filesystem), is
-    fsynced, and only then replaces the original, so no reader ever observes a
-    half-written book.
-    """
-    bpath = backup_path(outdir, doc.path)
-    os.makedirs(os.path.dirname(bpath), exist_ok=True)
-    shutil.copy2(doc.path, bpath)          # PermissionError -> 423 upstream
 
-    data = doc.encode()
-    tmp = '%s.%d.tmp' % (doc.path, os.getpid())
+def _write_new(path, data):
+    """Create `path` exclusively and make its bytes durable."""
+    with open(path, 'xb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def write_backup(outdir, path, data):
+    """Store `data` (the book as it is before a write) under a fresh backup
+    name; returns ``(backup_path, sha)``."""
+    for _ in range(5):
+        bpath = backup_path(outdir, path)
+        try:
+            os.makedirs(os.path.dirname(bpath), exist_ok=True)
+            _write_new(bpath, data)
+            return bpath, fingerprint_bytes(data)
+        except FileExistsError:
+            continue
+        except PermissionError as e:
+            raise denied_folder(os.path.dirname(bpath)) from e
+    raise FileExistsError(bpath)
+
+
+# temp files are only alive for the length of one write
+STALE_TEMP_SECONDS = 600
+
+
+def _clean_stale_temps(path, max_age=STALE_TEMP_SECONDS):
+    """Remove this book's own temp files that a crash left behind: those
+    older than `max_age` seconds, or all of them with ``max_age=0`` — which
+    only a holder of the book's lock may ask for: every writer of these
+    files holds it, so then none of them is still being written."""
+    d, base = os.path.split(path)
+    pat = re.compile(re.escape(base) + r'\.[0-9a-f]{32}\.tmp$')
     try:
-        with open(tmp, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, doc.path)
-    except BaseException:
+        names = os.listdir(d or '.')
+    except OSError:
+        return
+    now = datetime.now().timestamp()
+    for n in names:
+        if pat.match(n):
+            full = os.path.join(d, n)
+            try:
+                if max_age <= 0 or now - os.path.getmtime(full) > max_age:
+                    os.remove(full)
+            except OSError:
+                pass
+
+
+def atomic_write(path, data):
+    """Temp file in the same directory, fsync, then ``os.replace``: a reader
+    sees the old book or the new one, never half of either."""
+    _clean_stale_temps(path)
+    tmp = temp_path_for(path)
+    placed = False
+    try:
+        _write_new(tmp, data)
+        placed = True
+        os.replace(tmp, path)
+    except BaseException as e:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
+        if isinstance(e, PermissionError) and not isinstance(e, AccessDenied):
+            # the raw error names the temp file, in English; say what it means
+            if placed:
+                raise denied_file(path) from e        # locked or read-only
+            raise denied_folder(os.path.dirname(path) or '.') from e
+        if isinstance(e, OSError) and not isinstance(e, AccessDenied) \
+                and not placed and name_too_long(tmp):
+            raise denied_long(path) from e
         raise
-    doc.raw = doc.text()
-    doc.fingerprint = fingerprint_bytes(data)
-    return {'backup': bpath, 'fingerprint': doc.fingerprint,
-            'bytes': len(data)}
+    return fingerprint_bytes(data)
 
 
-def restore_backup(outdir, backup, path, expect_fingerprint=None):
-    """Put a backup back, refusing if the file changed after we wrote it.
+# There is deliberately no "write this doc" or "restore this backup" helper
+# here: a write that skipped the book's lock and its journal would reopen the
+# lost-update and no-undo holes. fixer_api._write_journaled is the only writer.
 
-    If the corrector edited the book by hand since the fix was applied,
-    restoring would destroy that work, so a fingerprint mismatch refuses
-    instead.
-    """
+
+def backup_file(outdir, backup):
+    """Absolute path of a backup NAME, refusing anything outside the dir."""
     base = os.path.basename(backup)
     if not _BACKUP_RE.match(base):
         raise PatchError('bad_backup', _msg('bad_backup'))
@@ -660,23 +1447,17 @@ def restore_backup(outdir, backup, path, expect_fingerprint=None):
     full = os.path.abspath(os.path.join(bdir, base))
     if os.path.dirname(full) != bdir or not os.path.isfile(full):
         raise PatchError('backup_missing', _msg('backup_missing'))
-    if not os.path.isfile(path):
-        raise PatchError('not_a_file', _msg('not_a_file', path=path))
-    if expect_fingerprint and fingerprint(path) != expect_fingerprint:
-        raise PatchError('file_changed_since_edit',
-                         _msg('file_changed_since_edit'))
-    tmp = '%s.%d.tmp' % (path, os.getpid())
-    try:
-        shutil.copyfile(full, tmp)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        raise
-    return {'restored': path, 'fingerprint': fingerprint(path)}
+    return full
+
+
+def read_backup(outdir, backup, expect_sha=None):
+    """A backup's bytes, verified against the hash recorded when it was
+    taken — a truncated or replaced backup is never restored."""
+    with open(backup_file(outdir, backup), 'rb') as f:
+        data = f.read()
+    if expect_sha and fingerprint_bytes(data) != expect_sha:
+        raise PatchError('backup_corrupt', _msg('backup_corrupt'))
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -703,24 +1484,42 @@ def assign_occurrences(rows):
     return rows
 
 
-def anchor_rows(doc, rows):
+def anchor_rows(doc, rows, applied=None):
     """Attach an ``anchor`` to each row: where it points, or why it does not.
 
     Computed on the SERVER for every row at load time, so the browser never
-    invents an offset — it can only echo one back.
+    invents an offset — it can only echo one back. ``applied`` maps a finding
+    id to its live recorded edit, so an already-written finding is shown as
+    such instead of being re-anchored inside its own correction.
     """
+    applied = applied or {}
+    own = _located(doc, list(applied.values()))
+    where = {id(e): at for e, at in own}
     for r in rows:
+        e = applied.get(r.get('id'))
+        at = where.get(id(e)) if e is not None else None
+        if at is not None:
+            r['anchor'] = {'ok': False, 'code': 'already_applied',
+                           'message': _msg('already_applied', n=at[0] + 1),
+                           'manual_lines': []}
+            r['lineno'] = at[0]
+            continue
         try:
             plan = plan_edit(doc, {
                 'id': r.get('id'), 'lineno': r.get('lineno'),
                 'word': r.get('word'),
                 'correction': r.get('correction') or r.get('word'),
+                'suggestion': r.get('suggestion'),
                 'snippet': r.get('snippet'),
                 'occurrence': r.get('occurrence'),
-                'expected_count': r.get('expected_count')})
+                'expected_count': r.get('expected_count'),
+                'errtype': r.get('errtype'),
+                'trusted': r.get('trusted', False)},
+                check_vocalization=False, own_edits=own)
             r['anchor'] = {'ok': True, 'start': plan.start, 'end': plan.end,
                            'confidence': plan.confidence,
                            'spans_markup': plan.spans_markup,
+                           'needs_vocalization': plan.needs_vocalization,
                            'total_occurrences': plan.total,
                            'moved_from': (r.get('lineno')
                                           if plan.drifted else None)}
@@ -730,6 +1529,15 @@ def anchor_rows(doc, rows):
         except PatchError as e:
             r['anchor'] = dict({'ok': False, 'code': e.code,
                                 'message': str(e)}, **e.extra)
+            # the pane must show the line the refusal is ABOUT, and offer a
+            # click only where the snippet identified the sentence
+            lines = e.extra.get('candidate_lines')
+            if e.extra.get('located_line') is not None:
+                lines = [e.extra['located_line']]
+            lines = list(lines or [])
+            r['anchor']['manual_lines'] = lines
+            if lines and r.get('lineno') not in lines:
+                r['lineno'] = lines[0]
     return rows
 
 

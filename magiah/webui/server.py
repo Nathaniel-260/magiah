@@ -7,7 +7,6 @@ returns a simple Hebrew placeholder page). All user-facing messages are in
 Hebrew; every response is UTF-8.
 """
 import json
-import mimetypes
 import os
 import sys
 import threading
@@ -16,7 +15,8 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, export, fixer_api, hebrew, patcher, scanner
+from . import (db, export, fixer_api, hebrew, patcher, result_status,
+               scanner)
 
 
 def _static_dir():
@@ -40,6 +40,21 @@ def _static_dir():
 
 
 STATIC_DIR = _static_dir()
+
+# Content types of the files the UI ships, by extension. A fixed table rather
+# than mimetypes.guess_type: on Windows that reads the registry, where a
+# misconfigured machine serves .js as text/plain and the page will not load,
+# and the header is then never built from anything a request supplied.
+_STATIC_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+    '.woff2': 'font/woff2',
+}
 
 PLACEHOLDER = '''<!DOCTYPE html>
 <html lang="he" dir="rtl"><head><meta charset="utf-8">
@@ -88,12 +103,29 @@ class Handler(BaseHTTPRequestHandler):
         body.update(exc.extra or {})
         self._json(body, 409 if exc.code in patcher.CONFLICT_CODES else 400)
 
+    def _permission_error(self, exc):
+        """423, always in Hebrew. An error this program raised carries its
+        own Hebrew message (a locked decisions.db or export file, the fixer's
+        AccessDenied); one the OS raised reads "[WinError 5] Access is
+        denied: '...tmp'", so it is replaced, keeping the path it names."""
+        if exc.errno is None and str(exc):
+            body = {'error': str(exc)}
+            if getattr(exc, 'code', None):
+                body['code'] = exc.code
+        else:
+            path = exc.filename2 or exc.filename
+            body = {'error': hebrew.FIXER_MESSAGES['access_denied'].format(
+                path=path) if path else hebrew.FIXER_MESSAGES['locked'],
+                'code': 'access_denied'}
+        self._json(body, 423)
+
     def _static(self, relpath):
         if relpath in ('', '/'):
             relpath = 'index.html'
         path = os.path.normpath(os.path.join(STATIC_DIR, relpath))
         base = os.path.normpath(STATIC_DIR)
-        if path != base and not path.startswith(base + os.sep):
+        # strictly inside: the static folder itself is no file to serve
+        if not path.startswith(base + os.sep):
             self._error(hebrew.MESSAGES['not_found'], 404)
             return
         if not os.path.isfile(path):
@@ -103,10 +135,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._error(hebrew.MESSAGES['not_found'], 404)
             return
-        ctype = mimetypes.guess_type(path)[0] or 'application/octet-stream'
-        if ctype.startswith('text/') or ctype in (
-                'application/javascript', 'application/json'):
-            ctype += '; charset=utf-8'
+        ctype = _STATIC_TYPES.get(os.path.splitext(path)[1].lower(),
+                                  'application/octet-stream')
         with open(path, 'rb') as f:
             self._send(200, f.read(), ctype)
 
@@ -123,6 +153,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        # an empty cursor means "first keyset page", not "no cursor"
+        if 'cursor' in urllib.parse.parse_qs(url.query,
+                                             keep_blank_values=True):
+            q.setdefault('cursor', '')
         path = url.path
         try:
             if not path.startswith('/api/'):
@@ -171,6 +205,8 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
         except patcher.PatchError as e:
             self._patch_error(e)
+        except PermissionError as e:
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -179,14 +215,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_get(self, path, q, con):
         if path == '/api/meta':
-            self._json(db.get_meta(con))
+            self._json(db.get_meta(con, self.outdir))
         elif path == '/api/books':
             books = db.get_books(con, q.get('origin'), q.get('q'))
             self._json({'books': books, 'rows': books, 'total': len(books)})
         elif path == '/api/findings':
             filters = {k: q.get(k) for k in
-                       ('origin', 'book', 'errtype', 'status', 'verified',
-                        'min_rank', 'q')}
+                       ('origin', 'book', 'book_key', 'errtype', 'status',
+                        'verified', 'min_rank', 'q', 'ids')}
+            if 'cursor' in q:
+                # keyset paging (card queue): stable under status changes
+                rows, total, nxt = db.query_findings_page(
+                    con, filters, sort=q.get('sort', 'rank'),
+                    direction=q.get('dir', ''),
+                    page_size=q.get('page_size', 50),
+                    cursor=q.get('cursor'), seed=q.get('seed'),
+                    with_total=q.get('total') == '1')
+                self._json({'rows': rows, 'total': total,
+                            'next_cursor': nxt})
+                return
             rows, total = db.query_findings(
                 con, filters, sort=q.get('sort', 'rank'),
                 direction=q.get('dir', ''), page=q.get('page', 1),
@@ -211,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(db.get_stats(con))
         elif path == '/api/fixlist':
             self._json(db.get_fixlist(con, q.get('book'), q.get('origin'),
-                                      q.get('statuses')))
+                                      q.get('statuses'), q.get('book_key')))
         elif path == '/api/backups':
             self._json({'backups': db.list_backups(self.outdir)})
         elif path == '/api/fixer/books':
@@ -253,17 +300,29 @@ class Handler(BaseHTTPRequestHandler):
                 with _import_lock:
                     counts = db.import_all(self.outdir)
                 kept = counts.get('book_scan_kept') or 0
+                summary = (f"נוספו {counts['added']:,}, הוסרו "
+                           f"{counts['removed']:,}, נשמרו "
+                           f"{counts['preserved']:,} החלטות"
+                           + (f'. נשמרו גם {kept:,} ממצאים '
+                              'מסריקות ספר בודד' if kept else ''))
+                con = db.connect(self.outdir)
+                try:
+                    status = result_status.build(con, self.outdir)
+                finally:
+                    con.close()
+                # an import of the previous scan's results is not "done":
+                # the scan the user ran last did not produce them
+                message = (hebrew.RESULT_STATUS['refresh_stale'].format(
+                               counts=f'({summary})')
+                           if status['stale'] else 'הרענון הושלם: ' + summary)
                 self._json({'ok': True, 'counts': counts,
                             'added': counts['added'],
                             'removed': counts['removed'],
                             'preserved': counts['preserved'],
                             'book_scan_kept': kept,
-                            'message': 'הרענון הושלם: נוספו '
-                                       f"{counts['added']:,}, הוסרו "
-                                       f"{counts['removed']:,}, נשמרו "
-                                       f"{counts['preserved']:,} החלטות"
-                                       + (f'. נשמרו גם {kept:,} ממצאים '
-                                          'מסריקות ספר בודד' if kept else '')})
+                            'stale': status['stale'],
+                            'result_status': status,
+                            'message': message})
                 return
             con = db.connect(self.outdir)
             try:
@@ -274,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             # before the ValueError clause below: PatchError subclasses it
             self._patch_error(e)
         except PermissionError as e:
-            self._error(str(e) or hebrew.FIXER_MESSAGES['locked'], 423)
+            self._permission_error(e)
         except (ValueError, FileNotFoundError) as e:
             self._error(str(e), 400)
         except Exception:
@@ -283,11 +342,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_post(self, path, body, con):
         if path == '/api/status':
-            res = db.set_status(
-                con, self.outdir, body.get('ids') or [],
-                body.get('status', ''), body.get('note'),
-                body.get('custom_suggestion'),
-                body.get('scope', 'occurrence'))
+            # a request is a human decision unless it declares otherwise
+            actor = 'agent' if body.get('actor') == 'agent' else 'human'
+            try:
+                res = db.set_status(
+                    con, self.outdir, body.get('ids') or [],
+                    body.get('status', ''), body.get('note'),
+                    body.get('custom_suggestion'),
+                    body.get('scope', 'occurrence'), decided_by=actor,
+                    expect_status=body.get('expect_status'))
+            except db.StatusConflict as e:
+                self._json({'error': str(e), 'code': 'status_conflict',
+                            'current': e.current, 'cause': e.cause}, 409)
+                return
             self._json({'ok': True, **res})
         elif path == '/api/undo':
             res = db.undo(con, self.outdir)
@@ -334,6 +401,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(res, code)
         elif path == '/api/fixer/undo_file':
             self._json(fixer_api.undo_file(con, self.outdir, body))
+        elif path == '/api/fixer/resolve_conflict':
+            self._json(fixer_api.resolve_conflict(con, self.outdir, body))
         elif path == '/api/fixer/mode':
             self._json(fixer_api.set_mode(con, body))
         else:
@@ -356,6 +425,16 @@ def serve(outdir, port=8766, open_browser=True):
             # in "no scan" mode where the user can launch one from the scan
             # panel, then load the findings without restarting.
             print('[webui] ' + hebrew.MESSAGES['no_scan_console'], flush=True)
+    if os.path.exists(ui_db):
+        # the same warnings the UI's banner shows, for whoever reads the
+        # console (not creating ui_review.db: its absence triggers the import)
+        con = db.connect(outdir)
+        try:
+            for n in result_status.build(con, outdir)['notices']:
+                if n['level'] != 'info':
+                    print(f"[webui] {n['title']}", flush=True)
+        finally:
+            con.close()
     srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     url = f'http://127.0.0.1:{port}/'
     print(f'[webui] serving {url}  (Ctrl+C to stop)', flush=True)

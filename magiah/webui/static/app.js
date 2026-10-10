@@ -113,11 +113,8 @@ const S = {
   sel: new Set(),
   sessionActions: 0,
   // cards
-  cardQueue: [],
-  cardSeen: new Set(),
-  cardPage: 1,
-  cardExhausted: false,
-  cardLoading: false,
+  cq: null,                 // CardQueue (cardqueue.js), created on first use
+  cardSeed: 0,              // fixed per queue so a 'random' cursor is stable
   cardStale: true,
   cardFixOpen: false,
   // fixer — keyed on the FILE (fixKey), never on the book title: one title can
@@ -232,7 +229,8 @@ function filterParams(overrides) {
   const origin = val("origin", f.origin), book = val("book", f.book);
   const errtypes = val("errtypes", f.errtypes), sts = val("statuses", f.statuses);
   if (origin) p.set("origin", origin);
-  if (book) p.set("book", book);
+  // `book` holds the book's stable key (doc), never its display title
+  if (book) p.set("book_key", book);
   if (errtypes && errtypes.length) p.set("errtype", errtypes.join(","));
   if (sts && sts.length) p.set("status", sts.join(","));
   if (val("verified", f.verified)) p.set("verified", "1");
@@ -448,7 +446,7 @@ function localRowsById(ids) {
   const set = new Set(ids);
   const found = [];
   for (const r of S.tableRows) if (set.has(r.id)) found.push(r);
-  for (const r of S.cardQueue) if (set.has(r.id)) found.push(r);
+  if (S.cq) for (const r of S.cq.queue.concat(S.cq.skipped)) if (set.has(r.id)) found.push(r);
   for (const r of S.fixRows) if (set.has(r.id)) found.push(r);
   return found;
 }
@@ -468,11 +466,15 @@ async function setStatus(ids, status, opts) {
   if (opts.note !== undefined) body.note = opts.note;
   if (opts.custom_suggestion !== undefined) body.custom_suggestion = opts.custom_suggestion;
   if (opts.scope) body.scope = opts.scope;
+  if (opts.expect_status) body.expect_status = opts.expect_status;
   try {
     const resp = await api("/api/status", { method: "POST", body });
     S.sessionActions += ids.length;
-    S.lastActions.push({ ids, rows: rows.slice(), snapshot, status });
-    if (S.lastActions.length > 60) S.lastActions.shift();
+    // a no-op write has no server history entry, so no undo step either
+    if (writeChanged(resp)) {
+      S.lastActions.push({ ids, rows: rows.slice(), snapshot, status });
+      if (S.lastActions.length > 60) S.lastActions.shift();
+    }
     updateSessionCounter();
     updateProgress();
     if (resp && resp.warnings) for (const w of resp.warnings) toast(w, "err", 8000);
@@ -480,7 +482,9 @@ async function setStatus(ids, status, opts) {
   } catch (e) {
     for (const [r, st, cs, nt] of snapshot) { r.effective_status = st; r.custom_suggestion = cs; r.note = nt; }
     repaintStatuses(ids);
-    toast("שמירת הסטטוס נכשלה: " + e.message, "err");
+    // a conflict is not a failure: the server says who decided it meanwhile
+    if (e.status === 409 && e.code === "status_conflict") toast(e.message, "warn", 8000);
+    else toast("שמירת הסטטוס נכשלה: " + e.message, "err");
     throw e;
   }
 }
@@ -519,11 +523,18 @@ async function doUndo() {
     if (last) {
       for (const [r, st, cs, nt] of last.snapshot) { r.effective_status = st; r.custom_suggestion = cs; r.note = nt; }
       // put the finding back at the head of the card queue
-      if (S.view === "cards" && last.rows.length === 1 && !S.cardQueue.includes(last.rows[0])) {
-        S.cardQueue.unshift(last.rows[0]);
+      if (S.view === "cards" && S.cq && last.rows.length === 1) {
+        S.cq.restore(last.rows[0]);
         renderCard();
       }
     }
+    // the server's word on what each finding is now (an approval brought
+    // back onto a changed suggestion returns as pending, not approved)
+    for (const e of (resp && resp.entries) || []) {
+      if (e.finding_id == null) continue;
+      for (const r of localRowsById([e.finding_id])) r.effective_status = e.restored;
+    }
+    if (S.view === "cards") renderCard();
     let msg = "הפעולה האחרונה בוטלה";
     if (resp && resp.reverted != null) msg += " (" + fmtNum(resp.reverted) + " ממצאים)";
     toast(msg, "ok");
@@ -571,7 +582,7 @@ function syncFilterControls() {
   $("#globalSearch").value = f.q;
   $$("#fErrtypes input[type=checkbox]").forEach(c => { c.checked = f.errtypes.includes(c.value); });
   $$("#fStatuses input[type=checkbox]").forEach(c => { c.checked = f.statuses.includes(c.value); });
-  $$("#fBookList .book-item").forEach(b => b.classList.toggle("selected", b.dataset.name === f.book));
+  $$("#fBookList .book-item").forEach(b => b.classList.toggle("selected", b.dataset.key === f.book));
   $("#fixInclude").checked = S.fixInclude;
   if ($("#fixBook")) $("#fixBook").value = S.fixKey;
   syncModeButtons();
@@ -641,15 +652,21 @@ const loadBooks = debounce(async function () {
     const box = $("#fBookList");
     box.replaceChildren();
     if (!books.length) { box.append(el("div", { class: "empty" }, "לא נמצאו ספרים")); return; }
+    // several books can share a title: filter by the stable key, and show
+    // the key next to a title that is not unique
+    const titleCount = new Map();
+    for (const b of books) titleCount.set(b.source, (titleCount.get(b.source) || 0) + 1);
     for (const b of books.slice(0, 300)) {
       const name = b.name || b.source || String(b);
+      const key = b.key || name;
+      const label = titleCount.get(b.source) > 1 ? name + " — " + key : name;
       const pending = b.pending_count != null ? b.pending_count : b.pending;
       const cnt = (pending != null ? fmtNum(pending) + " ממתינים / " : "") + (b.count != null ? fmtNum(b.count) : "");
-      const item = el("div", { class: "book-item" + (S.filters.book === name ? " selected" : ""), dataset: { name } },
-        el("span", { class: "bname", title: name }, el("bdi", null, name)),
+      const item = el("div", { class: "book-item" + (S.filters.book === key ? " selected" : ""), dataset: { key } },
+        el("span", { class: "bname", title: label }, el("bdi", null, label)),
         el("span", { class: "bcount" }, cnt));
       item.addEventListener("click", () => {
-        S.filters.book = S.filters.book === name ? "" : name;
+        S.filters.book = S.filters.book === key ? "" : key;
         syncFilterControls();
         filtersChanged();
       });
@@ -884,6 +901,62 @@ function evLabel(code) {
   return (typeof code === "string" && m[code]) || code;
 }
 
+// An independent source of the Tanach evidence ("host:<site>" or
+// "source:<Otzaria source>") in Hebrew.
+function tanachSourceLabel(g) {
+  if (typeof g !== "string") return String(g);
+  if (g.startsWith("host:")) return "אתר " + g.slice(5);
+  if (g.startsWith("source:")) {
+    const name = g.slice(7);
+    return "מאגר " + (originInfo(name).hebrew || name);
+  }
+  return g;
+}
+
+// One edition of a Tanach book, as the evidence names it
+// ({edition, book_id, version_id}): where its text is in the database.
+function editionRefText(e) {
+  if (!e || typeof e !== "object") return String(e);
+  const where = e.version_id != null ? "גרסה " + e.version_id
+    : "טקסט ראשי של ספר " + (e.book_id != null ? e.book_id : "");
+  return (e.edition || "") + " (" + where + ")";
+}
+
+const CTX_SCOPE_HE = { book: "בתוך הספר בלבד", corpus: "בכל המאגר" };
+
+// The lines of readable Hebrew the drawer shows for one key of a finding's
+// `extra`: never raw JSON, English keys or bare "host:" codes.
+function extraLines(k, v) {
+  if (v == null || v === "") return [];
+  if (typeof v === "boolean") return [v ? "כן" : "לא"];
+  if (k === "evidence_kind" || k === "reason") return [String(evLabel(v))];
+  if (k === "source" || k === "minority_source") return [tanachSourceLabel(v)];
+  if (k === "ctx_scope") return [CTX_SCOPE_HE[v] || String(v)];
+  const list = (x) => (Array.isArray(x) ? x : [x]).map(String).join(", ");
+  if (k === "witnesses" && Array.isArray(v))
+    return v.map((w) => (w && typeof w === "object")
+      ? tanachSourceLabel(w.source) + ": " + list(w.editions || [])
+      : String(w));
+  if (k === "readings" && typeof v === "object" && !Array.isArray(v))
+    // {reading: [editions]} (one source), or {reading: {source: [editions]}}
+    return Object.entries(v).map(([reading, by]) => "«" + reading + "» — " +
+      ((by && typeof by === "object" && !Array.isArray(by))
+        ? Object.entries(by).map(([g, eds]) =>
+            tanachSourceLabel(g) + " (" + list(eds) + ")").join("; ")
+        : list(by)));
+  if (k === "word_editions" && Array.isArray(v)) return v.map(editionRefText);
+  const labels = (S.meta && S.meta.extra_labels) || {};
+  const flat = (x) => (x && typeof x === "object")
+    ? (Array.isArray(x) ? x.map(flat).join(", ")
+      : Object.entries(x).map(([kk, vv]) =>
+          (labels[kk] || kk) + ": " + flat(vv)).join("; "))
+    : String(x);
+  if (Array.isArray(v)) return v.length ? [v.map(flat).join(", ")] : [];
+  if (typeof v === "object") return Object.entries(v).map(([kk, vv]) =>
+    (labels[kk] || kk) + ": " + flat(vv));
+  return [String(v)];
+}
+
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
@@ -981,11 +1054,12 @@ function renderDrawer(r, history) {
           dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
         continue;
       }
-      const txt = (v && typeof v === "object") ? JSON.stringify(v)
-        : typeof v === "boolean" ? (v ? "כן" : "לא")
-        : (k === "evidence_kind" || k === "reason") ? String(evLabel(v)) : String(v);
+      const lines = extraLines(k, v);
+      if (!lines.length) continue;
       const kl = ((S.meta && S.meta.extra_labels) || {})[k];
-      dl.append(el("dt", null, kl || ("פרטים: " + k)), el("dd", null, el("bdi", null, txt)));
+      dl.append(el("dt", null, kl || ("פרטים: " + k)),
+        el("dd", null, lines.length === 1 ? el("bdi", null, lines[0])
+          : lines.map((t) => el("div", null, el("bdi", null, t)))));
     }
   }
   fSec.append(dl);
@@ -1008,57 +1082,76 @@ function closeDrawer() {
 }
 
 /* ---------------------------------------------------------- card view */
+/* The queue logic lives in cardqueue.js (keyset paging, skip pile, in-flight
+ * guard, server-side completion); this is only its wiring to the API. */
+function cardQueue() {
+  if (!S.cq) {
+    S.cq = new CardQueue({
+      fetchPage: (cursor, recheck) => {
+        const p = filterParams({ page: 1, page_size: 50, statuses: recheck ? remainingStatuses() : S.filters.statuses });
+        p.set("cursor", cursor || "");
+        if (S.filters.sort === "random") p.set("seed", String(S.cardSeed));
+        return api("/api/findings?" + p);
+      },
+      countRemaining: async () =>
+        totalOf(await api("/api/findings?" + filterParams({ statuses: remainingStatuses(), page: 1, page_size: 1 }))),
+      // the cards a rule may just have decided, as they stand now
+      fetchRows: (ids, recheck) => {
+        const p = filterParams({ page: 1, page_size: 500, statuses: recheck ? remainingStatuses() : S.filters.statuses });
+        p.set("ids", ids.join(","));
+        return api("/api/findings?" + p);
+      },
+      save: (row, status, opts) => setStatus([row.id], status, Object.assign({ expect_status: effStatus(row) }, opts)),
+    });
+  }
+  return S.cq;
+}
+/* What still counts as open work in the card view: the statuses being
+ * reviewed, or the undecided ones when the filter does not narrow by status. */
+function remainingStatuses() {
+  return S.filters.statuses.length ? S.filters.statuses : ["pending"];
+}
+
 async function ensureCardQueue() {
-  if (S.cardLoading || S.cardExhausted) return;
-  if (S.cardQueue.length >= 10) return;
-  S.cardLoading = true;
+  const q = cardQueue();
   try {
-    const resp = await api("/api/findings?" + filterParams({ page: S.cardPage, page_size: 50 }));
-    const rows = rowsOf(resp);
-    let added = 0;
-    for (const r of rows) {
-      if (!S.cardSeen.has(r.id)) { S.cardSeen.add(r.id); S.cardQueue.push(r); added++; }
-    }
-    S.cardPage++;
-    if (!rows.length || (S.cardPage - 1) * 50 >= totalOf(resp)) S.cardExhausted = true;
-    if (!added && rows.length) {
-      // page contained only seen rows — advance further
-      S.cardLoading = false;
-      return ensureCardQueue();
-    }
+    await q.fill();
   } catch (e) {
     toast("טעינת הכרטיסים נכשלה: " + e.message, "err");
-    S.cardExhausted = true;
   }
-  S.cardLoading = false;
-  renderCard();
+  if (S.view === "cards") renderCard();
 }
 
 function resetCardQueue() {
-  S.cardQueue = [];
-  S.cardSeen = new Set();
-  S.cardPage = 1;
-  S.cardExhausted = false;
+  cardQueue().reset();
+  S.cardSeed = Math.floor(Math.random() * 2147483647);
   S.cardStale = false;
   S.cardFixOpen = false;
   renderCard();
   ensureCardQueue();
 }
 
-function currentCard() { return S.cardQueue[0] || null; }
+function currentCard() { return S.cq ? S.cq.head() : null; }
 
 function renderCard() {
   const box = $("#cardBox");
   const meta = $("#cardMeta");
   const r = currentCard();
+  const q = cardQueue();
   meta.replaceChildren(
-    el("span", null, "בתור: " + fmtNum(S.cardQueue.length) + (S.cardExhausted ? "" : "+")),
+    el("span", null, "בתור: " + fmtNum(q.queue.length) + (q.exhausted ? "" : "+")),
+    q.skipped.length ? el("span", { title: "יוצגו שוב בסוף התור" }, "נדחו לאחר כך: " + fmtNum(q.skipped.length)) : null,
     el("span", null, "קיצורים: י=אושר · נ=לא שגיאה · ד=לא בכל מקום · ת=תיקון · ע=התעלם · ב=בירור · ק=תוקן · רווח=דלג"));
   box.replaceChildren();
   if (!r) {
+    // "done" only on the server's word — never because the local list ran out
+    const st = q.state();
+    const msg = st === "done" ? "אין עוד ממצאים בסינון הנוכחי — כל הכבוד!"
+      : st === "remaining" ? "עברת על כל הכרטיסים, אך בסינון הנוכחי נותרו עוד " + fmtNum(q.remaining)
+        + " ממצאים פתוחים (ייתכן שעודכנו בחלון אחר). רענון הסינון יציג אותם."
+      : "טוען ממצאים…";
     box.append(el("div", { class: "card-done" },
-      el("div", { class: "big" }, S.cardLoading ? "⏳" : "🎉"),
-      S.cardLoading ? "טוען ממצאים…" : "אין עוד ממצאים בסינון הנוכחי — כל הכבוד!"));
+      el("div", { class: "big" }, st === "done" ? "🎉" : st === "remaining" ? "⚠" : "⏳"), msg));
     return;
   }
   const info = errtypeInfo(r.errtype);
@@ -1094,7 +1187,7 @@ function renderCard() {
    * one click away on a quieter secondary row. Nothing is hidden. */
   const mkBtn = (label, kbd, fn, cls) => {
     const b = el("button", { class: cls || null },
-      el("span", { class: "lbl" }, label), el("kbd", null, kbd));
+      el("span", { class: "lbl" }, label), kbd ? el("kbd", null, kbd) : null);
     b.addEventListener("click", fn);
     return b;
   };
@@ -1104,6 +1197,9 @@ function renderCard() {
     mkBtn("⏭ דלג", "רווח", () => cardSkip(), "act-skip")));
   box.append(el("div", { class: "card-actions second-row" },
     mkBtn("❌ לא שגיאה בכל מקום", "ד", () => cardAct("not_error", { scope: "word" })),
+    // narrower than "everywhere": the word may still be wrong elsewhere
+    mkBtn("❌ תקין בספר זה", "", () => cardAct("not_error", { scope: "book" })),
+    mkBtn("❌ ההצעה שגויה", "", () => cardAct("not_error", { scope: "replacement" })),
     mkBtn("✏ תיקון ידני", "ת", () => toggleCardFix(true)),
     mkBtn("🚫 התעלם", "ע", () => cardAct("ignored")),
     mkBtn("❓ דרוש בירור", "ב", () => cardAct("unsure")),
@@ -1137,19 +1233,26 @@ async function submitCardFix() {
   await cardAct("approved", { custom_suggestion: v });
 }
 async function cardAct(status, opts) {
-  const r = currentCard();
+  const q = cardQueue();
+  const r = q.head();
   if (!r) return;
   try {
-    await setStatus([r.id], status, opts || {});
-    S.cardQueue.shift();
+    const res = await q.act(status, opts || {});
+    if (res && res.ignored) return;        // a decision on this card is already in flight
     S.cardFixOpen = false;
     renderCard();
     ensureCardQueue();
-  } catch (e) { /* stays on card; toast shown */ }
+  } catch (e) {
+    // stays on card; setStatus already showed the toast. On 409 the server
+    // says what the finding is now, so the card shows the real state.
+    const cur = e && e.status === 409 && e.data && e.data.current;
+    if (cur && cur[String(r.id)]) { r.effective_status = cur[String(r.id)]; renderCard(); }
+  }
 }
+/* Skip for later: the card moves to a separate pile that returns after the
+ * rest of the queue; it is not a decision and not counted as done. */
 function cardSkip() {
-  if (!currentCard()) return;
-  S.cardQueue.push(S.cardQueue.shift());
+  if (!cardQueue().skip()) return;
   S.cardFixOpen = false;
   renderCard();
   ensureCardQueue();
@@ -1239,6 +1342,7 @@ async function loadFixDoc() {
     $("#fixDocPath").textContent = "";
     $("#fixDocMeta").textContent = "";
     setFixBanner(null);
+    renderFixConflicts();
     updateFixProgress();
     updateApplyButton();
     return;
@@ -1261,7 +1365,9 @@ async function loadFixDoc() {
       const e = manual.get(r.id);
       // only re-apply where the server still cannot place it itself; if it
       // now anchors on its own, its answer is the better one
-      if (e && r.anchor && !r.anchor.ok) {
+      // ...and only on a line the server still offers for a manual pick
+      if (e && r.anchor && !r.anchor.ok && e.lineno === r.lineno &&
+          (r.anchor.manual_lines || []).indexOf(e.lineno) >= 0) {
         const line = (resp.lines || []).find(l => l.n === r.lineno);
         const txt = line ? line.text : "";
         r.explicit = e;
@@ -1288,6 +1394,7 @@ async function loadFixDoc() {
     renderFixDoc();
     renderFixList(true);
     updateFixHead();
+    renderFixConflicts();
     if (!resp.editable) {
       setFixBanner(resp.message || "ספר זה אינו קובץ טקסט — אפשר לייצא את התיקונים בלבד.", "err");
     } else {
@@ -1298,6 +1405,7 @@ async function loadFixDoc() {
     S.fixRows = [];
     list.replaceChildren(el("div", { class: "fixer-empty" }, "הטעינה נכשלה: " + e.message));
     setFixBanner(e.message, "err");
+    renderFixConflicts();
   }
   updateApplyButton();
 }
@@ -1372,7 +1480,20 @@ function moveFixSelection(delta) {
 /* a row can be written only when the server managed to anchor it */
 function canApply(r) {
   return !!(r && r.anchor && r.anchor.ok && (r.correction || effFix(r)) &&
-            effStatus(r) !== "fixed");
+            effStatus(r) !== "fixed" && !needsVocalization(r));
+}
+
+/* nikud and teamim as patcher's normalize.has_marks counts them (marks and
+ * the vocalized presentation forms) */
+const VOCALIZED_RE = /[֑-ׇֽֿׁׂׅ̣ׄ̇͏יִ-ײַשׁ-פֿ]/;
+
+/* The word in the file is vocalized and replace mode would write a plain
+ * correction over it (the server's anchor.needs_vocalization, re-checked
+ * against the correction and mode chosen here since). */
+function needsVocalization(r) {
+  if (!(r && r.anchor && r.anchor.ok && r.anchor.needs_vocalization)) return false;
+  if (rowMode(r) !== "replace" || effStatus(r) === "fixed") return false;
+  return !VOCALIZED_RE.test(r.correction || effFix(r) || "");
 }
 
 function rowMode(r) {
@@ -1540,7 +1661,7 @@ function tokenPickLine(text, tokens, row) {
 function resolveOccurrence(row, start, end) {
   const lineText = (S.fixLines.get(row.lineno) || {}).text || "";
   const picked = lineText.slice(start, end);
-  row.explicit = { start, end };
+  row.explicit = { start, end, lineno: row.lineno };
   row.anchor = { ok: true, start, end, confidence: "manual",
                  spans_markup: picked.indexOf("<") >= 0 };
   // Pointing at a word says WHERE, not WHETHER. Arming an undecided finding
@@ -1583,6 +1704,47 @@ function updateFixHead() {
 }
 
 /* -------------------------------------------------- banners */
+/* Result status (UI_SPEC §9f): are the findings on screen the latest scan's?
+   It is derived from the output folder, not from this page, so it survives
+   a reload and a server restart; it cannot be dismissed — it goes away when a
+   scan succeeds. One block per notice, worst first, as /api/meta sends them. */
+const RESULT_ICONS = { error: "⚠", warning: "⚠", info: "ℹ" };
+const openScanSection = id => () => {
+  openScanModal();
+  const d = $(id); if (d) d.open = true;
+};
+const RESULT_ACTIONS = {
+  scan: openScanSection("#scanRunSection"),
+  book_scan: openScanSection("#bookScanSection"),
+  refresh: () => refreshFindings(),
+};
+
+function renderResultBanner() {
+  const box = $("#resultBanner");
+  const rs = S.meta && S.meta.result_status;
+  const notices = (rs && rs.notices) || [];
+  box.hidden = !notices.length;
+  box.replaceChildren(...notices.map(n => {
+    const body = el("div", { class: "rb-body" },
+      el("div", { class: "rb-title" }, n.title),
+      el("div", { class: "rb-text" }, n.text));
+    if (n.hint) body.append(el("div", { class: "rb-hint" }, el("b", null, "מה לעשות: "), n.hint));
+    if (n.details) body.append(el("details", { class: "rb-details" },
+      el("summary", null, "פרטים"), el("div", { class: "rb-reason" }, n.details)));
+    const run = RESULT_ACTIONS[n.action];
+    return el("div", { class: "rb-notice rb-" + n.level },
+      el("div", { class: "rb-icon", "aria-hidden": "true" }, RESULT_ICONS[n.level] || "ℹ"),
+      body,
+      run && n.action_label ? el("button", { class: "btn rb-action", onclick: run }, n.action_label) : null);
+  }));
+}
+
+/* Re-read the result status after a scan ends, leaving the page as it is. */
+async function reloadResultStatus() {
+  try { S.meta = await api("/api/meta"); } catch (e) { return; }
+  renderResultBanner();
+}
+
 function setFixBanner(node, kind) {
   const bn = $("#fixerBanner");
   if (!node) { bn.hidden = true; bn.replaceChildren(); return; }
@@ -1606,11 +1768,62 @@ function showBlockedBanner() {
   for (const [, v] of byCode) {
     ul.append(el("li", null, v.message + " (" + fmtNum(v.n) + ")"));
   }
+  // a click is offered only on a line the server identified; promising one
+  // for the others (a line_mismatch) sends the corrector looking for nothing
+  const pickable = blocked.some(r => (r.anchor.manual_lines || []).length);
   setFixBanner(el("div", { class: "bn-text" },
     el("b", null, fmtNum(blocked.length) + " ממצאים לא יוחלו אוטומטית — "),
-    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש. " +
-    "אפשר ללחוץ על המילה הנכונה בטקסט כדי לסמן אותה ידנית.",
+    "הכלי לא הצליח לאתר אותם בוודאות בקובץ, ולכן הוא לא ינחש." +
+    (pickable ? " בשורות שהכלי זיהה אפשר ללחוץ על המילה הנכונה בטקסט " +
+                "כדי לסמן אותה ידנית." : ""),
     ul));
+}
+
+/* An earlier write to this book was cut off (a crash, a closed window) and
+ * the file changed afterwards, so the tool cannot tell whether that write
+ * landed — and it never guesses. The book is named here, with its backup,
+ * until the corrector has checked it and says so; only then is the record
+ * dismissed (/api/fixer/resolve_conflict). Kept apart from #fixerBanner, which
+ * every refusal and reload repaints. */
+function renderFixConflicts() {
+  const box = $("#fixConflicts");
+  if (!box) return;
+  const list = (S.fixDoc && S.fixDoc.journal_conflicts) || [];
+  box.replaceChildren();
+  box.hidden = !list.length;
+  if (!list.length) return;
+  box.append(el("div", null,
+    el("b", null, "⚠ כתיבה קודמת לקובץ הזה נקטעה באמצע, והקובץ השתנה מאז. "),
+    "לכן אי אפשר לדעת אם התיקונים שבה נכתבו: הסטטוס שלהם לא עודכן, ואין לה " +
+    "שחזור מגיבוי. יש לפתוח את הקובץ ולבדוק אותו מול הגיבוי שנשמר לפני " +
+    "הכתיבה, ולתקן ידנית אם צריך. אחרי הבדיקה אפשר להסיר את ההתראה."));
+  const ul = el("ul");
+  for (const c of list) {
+    const words = (c.finding_ids || [])
+      .map(id => (S.fixRows.find(r => r.id === id) || {}).word)
+      .filter(Boolean);
+    ul.append(el("li", null,
+      (c.message || "") +
+        (words.length ? " (המילים: «" + words.join("», «") + "»)" : ""),
+      el("button", { class: "btn", onclick: () => resolveFixConflict(c.jid) },
+        "✔ בדקתי — הסר התראה"),
+      el("div", { class: "fc-meta" },
+        (c.kind === "undo" ? "שחזור מגיבוי" : "החלת תיקונים") +
+          (c.ts ? " · " + String(c.ts).replace("T", " ").slice(0, 19) : ""),
+        c.backup ? [" · גיבוי: ", el("code", null, c.backup)] : null)));
+  }
+  box.append(ul);
+}
+
+async function resolveFixConflict(jid) {
+  if (!confirm("לאשר שבדקת את הקובץ?\nההתראה תוסר, והכלי לא יחזור לבדוק את הכתיבה שנקטעה.")) return;
+  try {
+    await api("/api/fixer/resolve_conflict", { method: "POST", body: { jid } });
+    toast("ההתראה הוסרה", "ok");
+    await loadFixDoc();
+  } catch (e) {
+    toast(e.message, "err", 8000);
+  }
 }
 
 /* -------------------------------------------------- worklist */
@@ -1620,6 +1833,14 @@ function renderFixList(scroll) {
   if (!S.fixKey) {
     box.append(el("div", { class: "fixer-empty" },
       "בחר ספר מהרשימה — הכלי יפתח את קובץ הטקסט עצמו ויסמן בו את המקומות לתיקון."));
+    updateFixProgress();
+    return;
+  }
+  if (S.fixDoc && S.fixDoc.editable === false) {
+    // a book from the database has no file to write: say so, rather than
+    // the "nothing to fix" an empty worklist would otherwise claim
+    box.append(el("div", { class: "fixer-empty" }, S.fixDoc.message ||
+      "ספר זה מגיע ממסד הנתונים ולא מקובץ טקסט, ולכן אי אפשר לתקן אותו כאן."));
     updateFixProgress();
     return;
   }
@@ -1736,6 +1957,21 @@ function fixRowNode(r, idx, editable) {
     // against — probably fine, but worth a human glance before writing
     main.append(el("div", { class: "fix-warn weak-warn" },
       "⚠ הקטע בקובץ אינו תואם במלואו לקטע שנסרק — כדאי לוודא לפני ההחלה."));
+  } else if (r.anchor && r.anchor.confidence === "moved") {
+    // the sentence was found on another line than the scan saw it on
+    const from = r.anchor.moved_from;
+    main.append(el("div", { class: "fix-warn weak-warn" },
+      "⚠ השורה זזה מאז הסריקה" +
+      (from != null ? " (נסרקה בשורה " + fmtNum(from + 1) + ")" : "") +
+      " — הקטע זוהה בשורה " + fmtNum(r.lineno + 1) +
+      " לפי ההקשר המלא שלו. כדאי לוודא שזה המקום הנכון לפני ההחלה."));
+  }
+  if (needsVocalization(r)) {
+    // replacing would strip the word's nikud; the server refuses that, and
+    // one refusal fails the whole batch — so it is said here, before
+    main.append(el("div", { class: "fix-warn" },
+      "⚠ המילה בקובץ מנוקדת והתיקון אינו מנוקד — החלפה הייתה מוחקת את הניקוד, " +
+      "ולכן לא תיכתב. יש להקליד תיקון מנוקד («✏ תיקון ידני») או לבחור במצב «סוגריים»."));
   }
   if (r.anchor && r.anchor.ok && r.anchor.spans_markup) {
     // replacing takes the tag with the word (fine); bracketing would wrap
@@ -2018,6 +2254,7 @@ async function applyFixes() {
     if (r.explicit) {
       it.explicit_start = r.explicit.start;
       it.explicit_end = r.explicit.end;
+      it.explicit_lineno = r.explicit.lineno;
     }
     return it;
   });
@@ -2164,6 +2401,9 @@ async function loadStats() {
   const origins = normalizeMatrix(st.origins || st.by_origin || st.origin_status || []);
   const errts = normalizeMatrix(st.errtypes || st.by_errtype || st.errtype_status || []);
   const books = normalizeMatrix(st.books || st.by_book || st.per_book || []);
+  // decisions by who made them: an agent's approval is never shown as a human one
+  const actors = normalizeMatrix(st.by_actor || {});
+  const ACTOR_HE = { human: "אדם", agent: "סוכן", unknown: "לא ידוע (לפני תיעוד)" };
   if (origins.length) {
     body.append(el("h3", null, "לפי מאגר"));
     body.append(matrixTable(origins, colInfo("origin").hebrew, l => originInfo(l).hebrew || l));
@@ -2186,6 +2426,10 @@ async function loadStats() {
         el("span", { class: "bb-nums" }, fmtNum(done) + " / " + fmtNum(total) + " (" + pct + "%)")));
     }
     body.append(bars);
+  }
+  if (actors.length) {
+    body.append(el("h3", null, "לפי מקבל ההחלטה"));
+    body.append(matrixTable(actors, "הוחלט ע״י", l => ACTOR_HE[l] || l));
   }
   if (!origins.length && !errts.length && !books.length) {
     body.append(el("div", null, "אין נתוני סטטיסטיקה להצגה."));
@@ -2418,21 +2662,29 @@ function hebrewResult(resp, fallback) {
   return parts.length ? parts.join(", ") : fallback;
 }
 
+async function refreshFindings() {
+  if (!confirm("לרענן את הממצאים מהסריקה הנוכחית (report.db)?\n\nהחלטות על ממצאים שעדיין קיימים — יישמרו. ממצאים שנעלמו — יוסרו. ממצאים חדשים יתווספו כ«טרם נבדק».")) return;
+  try {
+    toast("מרענן מסריקה חדשה — נא להמתין…");
+    refreshToast(await api("/api/refresh", { method: "POST", body: {} }));
+    afterDataChanged();
+  } catch (e) { toast("הרענון נכשל: " + e.message, "err"); }
+}
+
+/* /api/refresh says whether what it loaded is the latest scan's results:
+   reloading the previous scan's results after a failed scan is no success. */
+function refreshToast(r) {
+  if (r && r.stale) toast(r.message, "warn", 15000);
+  else toast(hebrewResult(r, "הרענון הושלם"), "ok", 8000);
+}
+
 function bindScanModal() {
   $("#btnScan").addEventListener("click", openScanModal);
   bindScanRun();
   bindBookScan();
   $("#scanClose").addEventListener("click", closeScanModal);
   $("#scanScrim").addEventListener("click", closeScanModal);
-  $("#scanRefresh").addEventListener("click", async () => {
-    if (!confirm("לרענן את הממצאים מהסריקה הנוכחית (report.db)?\n\nהחלטות על ממצאים שעדיין קיימים — יישמרו. ממצאים שנעלמו — יוסרו. ממצאים חדשים יתווספו כ«טרם נבדק».")) return;
-    try {
-      toast("מרענן מסריקה חדשה — נא להמתין…");
-      const r = await api("/api/refresh", { method: "POST", body: {} });
-      toast("הרענון הושלם: " + hebrewResult(r, "בוצע"), "ok", 7000);
-      afterDataChanged();
-    } catch (e) { toast("הרענון נכשל: " + e.message, "err"); }
-  });
+  $("#scanRefresh").addEventListener("click", refreshFindings);
   $("#scanImportLegacy").addEventListener("click", async () => {
     if (!confirm("לייבא את ההחלטות מהכלי הישן (decisions.db)?\n\nהחלטות accept יהפכו ל«אושר», reject ל«לא שגיאה» (כולל חוקי «בכל מקום»), ignore ל«התעלם». ההחלטות ישויכו לממצאים לפי מילה ומזהה שורה.")) return;
     try {
@@ -2571,6 +2823,20 @@ function collectScanRequest() {
   };
 }
 
+/* allow_unread is per run and never saved (Config.PER_RUN). The field sits in
+   the collapsed advanced section, so a value left in it is named in the start
+   confirmation and cleared once a run has taken it — a later scan never
+   inherits it unseen. */
+function allowUnreadNote(req) {
+  const n = req.config.allow_unread || 0;
+  const tpl = SCAN.cfg && SCAN.cfg.allow_unread_confirm;
+  return n > 0 && tpl ? "\n\n" + tpl.replace("{n}", fmtNum(n)) : "";
+}
+function clearAllowUnread() {
+  const inp = $('#scanFields .scan-field[data-key="allow_unread"] input');
+  if (inp) inp.value = "0";
+}
+
 function stageHebrew(key) {
   const s = ((SCAN.cfg && SCAN.cfg.stages) || []).find(x => x.key === key);
   return s ? s.hebrew : (STAGE_HEBREW[key] || key);
@@ -2673,6 +2939,9 @@ function renderScanStatus(st) {
     else if (st.state === "done") toast("הסריקה הושלמה — אפשר לרענן את הממצאים", "ok", 8000);
     else if (st.state === "failed") toast("הסריקה נכשלה: " + (st.error || "ראו את יומן הריצה"), "err", 10000);
     else if (st.state === "cancelled") toast("הסריקה בוטלה", "", 5000);
+    // the scan's run record is final before its status turns, so the banner
+    // can show this outcome now (a finished book scan reloaded it above)
+    if (!(st.state === "done" && st.is_book)) reloadResultStatus();
   }
   SCAN.lastState = st.state;
 }
@@ -2704,9 +2973,10 @@ function bindScanRun() {
   $("#scanStart").addEventListener("click", async () => {
     const req = collectScanRequest();
     if (!req.stages.length) { toast("יש לבחור לפחות שלב אחד להרצה", "err"); return; }
-    if (!confirm("להתחיל סריקה חדשה?\n\nשלבים: " + req.stages.map(stageHebrew).join(", ") + "\nהסריקה עשויה להימשך זמן רב; אפשר לעקוב אחרי ההתקדמות ביומן.")) return;
+    if (!confirm("להתחיל סריקה חדשה?\n\nשלבים: " + req.stages.map(stageHebrew).join(", ") + "\nהסריקה עשויה להימשך זמן רב; אפשר לעקוב אחרי ההתקדמות ביומן." + allowUnreadNote(req))) return;
     try {
       const r = await api("/api/scan/start", { method: "POST", body: req });
+      clearAllowUnread();
       toast((r && r.message) || "הסריקה הופעלה", "ok");
       $("#scanRunSection").setAttribute("open", "");
       renderScanStatus((r && r.status) || { state: "running", log_tail: [] });
@@ -2725,8 +2995,7 @@ function bindScanRun() {
   $("#scanRefreshAfter").addEventListener("click", async () => {
     try {
       toast("מרענן ממצאים מהסריקה החדשה — נא להמתין…");
-      const r = await api("/api/refresh", { method: "POST", body: {} });
-      toast(hebrewResult(r, "הרענון הושלם"), "ok", 8000);
+      refreshToast(await api("/api/refresh", { method: "POST", body: {} }));
       $("#scanRefreshAfter").hidden = true;
       afterDataChanged();
     } catch (e) { toast("הרענון נכשל: " + e.message, "err", 8000); }
@@ -2825,18 +3094,20 @@ function bindBookScan() {
       label = BS.chosen.title;
     }
     const verify = $("#bsVerifyCtx").checked;
+    const req = collectScanRequest();
     if (!confirm("לסרוק את «" + label + "»?\n\n" +
                  "הסריקה מתבססת על המילון הקיים ואורכת שניות." +
                  (verify ? "\n\n⚠ סימנת «אימות הקשר מול כל המאגר» — הסריקה " +
                            "תימשך כ־10 דקות במקום שניות." : "") +
-                 "\n\nממצאים קודמים של ספר זה יוחלפו; ההחלטות שלך עליהם יישמרו.")) return;
-    const req = collectScanRequest();
+                 "\n\nממצאים קודמים של ספר זה יוחלפו; ההחלטות שלך עליהם יישמרו." +
+                 allowUnreadNote(req))) return;
     try {
       const r = await api("/api/scan/book", {
         method: "POST",
         body: { source: src, book: key, verify_ctx: verify,
                 config: req.config, corpus: req.corpus },
       });
+      clearAllowUnread();
       toast((r && r.message) || "סריקת הספר הופעלה", "ok");
       $("#scanRunSection").setAttribute("open", "");
       renderScanStatus((r && r.status) || { state: "running", log_tail: [] });
@@ -2853,6 +3124,7 @@ async function reloadAfterBookScan() {
   S.sel.clear();
   S.cardStale = true;
   try { S.meta = await api("/api/meta"); buildSidebar(); } catch (e) {}
+  renderResultBanner();
   loadBooks();
   refreshCurrentView();
   updateProgress();
@@ -2864,6 +3136,7 @@ async function afterDataChanged() {
   S.sel.clear();
   S.cardStale = true;
   try { S.meta = await api("/api/meta"); buildSidebar(); } catch (e) {}
+  renderResultBanner();
   loadBooks();
   refreshCurrentView();
   updateProgress();
@@ -3133,6 +3406,7 @@ async function init() {
     S.meta = { origins: [], errtypes: [], statuses: FALLBACK_STATUSES, columns: [] };
   }
   buildSidebar();
+  renderResultBanner();
   loadBooks();
   showView(S.view, true);
   updateProgress();

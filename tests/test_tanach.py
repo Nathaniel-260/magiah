@@ -6,6 +6,7 @@ The fixture is synthetic: the "verses" are everyday word sequences placed in
 a schema-6 style database (category tree, heRefs, book_version/version_line),
 so nothing here depends on real biblical text.
 """
+import contextlib
 import json
 import os
 import pickle
@@ -353,6 +354,41 @@ class IndexTest(_DBCase):
                          if r not in errs)
         self.assertEqual(reasons, ['intra_source', 'one_against_one',
                                    'plene', 'qere_ketiv'])
+
+    def test_edition_error_names_the_edition_holding_the_word(self):
+        # the row's unit is the primary line; the minority reading is in
+        # version 4 ("Third"), and the row must say so
+        rows, _ = self.idx.edition_errors()
+        (err,) = [json.loads(r[4]) for r in rows
+                  if json.loads(r[4])['evidence_kind']
+                  == 'tanach_edition_variant']
+        self.assertEqual(err['word_editions'], [
+            {'edition': 'Third', 'book_id': BIBLE, 'version_id': 4}])
+        self.assertEqual(self.t.word_editions_text(err), 'Third (גרסה 4)')
+        by = {json.loads(r[4])['reason']: (r[1], json.loads(r[4]))
+              for r in rows if json.loads(r[4])['evidence_kind']
+              == 'tanach_edition_unresolved'}
+        # one against one: 'לאת' is read by both renderings of source two
+        word, ev = by['one_against_one']
+        self.assertEqual(word, 'לאת')
+        self.assertEqual({e['version_id'] for e in ev['word_editions']},
+                         {2, 3})
+        # within one source: only the rendering that reads the word
+        word, ev = by['intra_source']
+        self.assertEqual(word, 'הנכונח')
+        self.assertEqual(self.t.word_editions_text(ev),
+                         'Second plain (גרסה 3)')
+        # every edition-error row names at least one edition
+        self.assertTrue(all(json.loads(r[4])['word_editions'] for r in rows))
+
+    def test_word_editions_text_of_a_primary_text_and_of_nothing(self):
+        self.assertEqual(self.t.word_editions_text(json.dumps(
+            {'word_editions': [{'edition': 'בראשית (Sefaria)',
+                                'book_id': 7, 'version_id': None}]})),
+            'בראשית (Sefaria) (טקסט ראשי, ספר 7)')
+        for nothing in (None, '', '{bad', '[]', '{}',
+                        {'word_editions': 'x'}):
+            self.assertEqual(self.t.word_editions_text(nothing), '')
 
     def test_unresolved_disagreements_are_reported_not_dropped(self):
         rows, _ = self.idx.edition_errors()
@@ -727,6 +763,34 @@ class LegacyTest(unittest.TestCase):
         finally:
             self.dir = base
 
+    def test_undo_of_an_earlier_step_does_not_reapprove_a_dropped_row(self):
+        """Undo restores the whole previous decision; when that decision is
+        an approval a refresh dropped afterwards (legacy_recheck), the row
+        comes back pending, and decisions.db gets no 'accept' again."""
+        from magiah.webui import db as uidb
+        self._seed_ui()
+        con = uidb.connect(self.dir)
+        # approved -> approved with a note: a real step whose previous state
+        # is the approval
+        uidb.set_status(con, self.dir, [1], 'approved', note='נבדק')
+        con.close()
+        uidb.import_all(self.dir)
+        self.assertIsNone(self._ui_state()[0]['פרץ'])
+        con = uidb.connect(self.dir)
+        res = uidb.undo(con, self.dir)
+        con.close()
+        self.assertEqual([(e['word'], e['restored']) for e in res['entries']],
+                         [('פרץ', 'pending')])
+        self.assertTrue(res['entries'][0]['legacy_recheck'])
+        st, dec, _n, _ = self._ui_state()
+        self.assertIsNone(st['פרץ'])
+        self.assertNotIn(('פרץ', '7'), dec)
+        entries = self._undo_all()
+        self.assertNotIn('approved', [e['restored'] for e in entries])
+        st, dec, _n, _ = self._ui_state()
+        self.assertEqual(set(st.values()), {None})
+        self.assertEqual(dec, {})
+
     def test_import_legacy_does_not_approve_tanach_backed_rows(self):
         """An accept of the old tool (never owned by this UI) on a row backed
         by Tanach evidence comes in as 'unsure', without its suggestion."""
@@ -784,8 +848,14 @@ class LegacyTest(unittest.TestCase):
                     "ref, tanach, suggestion, source) VALUES(4, 'error', "
                     "'edit1_sub', 'קפץ', '10', 'ר', 2, 'קפה', 'ספר')")
         con.commit()
-        # "everywhere" decisions taken on the old evidence
-        uidb.set_status(con, self.dir, [1], 'approved', scope='word')
+        # "everywhere" decisions taken on the old evidence. set_status no
+        # longer makes a word-wide approval (a scoped approval is refused);
+        # one still exists in a database of an earlier version, which wrote
+        # word_rules positionally, as it wrote it there
+        uidb.set_status(con, self.dir, [1], 'approved')
+        con.execute("INSERT INTO word_rules VALUES('פרץ', 'approved', "
+                    "'2026-01-01T00:00:00')")
+        con.commit()
         uidb.set_status(con, self.dir, [4], 'not_error', scope='word')
         con.close()
         uidb.import_all(self.dir)
@@ -797,22 +867,88 @@ class LegacyTest(unittest.TestCase):
         self.assertEqual(eff[('פרץ', '14')], 'approved')    # the word rule
         self.assertEqual(eff[('קפץ', '10')], 'not_error')   # judges the word
 
+    def test_scoped_rule_approval_does_not_reach_legacy_rows(self):
+        """A replacement-scope approval (the only approval a rule may carry
+        now) reaches the other findings of its (word, suggestion) pair, but
+        not a tanach_legacy row of the same pair; a book convention's
+        not_error still reaches it."""
+        from magiah.webui import db as uidb
+        rep = sqlite3.connect(os.path.join(self.dir, 'report.db'))
+        # beside the legacy rows פרץ@7 and קפץ@10 (tanach = 2), rows of the
+        # same words in the same book that rest on no Tanach evidence
+        rep.executemany(
+            f'INSERT INTO occurrences_full VALUES({",".join("?"*14)})',
+            [(w, 'edit1_sub', s, 2.0, 0, 0, 0, 0, 'ספר', 'ר', u, 's',
+              'Dicta', '3') for w, s, u in (('פרץ', 'פרח', '14'),
+                                            ('פרץ', 'פרח', '15'),
+                                            ('קפץ', 'קפה', '16'))])
+        rep.commit()
+        rep.close()
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        ids = {(w, u): i for i, w, u in con.execute(
+            'SELECT id, word, unit FROM findings')}
+        uidb.set_status(con, self.dir, [ids[('פרץ', '14')]], 'approved',
+                        scope='replacement')
+        uidb.set_status(con, self.dir, [ids[('קפץ', '16')]], 'not_error',
+                        scope='book')
+        eff = {(w, u): s for w, u, s in con.execute(
+            f'SELECT f.word, f.unit, {uidb.EFF} FROM findings f {uidb.JOINS}')}
+        approved = {(w, u) for w, u in con.execute(
+            f'SELECT f.word, f.unit FROM findings f {uidb.JOINS} '
+            f"WHERE {uidb.EFF} IN ('approved', 'fixed')")}
+        con.close()
+        self.assertEqual(eff[('פרץ', '7')], 'pending')      # legacy: re-check
+        self.assertEqual(eff[('פרץ', '14')], 'approved')    # its own row
+        self.assertEqual(eff[('פרץ', '15')], 'approved')    # the pair's rule
+        self.assertEqual(eff[('קפץ', '10')], 'not_error')   # the convention
+        self.assertEqual(approved, {('פרץ', '14'), ('פרץ', '15')})
+
+    def test_status_filter_works_with_the_legacy_guard(self):
+        """EFF carries a LIKE '%tanach_legacy%' pattern; the status filter
+        must not run it through %-formatting (it used to fail every
+        status-filtered query with "unsupported format character")."""
+        from magiah.webui import db as uidb
+        uidb.import_all(self.dir)
+        con = uidb.connect(self.dir)
+        try:
+            fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
+                              ).fetchone()[0]
+            uidb.set_status(con, self.dir, [fid], 'approved')
+            rows, total = uidb.query_findings(con, {'status': 'approved'})
+            self.assertEqual(([r['word'] for r in rows], total),
+                             (['בייתה'], 1))
+            _rows, total = uidb.query_findings(
+                con, {'status': 'pending,approved'})
+            self.assertEqual(total, con.execute(
+                'SELECT COUNT(*) FROM findings').fetchone()[0])
+        finally:
+            con.close()
+
     def test_import_legacy_keeps_a_word_wide_approval_an_approval(self):
         """decisions.db mirrors a word-wide approval as (word, '*', accept);
         importing it back must not turn it into "not an error everywhere"."""
         from magiah.webui import db as uidb
         uidb.import_all(self.dir)
         con = uidb.connect(self.dir)
-        fid = con.execute("SELECT id FROM findings WHERE word = 'בייתה'"
-                          ).fetchone()[0]
         kid = con.execute("SELECT id FROM findings WHERE word = 'גשמ'"
                           ).fetchone()[0]
-        uidb.set_status(con, self.dir, [fid], 'approved', scope='word')
         uidb.set_status(con, self.dir, [kid], 'not_error', scope='word')
+        con.close()
+        # set_status no longer makes a word-wide approval; earlier versions
+        # of this UI mirrored one into decisions.db like this
+        dec = sqlite3.connect(os.path.join(self.dir, 'decisions.db'))
+        dec.execute("INSERT INTO decisions VALUES('בייתה', '*', '', "
+                    "'accept', '', '', '')")
+        dec.commit()
+        dec.close()
+        con = uidb.connect(self.dir)
         uidb.migrate_legacy_decisions(con, self.dir)
         rules = dict(con.execute('SELECT word, status FROM word_rules'))
         con.close()
         self.assertEqual(rules, {'בייתה': 'approved', 'גשמ': 'not_error'})
+        # ...and only the global rejection feeds the detector's whitelist
+        self.assertEqual(core.load_review_rejections(self.dir), {'גשמ'})
 
 
 class BibleBookShareTest(unittest.TestCase):
@@ -988,6 +1124,63 @@ class EditionRankTest(unittest.TestCase):
                 "SELECT word, rank FROM findings WHERE family='tanach_error'"))
             con.close()
             self.assertEqual(rank, {'אדוס': 4.0, 'לאת': 0.0})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_exports_name_the_edition_to_correct(self):
+        import csv
+        from magiah.webui import db as uidb, export
+        d = tempfile.mkdtemp(prefix='magiah_tanach_exp_')
+        ev = {'evidence_kind': 'tanach_edition_variant',
+              'word_editions': [{'edition': 'Third', 'book_id': 1,
+                                 'version_id': 4}]}
+        try:
+            path = os.path.join(d, 'report.db')
+            make_legacy_report(path)
+            con = sqlite3.connect(path)
+            con.executescript('''
+                DROP TABLE tanach_errors_full;
+                CREATE TABLE tanach_errors_full(word, canonical, source, ref,
+                                                unit, snippet, origin,
+                                                evidence);''')
+            con.execute('INSERT INTO tanach_errors_full VALUES(?,?,?,?,?,?,?,?)',
+                        ('אדוס', 'אדום', 'בראשית', 'בראשית א, א', '9', 's',
+                         'Sefaria', json.dumps(ev, ensure_ascii=False)))
+            con.commit()
+            # the report CSV
+            con.row_factory = None
+            with open(os.devnull, 'w') as null, \
+                    contextlib.redirect_stdout(null):
+                core._write_reports(con, d, '', (), 0)
+            con.close()
+            with open(os.path.join(d, 'tanach_edition_errors.csv'),
+                      encoding='utf-8-sig') as f:
+                (row,) = list(csv.DictReader(f))
+            self.assertEqual(row['edition'], 'Third (גרסה 4)')
+            # the review UI's exports of an approved edition finding
+            uidb.import_all(d)
+            ucon = uidb.connect(d)
+            try:
+                (fid,) = [r[0] for r in ucon.execute(
+                    "SELECT id FROM findings WHERE family='tanach_error'")]
+                uidb.set_status(ucon, d, [fid], 'approved')
+                export.export_fixes(ucon, d)
+                with open(os.path.join(d, 'to_send',
+                                       'approved_fixes_all.csv'),
+                          encoding='utf-8-sig') as f:
+                    rows = list(csv.DictReader(f))
+                (fix,) = [r for r in rows if r['word'] == 'אדוס']
+                self.assertEqual(fix['edition'], 'Third (גרסה 4)')
+                self.assertEqual(fix['line_id'], '9')
+                xrows = list(export._all_rows(ucon, 'Sefaria'))
+                self.assertEqual(len(export.MAIN_HEADERS), len(xrows[0]))
+                (xrow,) = [r for r in xrows if r[3] == 'אדוס']
+                self.assertEqual(xrow[-1], 'Third (גרסה 4)')
+                # any other finding has an empty edition cell
+                self.assertTrue(all(r['edition'] == '' for r in rows
+                                    if r['word'] != 'אדוס'))
+            finally:
+                ucon.close()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

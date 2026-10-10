@@ -5,8 +5,12 @@ import io
 import json
 import os
 import pickle
+import shutil
 import sqlite3
+import sys
 import tempfile
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -18,10 +22,42 @@ from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
 from magiah.webui import db as webui_db
 
+
+
+class _ZstandardFixtures:
+    """The slice of ``compression.zstd`` the fixtures use, on the
+    ``zstandard`` package — the decoder Python < 3.14 reads seforim.db with
+    (pyproject: ``zstandard; python_version < '3.14'``). Without it the
+    zstd fixtures could not be written there, and the reader's only backend
+    on those interpreters would go untested."""
+
+    def __init__(self, zs):
+        self._zs = zs
+
+    def train_dict(self, samples, size):
+        return self.ZstdDict(self._zs.train_dictionary(size, samples)
+                             .as_bytes())
+
+    def ZstdDict(self, content):
+        d = types.SimpleNamespace(dict_content=bytes(content))
+        d.compression_dict = self._zs.ZstdCompressionDict(d.dict_content)
+        return d
+
+    def compress(self, data, zstd_dict):
+        return self._zs.ZstdCompressor(
+            dict_data=zstd_dict.compression_dict).compress(data)
+
+
 try:
     from compression import zstd as _zstd
 except ImportError:                                  # Python < 3.14
-    _zstd = None
+    try:
+        import zstandard
+    except ImportError:          # neither backend: the reader cannot decode
+        _zstd = None             # either, so the zstd tests are skipped
+    else:
+        _zstd = _ZstandardFixtures(zstandard)
+NO_ZSTD = 'needs a zstd backend (compression.zstd, or zstandard before 3.14)'
 
 LINES = [
     (1, 1, 'בראשית ברא אלהים את השמים ואת הארץ'),
@@ -41,6 +77,17 @@ def _base_schema(con):
         CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);
         INSERT INTO schema_meta VALUES('db_schema_version', '6');
     ''')
+
+
+def make_library_dir(path):
+    """A library repo with one book: an empty one is refused as a source
+    (corpus_hybrid.LibraryCorpus.chunks), so a hybrid corpus needs one even
+    where only its database part is under test."""
+    os.makedirs(os.path.join(path, 'DictaToOtzaria'), exist_ok=True)
+    with open(os.path.join(path, 'DictaToOtzaria', 'ספר.txt'), 'w',
+              encoding='utf-8') as f:
+        f.write('שורה מקובץ\n')
+    return path
 
 
 def make_inline_db(path):
@@ -78,6 +125,9 @@ def make_schema6_db(path, corrupt_id=None, plain_id=None, missing_id=None):
         CREATE TABLE version_line(versionId INT, lineId INT, content TEXT,
                                   charCount INT,
                                   PRIMARY KEY(versionId, lineId));
+        -- the real database's indexes: the query plans depend on them
+        CREATE INDEX idx_line_book_index ON line(bookId, lineIndex);
+        CREATE INDEX idx_version_line_line ON version_line(lineId);
     ''')
     con.execute('INSERT INTO zstd_dict VALUES(1, ?)', (zd.dict_content,))
     for i, b, t in LINES:
@@ -121,7 +171,7 @@ class InlineLayoutTest(unittest.TestCase):
             self.assertFalse(os.path.exists(p))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class Schema6Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -144,6 +194,14 @@ class Schema6Test(unittest.TestCase):
             got = {lid: t for lid, _, t in odb.iter_range(1, 5, st)}
         self.assertEqual(got, {i: t for i, _, t in LINES})
         self.assertEqual(st.decode_errors, 0)
+
+    def test_the_backend_this_interpreter_ships_with_is_tested(self):
+        # before 3.14 the decoder is `zstandard`: the fixtures are written
+        # with it there instead of skipping every zstd test
+        with OtzariaDB(self._db()) as odb:
+            self.assertEqual(odb.backend,
+                             'compression.zstd' if sys.version_info >= (3, 14)
+                             else 'zstandard')
 
     def test_text_row_in_compressed_db_passes_through(self):
         p = self._db(plain_id=3)
@@ -176,12 +234,12 @@ class Schema6Test(unittest.TestCase):
 
     def test_hybrid_db_part_reads_only_sefaria_books(self):
         p = self._db()
-        lib = os.path.join(self.dir, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.dir, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': p})
         units = []
         for ch in corpus.chunks(1):
-            units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
+            if ch[0] == 'db':
+                units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
         corpus.close()
         self.assertEqual(sorted(units), ['1', '2'])     # book 1 = Sefaria
 
@@ -275,6 +333,92 @@ class LineSplittingTest(unittest.TestCase):
                                       library_dir=lib)
             self.assertEqual(len(b), 1)
 
+    def _counting_walks(self):
+        calls = []
+        real = LibraryCorpus._files
+
+        def files(corpus, dirs=None):
+            calls.append(corpus.path)
+            return real(corpus, dirs)
+        return calls, mock.patch.object(LibraryCorpus, '_files', files)
+
+    def _write(self, *parts):
+        os.makedirs(os.path.dirname(os.path.join(*parts)), exist_ok=True)
+        with open(os.path.join(*parts), 'w', encoding='utf-8') as f:
+            f.write('שורה\n')
+
+    def _age(self, lib):
+        """Date every folder a minute back: a walk trusts only folders not
+        modified around the time it ran (book_source._walk_library)."""
+        past = time.time() - 60
+        for d, _, _ in os.walk(lib):
+            os.utime(d, (past, past))
+
+    def test_picker_walks_the_library_once_while_it_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            self._write(lib, 'MoreBooks', 'ב', 'ספר ב.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            with patch:
+                for q in ('', 'ספר', 'א', 'ב', 'ספר א'):
+                    book_source.list_library_books(lib, q)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                [b['key'] for b in book_source.list_library_books(lib, '')],
+                ['MoreBooks/א/ספר א.txt', 'MoreBooks/ב/ספר ב.txt'])
+
+    def test_picker_sees_every_kind_of_change(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            calls, patch = self._counting_walks()
+
+            def after(change):
+                """A trusted walk, then `change`: the next query must see
+                it through the changed folder's modification time."""
+                self._age(lib)
+                book_source.list_library_books(lib, '')
+                n = len(calls)
+                change()
+                keys = [b['key'] for b in
+                        book_source.list_library_books(lib, '')]
+                self.assertEqual(len(calls), n + 1)
+                return keys
+            with patch:
+                # a book deep in a folder that already existed
+                self.assertIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'א', 'ספר ג.txt')))
+                # a new folder, and a new origin at the top
+                self.assertIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'חדש',
+                                        'ספר ד.txt')))
+                self.assertIn('OtherRepo/ספר ה.txt', after(
+                    lambda: self._write(lib, 'OtherRepo', 'ספר ה.txt')))
+                # removed, renamed, a whole folder removed
+                self.assertNotIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: os.remove(os.path.join(lib, 'MoreBooks', 'א',
+                                                   'ספר ג.txt'))))
+                self.assertEqual(after(lambda: os.rename(
+                    os.path.join(lib, 'OtherRepo', 'ספר ה.txt'),
+                    os.path.join(lib, 'OtherRepo', 'ספר ו.txt'))),
+                    ['MoreBooks/א/ספר א.txt', 'MoreBooks/חדש/ספר ד.txt',
+                     'OtherRepo/ספר ו.txt'])
+                self.assertNotIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: shutil.rmtree(os.path.join(lib, 'MoreBooks',
+                                                       'חדש'))))
+
+    def test_a_walk_racing_a_change_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'ספר א.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            # every folder looks modified after the walk began
+            with patch, mock.patch.object(book_source.time, 'time_ns',
+                                          return_value=0):
+                book_source.list_library_books(lib, '')
+                book_source.list_library_books(lib, '')
+            self.assertEqual(len(calls), 2)
+
 
 BROKEN_FRAME = b'\x28\xb5\x2f\xfd' + b'\x00' * 9
 
@@ -303,7 +447,7 @@ def _coverage(out, stage):
         return json.load(f)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class PartialOutputTest(unittest.TestCase):
     """A stage that could not read its whole input must not replace its last
     good output, and nothing downstream may consume output whose latest
@@ -428,7 +572,7 @@ class PartialOutputTest(unittest.TestCase):
         self.assertIn('מיקום', err.getvalue())
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class MissingContentRowTest(unittest.TestCase):
     """A `line` row without its `line_content` row is unread, not absent."""
 
@@ -463,7 +607,7 @@ class MissingContentRowTest(unittest.TestCase):
             book_source.load_book('db', '2', db_path=self.db)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class OpenFailureTest(unittest.TestCase):
     """A database that fails to open is released and reported in Hebrew."""
 
@@ -530,7 +674,7 @@ class OpenFailureTest(unittest.TestCase):
         self.assertFalse(os.path.exists(missing))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class ReadStatsCountedTest(unittest.TestCase):
     """Every pass that reads the corpus counts what it could not read."""
 
@@ -599,14 +743,185 @@ class ReadStatsCountedTest(unittest.TestCase):
     def test_hybrid_counts_skipped_version_lines(self):
         db = os.path.join(self.tmp.name, 'clean.db')
         make_schema6_db(db)
-        lib = os.path.join(self.tmp.name, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': db})
         for ch in corpus.chunks(2):
             list(corpus.iter_texts_docs(ch))
         corpus.close()
         # the version row belongs to book 1 (Sefaria), so hybrid skips it too
         self.assertEqual(corpus.stats.version_lines_skipped, 1)
+
+
+# make_schema6_db + add_version_edge_cases: line id -> book id
+_LINE_BOOKS = {1: 1, 2: 1, 3: 2, 4: 2, 6: 3, 7: 3, 9: 3}
+# (versionId, lineId) of their version rows with content; no line 8 or 50
+_VERSION_READINGS = [(1, 2), (4, 2), (2, 3), (3, 6), (3, 7), (3, 8), (3, 50)]
+_BY_SOURCE = ('SELECT b.id FROM book b JOIN source s ON s.id = b.sourceId '
+              'WHERE s.name = ?')
+# name -> (book_ids_sql, params, the book ids it selects)
+_BOOK_FILTERS = {
+    'none': (None, (), None),
+    'Sefaria': (_BY_SOURCE, ('Sefaria',), {1, 3}),
+    'Dicta': (_BY_SOURCE, ('DictaToOtzaria',), {2}),
+    'hasTeamim': ('SELECT id FROM book WHERE hasTeamim = 1', (), {3}),
+    'no book': ('SELECT id FROM book WHERE 0', (), set()),
+}
+
+
+def add_version_edge_cases(path):
+    """On top of make_schema6_db: a second Sefaria book (3, cantillated)
+    with gaps in its line ids, a line with two versions, NULL rows in two
+    books, and version rows whose line does not exist (8 and 50)."""
+    con = sqlite3.connect(path)
+    zd = _zstd.ZstdDict(
+        con.execute('SELECT dict FROM zstd_dict').fetchone()[0])
+
+    def z(text):
+        return _zstd.compress(text.encode('utf-8'), zstd_dict=zd)
+
+    con.execute("INSERT INTO book VALUES(3, 'ספר ג', 1, 1)")
+    for i in (6, 7, 9):
+        con.execute('INSERT INTO line VALUES(?,3,?,?,NULL,0)',
+                    (i, i, f'ref {i}'))
+        con.execute('INSERT INTO line_content VALUES(?,?)',
+                    (i, z(f'שורה {i}')))
+    con.executemany('INSERT INTO book_version VALUES(?,?,?,1)',
+                    [(2, 2, 'v2'), (3, 3, 'v3'), (4, 1, 'v4')])
+    con.executemany('INSERT INTO version_line VALUES(?,?,?,0)',
+                    [(v, ln, z('נוסח אחר')) for v, ln in _VERSION_READINGS
+                     if (v, ln) != (1, 2)]   # make_schema6_db's own row
+                    + [(2, 4, None), (3, 9, None)])
+    con.commit()
+    con.close()
+
+
+def _in_subquery_sql(lo, hi, book_ids_sql, params):
+    """count_version_lines' query before the join, ``(sql, args)``: the
+    reference for which rows count."""
+    sql = 'SELECT COUNT(*) FROM version_line WHERE content IS NOT NULL'
+    args = []
+    if lo is not None:
+        sql += ' AND lineId >= ? AND lineId < ?'
+        args = [lo, hi]
+    if book_ids_sql:
+        sql += (' AND lineId IN (SELECT id FROM line '
+                f'WHERE bookId IN ({book_ids_sql}))')
+        args.extend(params)
+    return sql, args
+
+
+class _Recorder:
+    """Stands in for a connection and keeps every statement run on it."""
+
+    def __init__(self, con):
+        self.con, self.calls = con, []
+
+    def execute(self, sql, args=()):
+        self.calls.append((sql, tuple(args)))
+        return self.con.execute(sql, args)
+
+
+@contextlib.contextmanager
+def _recording(odb):
+    """Record the statements `odb` runs; its connection is restored after."""
+    rec = odb.con = _Recorder(odb.con)
+    try:
+        yield rec
+    finally:
+        odb.con = rec.con
+
+
+def _plan(con, sql, args):
+    """The EXPLAIN QUERY PLAN details of a statement, joined. Only the
+    details are used: the other columns differ between SQLite versions."""
+    return ' | '.join(str(r[-1]) for r in
+                      con.execute('EXPLAIN QUERY PLAN ' + sql, args))
+
+
+@unittest.skipIf(_zstd is None, NO_ZSTD)
+class BookFilteredReadTest(unittest.TestCase):
+    """Reads restricted to some books: the same rows, with a chunk's id range
+    — not the list of the selected books' lines — driving the scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, 'seforim.db')
+        make_schema6_db(self.db)
+        add_version_edge_cases(self.db)
+        bounds = list(range(12)) + [50, 51]
+        self.ranges = [(lo, hi) for lo in bounds for hi in bounds if lo <= hi]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _hybrid(self):
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
+        return HybridCorpus({'type': 'hybrid', 'path': lib, 'db': self.db})
+
+    def test_version_counts_match_the_in_subquery_form(self):
+        ranges = [(None, None)] + self.ranges       # None: the whole table
+        with OtzariaDB(self.db) as odb:
+            for name, (sql, params, books) in _BOOK_FILTERS.items():
+                with self.subTest(name):
+                    got = [odb.count_version_lines(lo, hi, sql, params)
+                           for lo, hi in ranges]
+                    self.assertEqual(got, [
+                        odb.con.execute(*_in_subquery_sql(
+                            lo, hi, sql, params)).fetchone()[0]
+                        for lo, hi in ranges])
+                    self.assertEqual(got, [
+                        sum(1 for _, ln in _VERSION_READINGS
+                            if (lo is None or lo <= ln < hi) and (
+                                books is None
+                                or _LINE_BOOKS.get(ln) in books))
+                        for lo, hi in ranges])
+
+    def test_hybrid_skipped_count_does_not_depend_on_chunking(self):
+        for n in (1, 2, 3, 7):
+            with self.subTest(chunks=n):
+                corpus = self._hybrid()
+                for ch in corpus.chunks(n):
+                    list(corpus.iter_texts_docs(ch))
+                corpus.close()
+                # (1,2) (4,2) (3,6) (3,7): the Sefaria books' own readings
+                self.assertEqual(corpus.stats.version_lines_skipped, 4)
+
+    def test_range_reads_return_exactly_the_selected_books(self):
+        with OtzariaDB(self.db) as odb:
+            for name, (sql, params, books) in _BOOK_FILTERS.items():
+                with self.subTest(name):
+                    for lo, hi in self.ranges:
+                        st = ReadStats()
+                        got = sorted((lid, bid) for lid, bid, _ in
+                                     odb.iter_range(lo, hi, st, sql, params))
+                        self.assertEqual(got, sorted(
+                            (i, b) for i, b in _LINE_BOOKS.items()
+                            if lo <= i < hi
+                            and (books is None or b in books)), (lo, hi))
+                        self.assertEqual(st.unread(), 0)
+
+    def test_hybrid_chunk_is_driven_by_its_id_range(self):
+        corpus = self._hybrid()
+        try:
+            _, lo, hi = next(c for c in corpus.chunks(2) if c[0] == 'db')
+            with _recording(corpus._otzaria()) as rec:
+                list(corpus.iter_texts_docs(('db', lo, hi)))
+            [read] = [c for c in rec.calls if 'line_content' in c[0]]
+            [count] = [c for c in rec.calls if 'version_line' in c[0]]
+            read_plan = _plan(rec.con, *read)
+            count_plan = _plan(rec.con, *count)
+            old_plan = _plan(rec.con, *_in_subquery_sql(
+                lo, hi, _BY_SOURCE, ('Sefaria',)))
+        finally:
+            corpus.close()
+        # driven by the book index, SQLite walked the lines of every
+        # selected book on each chunk; the range must drive instead
+        self.assertIn('rowid>?', read_plan)
+        self.assertIn('lineId>?', count_plan)
+        for plan in (read_plan, count_plan):
+            self.assertNotIn('idx_line_book_index', plan)
+        # and the check is not vacuous: the IN-subquery form fails it
+        self.assertIn('idx_line_book_index', old_plan)
 
 
 class ReadOnlyUriTest(unittest.TestCase):

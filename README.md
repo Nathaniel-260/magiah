@@ -23,10 +23,10 @@ suspected correction can be **verified against the corpus itself**.
 
 | Class | Example | Verification |
 |---|---|---|
-| **Missing space** | `אתהשמים` → `את השמים` | the split sequence must actually occur *with* spaces elsewhere in the corpus (bigram evidence) |
+| **Missing space** | `אתהשמים` → `את השמים` | every plausible segmentation (all 2-part splits, the best 3-part ones) is checked; a split is confirmed when its exact word sequence occurs *with* spaces in the corpus (at least `split_obs_min` times; a split with a 2-letter part also needs twice the count expected by chance, and a final letter marking the break needs one sighting), and among the confirmed splits the chosen one has the best score and the strongest association (observed vs. expected by chance). A split never displaces an edit-1 correction of the same word unless it is seen at least `split_obs_min` times and 10x above chance; otherwise it stays an alternative (alternatives and their counts are kept in `report.db` → `split_alternatives`) |
 | **Extra space** | `הימ נו` → `הימנו` | the joined form is frequent while a fragment is rare |
 | **Wrong / missing / extra / swapped letter** | `היעמנו` → `הימנו` | Damerau-Levenshtein distance 1 from a word ≥50× more frequent, boosted by a **learned confusion matrix** (see Calibration), then **context-verified**: the corrected word must appear next to the same neighboring words elsewhere |
-| **Final letter mid-word** | `שלוםעליכם` | deterministic rule of Hebrew orthography (ם ן ץ ף ך) |
+| **Final letter mid-word** | `שלוםעליכם` | deterministic rule of Hebrew orthography (ם ן ץ ף ך), applied up to `struct_max` occurrences (default 10), not only to rare words; abbreviations (geresh/gershayim) are exempt, and with no corpus word to propose it is reported as a *suspicion* with an empty suggestion |
 | **Non-final letter at word end** | `אדמ` → `אדם` | the final-form variant must be ≥50× more frequent |
 | **Abbreviation that lost its gershayim** | `רמבם` → `רמב"ם` | the quoted form must be a frequent abbreviation in the corpus |
 | **Book-specific OCR errors** | ד↔ר confusion throughout one scanned book | per-book OCR profiles learned by calibration allow a sensitized rescan of books with a proven systematic confusion |
@@ -67,6 +67,13 @@ suspected correction can be **verified against the corpus itself**.
 Every finding gets a confidence score; reports are sorted so genuine errors
 concentrate at the top, and each class also gets a high-precision
 `*_verified.csv` subset (context-verified or repeated in the same book).
+Rarity is statistical evidence, not a verdict: each row also carries an
+`evidence` column naming the support actually found — `context` (correction
+seen beside the same neighbours corpus-wide), `book_local` (correction used
+3+ times in the same book), `split_observed` (the spaced sequence occurs),
+`tanach`, `structural` (a deterministic orthographic rule with a corpus suggestion), `ocr_profile` (the book's reviewed systematic confusion), `suspicion` (structural rule, nothing to propose) or `none`. A
+single-book scan that looked only inside the book reports `context_book` /
+`split_observed_book` instead.
 
 ### False-positive suppression
 
@@ -103,9 +110,9 @@ common failure modes of naive edit-distance flagging:
 3. locate     find occurrences, detect extra spaces,
               context-verify corrections, check Tanach quotes (two corpus passes)
 4. report     ranked CSVs + SQLite report, split per source
-5. calibrate  (optional, after a first run) learn a letter-confusion matrix
-              and per-book OCR profiles from the verified findings, then
-              rerun detect+locate for a sharper second pass
+5. calibrate  (optional, after reviewing findings) learn a letter-confusion
+              matrix and per-book OCR profiles from HUMAN-REVIEWED findings
+              (approved/fixed in the review UI), then rerun detect+locate
 6. review     local web interface for accepting/rejecting findings
 ```
 
@@ -135,8 +142,9 @@ encoding problems.
 (`line.content`) and schema 6 (`line_content`, zstd with a stored
 dictionary) are read. Alternative editions in `version_line` are not
 scanned and are counted as skipped. Every stage writes
-`coverage_<stage>.json`, and a stage that could not decode some rows
-stops with an error instead of reporting a partial pass as complete:
+`coverage_<stage>.json`, and a stage that could not read some rows
+stops with an error instead of reporting a partial pass as complete (see
+*Unreadable rows* below):
 
 ```bash
 magiah all --otzaria --out results
@@ -147,14 +155,76 @@ corpus source and thresholds are remembered in `results/run_config.json`, so
 after tuning thresholds you can rerun from `detect` without recounting the
 lexicon.
 
-**Second, sharper pass** (recommended):
+A failed stage never replaces its previous output, so after a failed run the
+folder still holds the last good results. Every run therefore records itself
+in `results/run_state/` — when it started, the stage it reached, and how it
+ended (done, failed, partial, cancelled). A run that never got to say how it
+ended (killed, window closed, power cut) is recognized as *interrupted*: it
+holds an OS file lock for as long as it lives. The review UI (`magiah ui`)
+reads this record and, until a scan that rebuilds the results succeeds, shows
+a warning above the findings that they come from the previous complete scan.
+Two pipeline runs on one folder at a time are refused — they would overwrite
+each other's files.
+
+**Unreadable rows (`--allow-unread`).** `seforim.db` is used as downloaded,
+and it may hold a row that cannot be read — a corrupt zstd frame, or a
+`line` without its `line_content` row. By default any such row stops the
+stage before it writes anything; the error lists the rows (book, reference,
+line id) and says how to go on. If the database cannot be repaired, let the
+scan skip them:
+
+```bash
+magiah all --otzaria --out results --allow-unread 3
+```
+
+* `N` is an absolute number of distinct rows (a row met by several passes
+  counts once). The default, `0`, skips none, and there is no "unlimited".
+  With more than N unreadable rows the stage stops as before, so a database
+  that degrades further is not let through.
+* With a folder of text files (`--textdir`, or the library of a hybrid scan)
+  an unreadable *file* counts as one row, and the review UI's notice speaks
+  of files, not of the database.
+* Skipped rows are not scanned: errors in them are not found, and their
+  words are missing from the lexicon frequencies. Every output built this way
+  is marked partial, never complete: `coverage_<stage>.json` keeps
+  `complete: false` and adds `accepted: true`, `allow_unread`, `unread_rows`,
+  `unread_units` (the row ids) and `unread_refs` (where the first 20 are); a
+  stage built on a partial output of an earlier stage records it under
+  `inherited`. `report.db` carries the same record, and the review UI shows a
+  persistent notice listing the rows. Such a run still counts as completed:
+  its results are the latest, so the warning about a scan that did not
+  finish does not appear — unless a later scan fails, and then both do.
+* The option applies only to the run that names it and is not remembered in
+  `run_config.json`. A later run — `detect`, `report`, a single-book scan —
+  refuses partial outputs unless it is given an `--allow-unread` that covers
+  as many rows, and its error says which value to give. A complete run (for
+  example on a repaired database, without the option) replaces the partial
+  outputs and clears every mark.
+* A single-book scan follows the same rule: a book with at most N unreadable
+  rows is scanned without them and marked partial; with more, it is refused.
+* In the UI scan panel the option is the advanced setting «שורות לא קריאות
+  מותרות»; it opens at 0 and is cleared after each scan.
+* Deleting `coverage_*.json` is not a workaround: on a fresh folder it
+  unblocks nothing, and on an old one it passes stale results off as current.
+
+**Second, sharper pass** (recommended, after reviewing some findings):
 
 ```bash
 magiah calibrate --out results   # learn confusion matrix + OCR book profiles
+                                 # from your reviewed decisions (ui_review.db)
 magiah detect    --out results
 magiah locate    --out results
 magiah report    --out results
 ```
+
+Calibration never learns from the machine's own unreviewed output by
+default (that would reinforce its own guesses). Without reviewed findings it
+learns nothing and says so; `--calibrate-from-machine` learns from
+`report.db` anyway and labels the result `machine_unreviewed` in
+`calibration_meta.json`. Learned files without that provenance (written by
+older versions), or whose hash no longer matches it, are ignored, and a
+`calibrate` run with nothing to learn disables the previous files. `python -m magiah.eval --out results` measures
+the ranking's precision on reviewed books held out from calibration.
 
 **Scan a single book** (seconds instead of an hour):
 
@@ -174,8 +244,11 @@ Findings are merged **additively** into `ui_review.db`. If the book was scanned
 before, its rows are replaced in place (no duplicates) and your review
 decisions on them are preserved; other books are untouched.
 
-`--book-verify-ctx` additionally verifies each correction against the entire
-corpus (more accurate, adds ~10 min). Without it, verification is book-local.
+`--book-verify-ctx` additionally verifies each correction and each split
+against the entire corpus (adds ~10 min); the findings are then the ones a
+full scan gives for this book. Without it, verification is book-local and is
+labelled so (`ctx_scope`/`split_scope` = `book`, evidence `context_book` /
+`split_observed_book`).
 
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
@@ -290,6 +363,8 @@ titles, references and source-repository names from Otzaria's schema. Use
 | `tanach_matches.csv` / `tanach_edition_errors.csv` | quotations confirmed by 2+ independent sources / edition disagreements (`evidence` JSON: variant vs. unresolved, witnesses) |
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
+| `coverage_<stage>.json` | what each stage actually read — a partial read stops the stage and is recorded here; for a partial output accepted under `--allow-unread` also `accepted`, the rows not read and where they are |
+| `run_state/` | how the latest runs ended (`scan.json`, `book.json`) — read by the review UI |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |
 
 ```sql

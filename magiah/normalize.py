@@ -37,12 +37,28 @@ for _cp in range(0xFB1D, 0xFB50):
 _STRIP[0x00A0] = ' '
 _STRIP[0x05F3] = "'"                     # geresh
 _STRIP[0x05F4] = '"'                     # gershayim
+# Yiddish ligatures (װ ױ ײ) are single code points outside [א-ת]; spelled out
+# so a word like צװײ stays one token instead of breaking at the ligature.
+_STRIP[0x05F0] = 'וו'
+_STRIP[0x05F1] = 'וי'
+_STRIP[0x05F2] = 'יי'
+
+# Combining marks that belong to the letter before them (nikud, teamim, the
+# Judeo-Arabic dots, CGJ). Maqaf, paseq, sof pasuq and nun hafukha are in the
+# same block but separate words, so they are not marks.
+MARKS = frozenset(chr(c) for c in range(0x0591, 0x05C8)
+                  if c not in (0x05BE, 0x05C0, 0x05C3, 0x05C6)) \
+    | frozenset((chr(0x0307), chr(0x0323), chr(0x034F)))
+_JOINERS = frozenset((chr(0x200C), chr(0x200D)))      # ZWNJ, ZWJ
 
 # Inline formatting tags are removed with no space so they never split a word
 # (e.g. an enlarged first letter: <big>ב</big>ראשית). Structural tags become
 # a space so adjacent blocks never merge into one word.
-INLINE_TAG_RE = re.compile(r'</?(?:b|i|u|em|strong|big|small|font)(?:\s[^>]*)?>',
-                           re.IGNORECASE)
+# `span` is inline: it only styles, so ה<span>ע</span>ולם is one word. `sup`
+# is NOT: it carries footnote letters that would glue onto the next word.
+INLINE_TAG_RE = re.compile(
+    r'</?(?:b|i|u|em|strong|big|small|font|span)(?:\s[^>]*)?>',
+    re.IGNORECASE)
 TAG_RE = re.compile(r'<[^>]*>')
 TOKEN_RE = re.compile(r'[א-ת]+(?:["\'][א-ת]+)*')
 
@@ -101,19 +117,55 @@ def tokenize(text):
 # that word sits in the raw line (measured: 35 raw chars -> 22 clean ones). The
 # fixer must write back into the raw file, so it needs the inverse map.
 #
-# `clean_mapped` therefore performs the SAME transform as `clean` while
-# recording, for every character it emits, the raw index that produced it.
-# Tag ranges are blanked in place (rather than removed) so that indices stay
-# raw-aligned throughout:
-_DROP = '\x00'      # inline tag: removed with NO space (never splits a word)
-_SPACE = '\x01'     # structural tag: ONE space per tag (matches TAG_RE.sub(' '))
-_KEEP = '\x02'      # continuation of a structural tag: contributes nothing
+# `clean_mapped` therefore performs the SAME transform as `clean`, stage by
+# stage on real strings, while recording for every character it emits the raw
+# span that produced it. No character is reserved as a marker: a line may hold
+# any code point (NUL, U+0001 and U+0002 do occur in library files), and a
+# sentinel that collides with one silently desynchronizes the map from
+# `clean`, which turns into refusals at best.
 
 # `clean` decodes entities with html.unescape, which is more permissive than a
 # strict entity regex (it also accepts some forms without a trailing ';'). To
 # stay byte-identical we do not re-implement it: we find candidate runs, hand
 # each to html.unescape, and keep only the ones it actually changes.
 _ENTITY_RE = re.compile(r'&#?[0-9a-zA-Z]+;?')
+
+# every character `clean` translates (removes, replaces or expands); runs of
+# other characters are copied in one slice
+_SPECIAL_RE = re.compile('[%s]' % ''.join(
+    re.escape(chr(c)) for c in sorted(_STRIP)))
+
+
+def _strip_mapped(s, a, b):
+    """Translate `s` through _STRIP; ``a[i]``/``b[i]`` are the raw bounds of
+    ``s[i]`` (None: ``s`` IS the raw text, so they are ``i``/``i + 1``)."""
+    out, om, em = [], [], []
+    pos = 0
+    for m in _SPECIAL_RE.finditer(s):
+        i = m.start()
+        if i > pos:
+            out.append(s[pos:i])
+            if a is None:
+                om.extend(range(pos, i))
+                em.extend(range(pos + 1, i + 1))
+            else:
+                om.extend(a[pos:i])
+                em.extend(b[pos:i])
+        rep = _STRIP[ord(s[i])]
+        if rep:
+            out.append(rep)
+            om.extend([i if a is None else a[i]] * len(rep))
+            em.extend([i + 1 if a is None else b[i]] * len(rep))
+        pos = i + 1
+    if pos < len(s):
+        out.append(s[pos:])
+        if a is None:
+            om.extend(range(pos, len(s)))
+            em.extend(range(pos + 1, len(s) + 1))
+        else:
+            om.extend(a[pos:])
+            em.extend(b[pos:])
+    return ''.join(out), om, em
 
 
 def clean_mapped(text):
@@ -131,71 +183,46 @@ def clean_mapped(text):
 
     Invariant (asserted by the tests): ``clean_mapped(t)[0] == clean(t)``.
     """
-    buf = list(text)
+    if '<' not in text and '&' not in text:
+        return _strip_mapped(text, None, None)
+    s, a, b = text, list(range(len(text))), list(range(1, len(text) + 1))
     if '<' in text:
-        # inline first, then structural — the order `clean` uses
-        for m in INLINE_TAG_RE.finditer(text):
-            for i in range(m.start(), m.end()):
-                buf[i] = _DROP
-        masked = ''.join(buf)
-        for m in TAG_RE.finditer(masked):
-            if _DROP in masked[m.start():m.end()]:
-                continue        # already consumed as an inline tag
-            # one space PER TAG: mark the opening char, blank the remainder,
-            # so '<blockquote><p>' yields two spaces exactly as
-            # TAG_RE.sub(' ') does
-            buf[m.start()] = _SPACE
-            for i in range(m.start() + 1, m.end()):
-                buf[i] = _KEEP
-    # entity decoding, still position-aligned: the decoded text is attributed
-    # to the '&' that started the entity
-    ents = {}
-    if '&' in text:
-        masked = ''.join(buf)
-        for m in _ENTITY_RE.finditer(masked):
-            frag = m.group()
-            if _DROP in frag or _SPACE in frag or _KEEP in frag:
-                continue        # the candidate sat inside a tag
-            dec = html.unescape(frag)
-            if dec != frag:
-                ents[m.start()] = (m.end(), dec)
-
-    out, omap, emap = [], [], []
-    i, n = 0, len(buf)
-    while i < n:
-        ent = ents.get(i)
-        if ent is not None:
-            end, dec = ent
-            for ch in dec:
-                rep = _STRIP.get(ord(ch), ch)
-                if rep is None:
-                    continue
-                for c in rep:
-                    out.append(c)
-                    omap.append(i)
-                    emap.append(end)
-            i = end
-            continue
-        ch = buf[i]
-        if ch == _DROP or ch == _KEEP:
-            i += 1
-            continue
-        if ch == _SPACE:
-            out.append(' ')
-            omap.append(i)
-            emap.append(i + 1)
-            i += 1
-            continue
-        rep = _STRIP.get(ord(ch), ch)
-        if rep is None:
-            i += 1
-            continue
-        for c in rep:
-            out.append(c)
-            omap.append(i)
-            emap.append(i + 1)
-        i += 1
-    return ''.join(out), omap, emap
+        # inline tags go with NO space, then structural tags become ONE space
+        # each — the order and the regexes `clean` uses, on the same strings
+        for rx, rep in ((INLINE_TAG_RE, ''), (TAG_RE, ' ')):
+            parts, na, nb, pos = [], [], [], 0
+            for m in rx.finditer(s):
+                parts.append(s[pos:m.start()])
+                na.extend(a[pos:m.start()])
+                nb.extend(b[pos:m.start()])
+                if rep:
+                    parts.append(rep)
+                    na.append(a[m.start()])
+                    nb.append(a[m.start()] + 1)
+                pos = m.end()
+            parts.append(s[pos:])
+            na.extend(a[pos:])
+            nb.extend(b[pos:])
+            s, a, b = ''.join(parts), na, nb
+    if '&' in s:
+        # the decoded text is attributed to the whole raw entity
+        parts, na, nb, pos = [], [], [], 0
+        for m in _ENTITY_RE.finditer(s):
+            dec = html.unescape(m.group())
+            if dec == m.group():
+                continue
+            parts.append(s[pos:m.start()])
+            na.extend(a[pos:m.start()])
+            nb.extend(b[pos:m.start()])
+            parts.append(dec)
+            na.extend([a[m.start()]] * len(dec))
+            nb.extend([b[m.end() - 1]] * len(dec))
+            pos = m.end()
+        parts.append(s[pos:])
+        na.extend(a[pos:])
+        nb.extend(b[pos:])
+        s, a, b = ''.join(parts), na, nb
+    return _strip_mapped(s, a, b)
 
 
 def token_spans(text):
@@ -209,12 +236,81 @@ def token_spans(text):
     along with the word, which is correct for a whole-word correction — and
     callers that would rather not touch markup can detect it by looking for
     '<' inside the returned slice.
+
+    The span also swallows the combining marks after the last letter (the
+    dagesh in ``אמרוּ``): they emit nothing in the clean text, so without this
+    a replacement would leave them orphaned on the following character.
     """
+    return [s[:3] for s in token_spans_full(text)[1]]
+
+
+def mark_end(text, j):
+    """Index past the marks that follow ``text[j-1]`` (joiners only between
+    marks, never trailing).
+
+    A mark still belongs to the letter when it is written as an entity
+    (``אמרו&#1468;``) or sits behind inline formatting tags, which clean()
+    drops without a space (``<b>אמרו</b>ּ``). The span takes those along:
+    left outside it, the mark would end up on the replacement's last letter.
+    (The fixer then refuses a span holding a tag, and asks for a vocalized
+    correction for one holding a mark.)
+    """
+    n, k = len(text), j
+    while k < n:
+        ch = text[k]
+        if ch in MARKS or ch in _JOINERS:
+            k += 1
+            if ch in MARKS:
+                j = k
+        elif ch == '&':
+            m = _ENTITY_RE.match(text, k)
+            dec = html.unescape(m.group()) if m else ''
+            if not m or dec == m.group() or not all(
+                    c in MARKS or c in _JOINERS for c in dec):
+                break
+            k = m.end()
+            if any(c in MARKS for c in dec):
+                j = k
+        elif ch == '<':
+            m = INLINE_TAG_RE.match(text, k)
+            if not m:
+                break
+            k = m.end()            # taken only if a mark follows it
+        else:
+            break
+    return j
+
+
+def token_spans_full(text):
+    """``(clean_text, [(token, raw_start, raw_end, clean_start, clean_end)])``
+    — :func:`token_spans` plus each token's position in the CLEAN text, which
+    is the coordinate system the scanner's snippets were cut in."""
     clean_text, omap, emap = clean_mapped(text)
     spans = []
     for m in TOKEN_RE.finditer(clean_text):
-        spans.append((m.group(), omap[m.start()], emap[m.end() - 1]))
-    return spans
+        spans.append((m.group(), omap[m.start()],
+                      mark_end(text, emap[m.end() - 1]),
+                      m.start(), m.end()))
+    return clean_text, spans
+
+
+def is_mark(ch):
+    return ch in MARKS
+
+
+def has_marks(text):
+    """True when `text` carries nikud/teamim, as marks (also written as
+    entities, ``&#1468;``) or presentation forms (U+FB1D-FB4E, except the
+    wide letters FB20-FB29 that carry none)."""
+    if '&' in text:
+        text = html.unescape(text)
+    for ch in text:
+        if ch in MARKS:
+            return True
+        cp = ord(ch)
+        if 0xFB1D <= cp <= 0xFB4E and not 0xFB20 <= cp <= 0xFB29:
+            return True
+    return False
 
 
 def phrase_spans(text, phrase):

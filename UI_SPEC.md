@@ -87,26 +87,29 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);  -- import timestamps, sour
 - `report.db.tanach_errors_full` → family `tanach_error`, errtype `tanach_edition`; suggestion = `canonical`.
 - `report.db.tanach_matches_full` → family `tanach_match`, errtype `tanach_match` (informational).
 - `1784548105098-tokdiag_source_he.csv` (if present in outdir) → family `tokdiag`, errtype `tokdiag`; word=term, suggestion, snippet=context, source=book, ref=heRef, unit=line_id; extra={category,freq}. origin: resolve via unit→occurrences match if cheap, else 'לא ידוע'.
-- **Migration:** existing `decisions.db` (114 rows): verdict `accept`→status `approved` (with suggestion→custom_suggestion if differs), `reject` with unit='*'→word_rules `not_error`, `reject` per-unit→`not_error`, `ignore`→`ignored`. Match on (word, unit) → finding_id.
+- **Migration:** existing `decisions.db` (114 rows): verdict `accept`→status `approved` (with suggestion→custom_suggestion if differs), `reject` per-unit→`not_error` on that occurrence only, `ignore`→`ignored`; a unit='*' row → a word_rules row of its own status (`reject`→`not_error`, the only global scope; an `accept` stays an approval). An `accept` on a Tanach-backed finding comes in as `unsure`, its old suggestion in the note. Match on (word, unit) → finding_id.
+- **Decision scopes:** a decision reaches `occurrence` (this finding), `replacement` (`replacement_rules`: every finding proposing the same word→suggestion), `book` (`book_rules`: the word within one doc) or `word` (`word_rules`: everywhere). Per-decision details (scope, approved_suggestion, decided_by, flag, prev_decision) live in `review_ext`; `review`'s column list is unchanged. An approval whose finding later proposes a different suggestion (re-import / book re-scan) drops to `pending` with flag `stale_approval`; a user-typed correction stays bound. An approval made by a rule (word-wide or replacement) never reaches a `tanach_legacy` row. A dropped approval (stale, or a legacy Tanach approval an import drops) is withdrawn from decisions.db in the same step, decisions.db committed first; if decisions.db is locked the import / undo / restore changes nothing and answers 423. Existing databases are upgraded additively on connect (`meta.schema_rev`).
 
-**Effective status resolution (query layer):** review row wins; else word_rules for that word; else `pending`.
+**Effective status resolution (query layer):** review row wins; else the book rule (word, doc); else the replacement rule (word, suggestion); else word_rules for that word; else `pending`.
 
-**decisions.db sync-back (critical for pipeline compat):** every status write ALSO writes the old-format row to `decisions.db` `decisions(word,unit,errtype,verdict,suggestion,source,ref)`: `approved`/`fixed` → verdict `accept`; `not_error` → `reject` (word-rule → unit='*'); `ignored` → `ignore`; `pending`/`unsure` → DELETE the row (so old detect feedback loop keeps working unchanged).
+**Book identity:** the `doc` column (DB bookId / library relpath / `local:<abs>`), never the title. Rows without a doc are keyed `src:<title>`.
+
+**decisions.db sync-back (critical for pipeline compat):** every status write ALSO writes the old-format row to `decisions.db` `decisions(word,unit,errtype,verdict,suggestion,source,ref)`: `approved`/`fixed` → verdict `accept`; `not_error` → `reject` (word-rule → unit='*'; only unit='*' rows feed the detect whitelist, and `decision_scope` records each row's scope explicitly); `ignored` → `ignore`; `pending`/`unsure` → DELETE the row (so old detect feedback loop keeps working unchanged).
 
 ## 3. HTTP API (JSON, UTF-8; server binds 127.0.0.1)
 
 - `GET /` and `/static/*` — SPA files.
-- `GET /api/meta` — { origins:[{name, hebrew, count, done_count}], errtypes:[{key, hebrew, explanation, count, pending_count}], statuses:[...], columns:[{key, hebrew, explanation}] }.
+- `GET /api/meta` — { origins:[{name, hebrew, count, done_count}], errtypes:[{key, hebrew, explanation, count, pending_count}], statuses:[...], columns:[{key, hebrew, explanation}], result_status (§9f) }.
 - `GET /api/books?origin=&q=` — books (source values) with counts + pending counts, sorted by count desc; q = substring filter.
-- `GET /api/findings?origin=&book=&errtype=&status=&verified=&min_rank=&q=&sort=rank|random|source|word&dir=&page=&page_size=` — paginated (default page_size 50, max 500). Returns rows with effective_status + total count. `q` searches word/suggestion/snippet/ref (LIKE).
+- `GET /api/findings?origin=&book_key=&errtype=&status=&verified=&min_rank=&q=&sort=rank|random|source|word&dir=&page=&page_size=` — paginated (default page_size 50, max 500). Returns rows with effective_status + total count. `q` searches word/suggestion/snippet/ref (LIKE). `book` (by title) is still accepted. With `cursor=` (empty for the first page) paging is keyset-based (index seeks, no OFFSET) and the response carries `next_cursor` (null on the last page); `total` is null there unless `total=1` is passed. `seed=` selects the `random` order (a seed-keyed permutation; same seed, same order). The card queue uses this.
 - `GET /api/finding/<id>` — full row incl. extra JSON, history entries for it.
-- `POST /api/status` — body {ids:[...], status, note?, custom_suggestion?, scope?:'occurrence'|'word'} ; scope 'word' writes word_rules for those words. Writes history + decisions.db sync. Returns updated counts.
-- `POST /api/undo` — revert last history entry (incl. bulk as one step). Returns what was reverted.
+- `POST /api/status` — body {ids:[...], status, note?, custom_suggestion?, scope?:'occurrence'|'replacement'|'book'|'word', expect_status?, actor?:'agent'} ; scope 'word' writes word_rules for those words. Writes history (with the full previous state) + decisions.db sync; `decided_by` is 'human' unless actor='agent'. A write that changes nothing is skipped. If `expect_status` no longer matches → 409 {code:'status_conflict', current:{id: status}} (checked inside the write transaction). `approved`/`fixed` with scope `book` or `word` is refused (400): an approval is bound to one suggestion. Returns updated counts.
+- `POST /api/undo` — revert the last user history group (incl. bulk as one step), restoring the full previous state. An import's `legacy_recheck` entry is not an undo step, and an approval an import dropped after the reverted entry comes back `pending`, as does one restored onto a changed suggestion (`stale_approval`). 423 when decisions.db is locked. Returns what was reverted.
 - `GET /api/history?limit=100` — recent actions.
 - `GET /api/stats` — progress matrix: per origin × status counts, per errtype × status, per book (top N + filtered).
 - `POST /api/export/xlsx` — body {origin?} — export one/all origins; returns file paths + row counts.
 - `POST /api/export/fixes` — legacy `to_send/` export (see §7). Returns counts.
-- `POST /api/refresh` — re-run importer (after a new pipeline scan).
+- `POST /api/refresh` — re-run importer (after a new pipeline scan). Also returns `stale` and `result_status` (§9f); when the results it loaded are not the latest scan's, its message says so instead of reporting a completed refresh.
 - Errors: JSON {error: "<Hebrew message>"} with proper HTTP status; **all user-facing messages in Hebrew**.
 
 ## 4. Hebrew mappings (hebrew.py — the single source of truth; frontend fetches via /api/meta)
@@ -189,7 +192,7 @@ Origin (מאגר) display names: Sefaria→ספריא, DictaToOtzaria→דיקט
 - Large sheets (Sefaria ~194k rows) must export in streaming fashion (write rows incrementally, no giant string concat) and stay under a few hundred MB memory.
 - If target file is locked (open in Excel): return Hebrew error naming the locked file — never skip silently (fix for defect §8.3).
 
-**B. Legacy fixes export (compat):** `POST /api/export/fixes` reproduces old `to_send/` exactly: `approved_fixes_all.csv` + `approved_fixes_<origin>.csv` (header `word,suggestion,errtype,book,ref,line_id,origin,snippet`, UTF-8-BOM) from statuses approved+fixed (custom_suggestion wins over suggestion), plus `rejected_words.txt` from not_error word_rules **and** per-occurrence not_error words. Fix defect §8.1: book/ref/origin/snippet come from the findings table directly (no lossy join → no more "Unknown" rows).
+**B. Legacy fixes export (compat):** `POST /api/export/fixes` reproduces old `to_send/` exactly: `approved_fixes_all.csv` + `approved_fixes_<origin>.csv` (header `word,suggestion,errtype,book,ref,line_id,origin,snippet`, UTF-8-BOM) from statuses approved+fixed (custom_suggestion wins over suggestion), plus `rejected_words.txt` from not_error word_rules (global exclusions only), `rejected_occurrences.csv`, `rejected_replacements.csv` and `book_conventions.csv`. The fixes files append `approved_suggestion,decided_by` after the 8 legacy columns. A per-origin file this exporter wrote earlier (listed in `to_send/.magiah_export_manifest.json`) is removed once that origin has no fixes. Fix defect §8.1: book/ref/origin/snippet come from the findings table directly (no lossy join → no more "Unknown" rows).
 
 ## 8. Defects in old tool that MUST be fixed in the new one
 
@@ -218,7 +221,7 @@ Origin (מאגר) display names: Sefaria→ספריא, DictaToOtzaria→דיקט
 ## 11. Module interface contracts (for parallel build)
 
 - `xlsx.write_workbook(path, sheets)` — pure, no DB access. `sheets` = list of dicts: `{"name": str, "headers": [str], "rows": iterable of lists (str|int|float|None)}`. Always: rightToLeft views, bold frozen header row, inline strings, XML-escaping + illegal-char stripping, streaming write. Raises `PermissionError` (with path in message) if the target is locked; caller turns that into the Hebrew error.
-- `db.py` public functions (server imports these): `import_all(outdir) -> dict counts`, `connect(outdir)`, `get_meta(con)`, `get_books(con, origin, q)`, `query_findings(con, filters, sort, page, page_size) -> (rows, total)`, `get_finding(con, id)`, `set_status(con, outdir, ids, status, note, custom_suggestion, scope) -> counts` (writes history + decisions.db sync), `undo(con, outdir)`, `get_history(con, limit)`, `get_stats(con)`, `get_fixlist(con, book, origin, statuses)`.
+- `db.py` public functions (server imports these): `import_all(outdir) -> dict counts`, `connect(outdir)`, `get_meta(con, outdir=None)` (with `outdir`: + `result_status`, §9f), `get_books(con, origin, q)`, `query_findings(con, filters, sort, page, page_size) -> (rows, total)`, `get_finding(con, id)`, `set_status(con, outdir, ids, status, note, custom_suggestion, scope) -> counts` (writes history + decisions.db sync), `undo(con, outdir)`, `get_history(con, limit)`, `get_stats(con)`, `get_fixlist(con, book, origin, statuses)`.
 - `export.py`: `export_xlsx(con, outdir, origin=None) -> [paths]`, `export_fixes(con, outdir) -> dict counts`.
 
 ## 9b. Scan lifecycle — not bound to one scan or to past decisions (user note #7)
@@ -255,6 +258,7 @@ The user updates books in their local copy of the otzaria-library repo (text fil
 - New panel "הרצת סריקה" in the UI: corpus selection (library dir path, DB path, hybrid toggle), every Config threshold (rare_max, common_min, part_min, join_min, ed1_ratio, foreign_ratio, workers, ... — each with Hebrew label, explanation and its default), whitelist files, stage selection (הכל / כיול+ריצה שניה / שלב בודד).
 - Backend: `POST /api/scan/start` (writes run_config.json, launches `python -X utf8 -m magiah <stages>` as a subprocess with the chosen flags), `GET /api/scan/status` (state + tail of captured log lines, polled by UI), `POST /api/scan/cancel`. Only one scan at a time; UI shows live log + progress; on completion offer "רענן ממצאים" (§9b refresh). Scan settings persist in run_config.json (single source of truth, same file the CLI uses).
 - Hebrew explanations for every threshold go in hebrew.py (CONFIG_LABELS dict).
+- **Exception — `allow_unread` is per run.** It is offered among the advanced settings like a threshold, but it is never written to run_config.json nor read back from it (`Config.PER_RUN`): a remembered allowance would let every later scan consume partial outputs unasked. The runner passes it to each stage as `--allow-unread N` (visible in the scan log); the field always opens at 0, the start confirmation names a non-zero value, and the field is cleared once a scan has taken it. See §9g.
 
 ## 9e. Single-book scan — check one book in seconds (user note #10)
 
@@ -336,6 +340,73 @@ Cost: seconds (measured: 2s for a 336-line book, 47s for a 22k-line one).
 99.6% of flagged words reproduced; the remainder are `missing_space` splits
 whose only evidence is corpus-scale. The book scan also surfaced correct
 findings the full scan missed.
+
+## 9f. Result status — never show an older scan's results as the latest
+
+**Problem.** A stage that fails never replaces its last good output, so after
+a failed, partial, cancelled or killed scan `report.db` still holds the
+previous run's results — complete and readable. The UI imported them on
+refresh, answered "הרענון הושלם", and the only sign of the failure was a toast
+that was gone after ten seconds or a server restart.
+
+- **Run record** — `magiah/runstate.py`, in `<out>/run_state/`: `scan.json`
+  for pipeline runs (CLI commands and UI scans), `book.json` for single-book
+  scans. Written atomically when a run starts, finalized when it ends
+  (`done` / `failed` / `partial` / `cancelled`); the run holds an OS file
+  lock (`<slot>.lock`) for its lifetime, so a `running` record whose lock is
+  free reads as `interrupted` (killed, crashed, power cut). For each stage of
+  the chain lexicon → detect → locate the record keeps the run that last
+  attempted or planned it; the results are stale while any of them was not
+  completed by its run. A `calibrate`- or `report`-only run cannot clear
+  that, and a failed `report` (CSV export) does not cause it.
+- **UI scans:** the scanner owns the run and its lock and passes the run id to
+  each stage subprocess (`MAGIAH_RUN_ID`); a stage that fails records its
+  reason in that run (the scanner only sees an exit code). A second pipeline
+  run on the same folder (e.g. a CLI scan while the UI scans) is refused.
+- **Single-book scans** have their own record and never touch the scan
+  record: they do not write the pipeline's outputs, and their merge is one
+  transaction, so a failed one leaves every finding as it was. It can neither
+  raise nor clear the full scan's warning; it gets its own, lower-level
+  notice. The record is per book (`failed: {book: run}`, the book keyed as
+  the loader resolves it, `runstate.book_id` — a file inside the library is
+  that library book): a successful scan of a book clears that book only, a
+  cancelled one changes nothing, and at most `runstate.MAX_BOOK_FAILURES`
+  (20) books are kept, oldest dropped first. A full scan (all of lexicon →
+  detect → locate in one run) that ends `done` reads every corpus book
+  again, so it supersedes the failures of database and library books that
+  ended before it began (`scan.json` `books_superseded`, which
+  `book_problems` leaves out); a file outside the library is not part of it
+  and stays listed.
+  One notice covers them all — a single book is named with its reason;
+  several are counted in the title, the newest three named in the text and
+  every one, with its reason, in the details.
+- **API:** `webui/result_status.py` builds `result_status = {stale,
+  results_at, notices:[{kind, level, stale, title, text, hint, details,
+  action, action_label}]}` for `/api/meta` and `/api/refresh`. Notices come
+  from a tuple of providers: `scan_incomplete` (error; from the run record,
+  or — for folders without one — from the coverage files of reads that
+  stopped, `core.failed_coverage`), `refresh_needed` (info: `report.db` is
+  newer than the one imported, recorded as `meta.report_mtime`),
+  `accepted_partial` (warning, not stale: the findings rest on rows skipped
+  under `--allow-unread`, §9g), `book_scan_incomplete` (warning; every book
+  whose latest scan failed or was interrupted). A further warning about the
+  results is one more provider. Hebrew texts: `hebrew.RESULT_STATUS`.
+- **Frontend:** `#resultBanner`, above the view tabs in every view: one block
+  per notice (title, text, "מה לעשות", collapsible full reason, an action
+  button). Not dismissible; re-read on every `/api/meta` load and when a scan
+  ends. A refresh that loaded stale results shows a warning toast, not "ok".
+- **Older folders** (no `run_state/`, a `ui_review.db` without
+  `report_mtime`) behave as before: no notice unless their coverage files
+  record a read that stopped (an output accepted under `--allow-unread` is
+  no failure, §9g).
+
+## 9g. Findings that rest on unreadable rows (`--allow-unread`)
+
+seforim.db comes from upstream and may hold a few rows that cannot be read (a broken zstd frame, a `line` without its `line_content` row). By default any such row stops the stage. With `--allow-unread N` (CLI) or the advanced field «שורות לא קריאות מותרות» (UI) a scan may skip up to N of them; its outputs are then *accepted partial*, never complete (README: "Unreadable rows").
+
+- **Where the mark lives.** `locate` writes the coverage record into report.db itself (table `coverage`, one JSON row, only when partial), so the UI never trusts a coverage file a later run may have replaced. `import_all` copies its summary (rows, limit, the first 20 row locations — not the row ids) to `meta.coverage`, and deletes it when report.db has none. A book scan's record (`scan_book()['coverage']`) goes to `meta.book_coverage[doc]` in `import_book_scan`; a later scan of the book replaces or removes it, and `import_all` keeps only the records of books whose rows it keeps (§9e).
+- **The notice** is one more result-status provider (§9f), `result_status.coverage_notice`: `{kind: 'accepted_partial', level: 'warning', stale: false, action: null, …}` in `#resultBanner`, like every other notice. `details` is one line per unread row (book, heRef, line id, or file path — `core.ref_text`), with a closing line when the list is partial. It is worded by what was skipped — database rows, text files (an unreadable file of a text folder or of the library counts as one row), or both — from the record's `unread_kind` (`core.gap_record`); a record without it is worded as input in general. The clause that the lexicon lacks the skipped words appears only when the lexicon itself was built partial (`inherited.lexicon`). Strings: `hebrew.COVERAGE_NOTICE`.
+- **Accepted is not stale.** A run accepted partial *succeeded*: the run record finalizes it `done`, and the coverage fallback of `scan_incomplete` (`core.failed_coverage`) ignores outputs accepted within the limit they were written under — only a read that stopped makes results out of date. The two notices answer different questions and can show together: `scan_incomplete` — the latest scan did not produce what is shown; `accepted_partial` — what is shown rests on skipped rows. After an accepted scan and then a failed one, both show; a complete scan (and its refresh) clears both.
 
 ## 10. Non-goals
 

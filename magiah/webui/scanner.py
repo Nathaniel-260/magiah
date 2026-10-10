@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 
+from .. import runstate
 from ..config import Config
 from ..corpus import OTZARIA_DB
 from ..corpus_hybrid import DEFAULT_LIBRARY
@@ -70,18 +71,22 @@ def _log_line(text):
     _log.append(text.rstrip('\r\n'))
 
 
-def _stage_cmd(stage, outdir):
+def _stage_cmd(stage, outdir, allow_unread=0):
     """Command that runs one pipeline stage as a subprocess.
 
     Frozen (PyInstaller) there is no interpreter to call: sys.executable IS
     the exe, which ignores `-m magiah <stage>` and would open a second UI
     instead of scanning. The exe's launcher accepts `<exe> <stage> --out <dir>`
     and dispatches to the CLI, so call it that way.
+
+    `allow_unread` travels on the command line, not in run_config.json: it
+    is a per-run option (see Config.PER_RUN).
     """
+    extra = ['--allow-unread', str(allow_unread)] if allow_unread else []
     if getattr(sys, 'frozen', False):
-        return [sys.executable, stage, '--out', outdir]
+        return [sys.executable, stage, '--out', outdir] + extra
     return [sys.executable, '-X', 'utf8', '-m', 'magiah', stage,
-            '--out', outdir]
+            '--out', outdir] + extra
 
 
 def _parse_chunk(line):
@@ -121,8 +126,8 @@ def load_run_config(outdir):
 
 def _merge_config(outdir, overrides):
     prev = load_run_config(outdir)
-    cfg = Config.from_dict(prev['config']) if prev and prev.get('config') \
-        else Config()
+    cfg = Config.from_run_config(prev['config']) \
+        if prev and prev.get('config') else Config()
     fields = {f.name for f in dataclasses.fields(Config)}
     for key, val in (overrides or {}).items():
         if key not in fields or val is None or val == '':
@@ -133,14 +138,28 @@ def _merge_config(outdir, overrides):
                 if isinstance(val, str):
                     val = [v.strip() for v in val.splitlines() if v.strip()]
                 setattr(cfg, key, tuple(val))
+            elif key in Config.PER_RUN:
+                # a count, written as one: never a truncated 1.5 nor `true`
+                setattr(cfg, key, int(str(val).strip()))
             elif isinstance(cur, float):
                 setattr(cfg, key, float(val))
             else:
                 setattr(cfg, key, int(val))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 hebrew.SCAN_MESSAGES['bad_config_value'] + str(key))
+    if cfg.allow_unread < 0:
+        raise ValueError(
+            hebrew.SCAN_MESSAGES['bad_config_value'] + 'allow_unread')
     return cfg
+
+
+def calibrate_available(outdir):
+    """Calibration learns only from human-reviewed findings (approved or
+    fixed in ui_review.db); without them the stage has nothing to learn."""
+    from .. import core
+    rows, _ = core.reviewed_findings(outdir, core.REVIEW_POSITIVE)
+    return bool(core.calibration_rows(rows))
 
 
 def start_scan(outdir, stages=None, config_overrides=None,
@@ -152,11 +171,10 @@ def start_scan(outdir, stages=None, config_overrides=None,
     stages = [s for s in STAGE_ORDER if s in (stages or DEFAULT_STAGES)]
     if not stages:
         raise ValueError(hebrew.SCAN_MESSAGES['no_stages'])
-    # calibrate learns from a previous scan's report.db; on a first run there
-    # is nothing to learn from, so drop it rather than fail the whole scan.
+    # calibrate learns from human review decisions; with none there is
+    # nothing to learn from, so drop it rather than fail the whole scan.
     skipped_calibrate = False
-    if 'calibrate' in stages and not os.path.isfile(
-            os.path.join(outdir, 'report.db')):
+    if 'calibrate' in stages and not calibrate_available(outdir):
         stages = [s for s in stages if s != 'calibrate']
         skipped_calibrate = True
         if not stages:
@@ -174,10 +192,21 @@ def start_scan(outdir, stages=None, config_overrides=None,
     with _lock:
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
-        with open(os.path.join(outdir, RUN_CONFIG), 'w',
-                  encoding='utf-8') as f:
-            json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                      ensure_ascii=False, indent=2)
+        # the run is recorded before anything is written, so a scan that
+        # dies at any point leaves the results marked as not current
+        try:
+            run = runstate.ScanRun(outdir, stages, via='ui')
+        except runstate.RunBusy as e:            # a CLI scan holds the folder
+            raise ValueError(str(e))
+        try:
+            with open(os.path.join(outdir, RUN_CONFIG), 'w',
+                      encoding='utf-8') as f:
+                json.dump({'corpus': spec, 'config': cfg.to_run_config()},
+                          f, ensure_ascii=False, indent=2)
+        except BaseException as e:      # the scan never started
+            run.fail(f'{type(e).__name__}: {e}')
+            run.close()
+            raise
         _log.clear()
         if skipped_calibrate:
             _log.append('[webui] ' + hebrew.SCAN_MESSAGES['calibrate_skipped'])
@@ -188,13 +217,18 @@ def start_scan(outdir, stages=None, config_overrides=None,
                       chunk_done=0, chunk_total=0, book=None,
                       started_at=time.strftime('%Y-%m-%d %H:%M:%S'),
                       started_epoch=time.time())
-        _thread = threading.Thread(target=_run, args=(outdir, stages),
-                                   daemon=True)
+        _thread = threading.Thread(
+            target=_run, args=(outdir, stages, run, cfg.allow_unread),
+            daemon=True)
         _thread.start()
     return dict(get_status())
 
 
-def _run(outdir, stages):
+def _run(outdir, stages, run, allow_unread=0):
+    """Worker: run `stages` as subprocesses. `run` (runstate.ScanRun) is
+    this scan's record; it is finalized before the in-memory state, so the
+    UI never sees the scan end ahead of the record that explains it.
+    `allow_unread` goes on every stage's command line (Config.PER_RUN)."""
     global _proc
     log_path = os.path.join(outdir, LOG_FILE)
     rc = 0
@@ -217,7 +251,10 @@ def _run(outdir, stages):
                 pass
 
     try:
-        env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1')
+        # each stage joins this run instead of recording its own: it is the
+        # one that knows why it failed
+        env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1',
+                   **{runstate.ENV_RUN_ID: run.id})
         for i, stage in enumerate(stages):
             if _cancel.is_set():
                 break
@@ -225,7 +262,8 @@ def _run(outdir, stages):
                 # new stage — its chunk counters start fresh
                 _state.update(stage=stage, stage_index=i,
                               chunk_done=0, chunk_total=0)
-            cmd = _stage_cmd(stage, outdir)
+            run.enter(stage)
+            cmd = _stage_cmd(stage, outdir, allow_unread)
             emit(f'===== [{stage}] {" ".join(cmd)}')
             _proc = subprocess.Popen(
                 cmd, cwd=REPO_DIR, env=env,
@@ -246,6 +284,7 @@ def _run(outdir, stages):
     except Exception as e:                          # noqa: BLE001
         rc = -1
         emit(f'===== internal error: {e!r}')
+        run.fail(f'{type(e).__name__}: {e}')
         with _lock:
             _state['error'] = str(e)
     finally:
@@ -254,6 +293,14 @@ def _run(outdir, stages):
                 logf.close()
             except OSError:
                 pass
+        # a stage that failed has already recorded why (first writer wins)
+        if _cancel.is_set():
+            run.cancel()
+        elif rc == 0:
+            run.done()
+        else:
+            run.fail(hebrew.SCAN_MESSAGES['stage_exit'].format(rc=rc))
+        run.close()
         with _lock:
             if _cancel.is_set():
                 _state.update(state='cancelled', returncode=rc)
@@ -371,6 +418,11 @@ def start_book_scan(outdir, source, key, config_overrides=None,
     with _lock:
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
+        try:
+            run = runstate.BookRun(outdir, source, key, via='ui',
+                                   library_dir=library_dir)
+        except runstate.RunBusy as e:            # a CLI book scan is running
+            raise ValueError(str(e))
         _log.clear()
         _cancel.clear()
         _state.update(state='running', stage='book', stages=['book'],
@@ -384,17 +436,19 @@ def start_book_scan(outdir, source, key, config_overrides=None,
         _thread = threading.Thread(
             target=_run_book,
             args=(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
-                  spec),
+                  spec, run),
             daemon=True)
         _thread.start()
     return dict(get_status())
 
 
 def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
-              spec):
-    """Worker: scan one book, then merge it into ui_review.db."""
+              spec, run):
+    """Worker: scan one book, then merge it into ui_review.db. `run`
+    (runstate.BookRun) is finalized before the in-memory state."""
     from .. import book_scan
     from ..book_source import BookNotFound
+    from ..core import StageError
     from ..textsource import TextSourceError
     from . import db as uidb
 
@@ -433,7 +487,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
             raise _Cancelled()
         with _lock:
             _state['book']['title'] = result.get('title')
-        counts = uidb.import_book_scan(outdir, result)
+        counts = uidb.merge_book_scan(outdir, result)
         merged = True
         emit(f"===== [book] נוספו {counts['added']:,} ממצאים, "
              f"הוחלפו {counts['replaced']:,}, "
@@ -447,7 +501,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
     except _Cancelled:
         rc = 1
     except (book_scan.BookScanError, BookNotFound, TextSourceError,
-            ValueError) as e:
+            StageError, ValueError) as e:
         rc, err = 1, str(e)
         emit(f'===== [book] שגיאה: {e}')
     except Exception as e:                          # noqa: BLE001
@@ -459,6 +513,13 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
                 logf.close()
             except OSError:
                 pass
+        if cancelled and not merged:
+            run.cancel()
+        elif rc == 0:
+            run.done(title=result.get('title'))
+        else:
+            run.fail(err)
+        run.close()
         with _lock:
             # a cancel that arrived *during* the merge is too late: the rows
             # are committed, so report the truth (done), not "cancelled"
@@ -487,7 +548,9 @@ def scan_config(outdir):
         db_path = spec.get('db') or OTZARIA_DB
     defaults = Config().to_dict()
     current = dict(defaults)
-    current.update(rc.get('config') or {})
+    # a per-run option always starts at its default, whatever the file says
+    current.update({k: v for k, v in (rc.get('config') or {}).items()
+                    if k not in Config.PER_RUN})
     fields = []
     for key, default in defaults.items():
         lab = hebrew.CONFIG_LABELS.get(key, {})
@@ -501,16 +564,16 @@ def scan_config(outdir):
             'type': ('list' if key == 'whitelist'
                      else 'float' if isinstance(default, float) else 'int'),
         })
-    have_report = os.path.isfile(os.path.join(outdir, 'report.db'))
+    have_reviews = calibrate_available(outdir)
     stages = [{'key': s,
                'hebrew': hebrew.STAGE_LABELS.get(s, {}).get('hebrew', s),
                'explanation': hebrew.STAGE_LABELS.get(s, {}).get(
                    'explanation', ''),
-               # calibrate is a deliberate second pass: only pre-tick it once a
-               # report.db from an earlier scan exists for it to learn from
+               # calibrate is a deliberate second pass: only pre-tick it once
+               # human-reviewed findings exist for it to learn from
                'default': s in DEFAULT_STAGES or (s == 'calibrate'
-                                                  and have_report),
-               'available': s != 'calibrate' or have_report}
+                                                  and have_reviews),
+               'available': s != 'calibrate' or have_reviews}
               for s in STAGE_ORDER]
     return {
         'corpus': {'mode': mode, 'library_dir': library_dir or
@@ -519,4 +582,5 @@ def scan_config(outdir):
         'fields': fields,
         'stages': stages,
         'run_config': rc or None,
+        'allow_unread_confirm': hebrew.SCAN_MESSAGES['allow_unread_confirm'],
     }

@@ -14,7 +14,7 @@ import os
 import sqlite3
 
 from . import tanach
-from .textsource import OtzariaDB, ReadStats, iter_file_lines
+from .textsource import OtzariaDB, ReadStats, TextSourceError, iter_file_lines
 
 LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
 
@@ -64,6 +64,18 @@ def default_otzaria_db():
 
 
 OTZARIA_DB = default_otzaria_db()
+
+
+def check_source(spec):
+    """Raise TextSourceError (Hebrew) when the folder `spec` reads is missing
+    or cannot be listed — cheap checks only, run before anything is written
+    (a missing database is reported when it is opened)."""
+    if spec.get('type') in ('library', 'hybrid'):
+        from .corpus_hybrid import LibraryCorpus
+        LibraryCorpus({'type': 'library', 'path': spec.get('path')}
+                      ).check_root()
+    elif spec.get('type') == 'textdir':
+        TextDirCorpus(spec).check_root()
 
 
 def make_corpus(spec):
@@ -145,10 +157,8 @@ class SqliteCorpus:
                 if not isinstance(text, str):
                     # a BLOB here would tokenize to nothing and look like an
                     # empty line — count it as unreadable instead
-                    self.stats.decode_errors += 1
-                    if len(self.stats.error_samples) < 20:
-                        self.stats.error_samples.append(
-                            (str(uid), 'non-text value in text column'))
+                    self.stats.unread_row(uid, 'decode_errors',
+                                          'non-text value in text column')
                     continue
                 self.stats.lines += 1
                 self.stats.chars += len(text)
@@ -168,12 +178,14 @@ class SqliteCorpus:
         con.execute(tanach.EVIDENCE_SCHEMA)
         con.executescript(f'''
             CREATE TABLE occurrences_full AS
-              SELECT o.word, e.errtype, e.suggestion,
-                     e.score, o.ctx_hits, o.sugg_local, o.book_repeat,
+              SELECT o.word, e.errtype,
+                     COALESCE(o.occ_sugg, e.suggestion) AS suggestion,
+                     COALESCE(o.occ_score, e.score) AS score,
+                     o.ctx_hits, o.sugg_local, o.book_repeat,
                      o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet,
                      COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc,
-                     {tanach.ENRICH_COLS}
+                     o.evidence AS evidence, {tanach.ENRICH_COLS}
               FROM occurrences o
               JOIN errors e ON e.word = o.word
               {tanach.ENRICH_JOIN}
@@ -225,10 +237,29 @@ class TextDirCorpus:
         return sorted(glob.glob(os.path.join(self.path, self.pattern),
                                 recursive=True))
 
+    def check_root(self):
+        """Raise TextSourceError (Hebrew) unless the folder can be listed."""
+        if not os.path.isdir(self.path):
+            raise TextSourceError(
+                f'תיקיית הטקסטים לא נמצאה: {self.path}\n'
+                'יש לבדוק את הנתיב (‎--textdir‎) ולהריץ שוב. התוצרים הקודמים '
+                'לא שונו.')
+        try:
+            os.listdir(self.path)
+        except OSError as e:
+            raise TextSourceError(
+                f'לא ניתן לקרוא את תיקיית הטקסטים: {self.path} ({e})\n'
+                'התוצרים הקודמים לא שונו.') from e
+
     def chunks(self, n):
+        self.check_root()
         files = self._files()
         if not files:
-            return []
+            # a wrong folder, not an empty corpus: scanning it would empty
+            # the results
+            raise TextSourceError(
+                f'לא נמצאו קובצי טקסט ({self.pattern}) בתיקייה: {self.path}'
+                '\nהתוצרים הקודמים לא שונו.')
         n = min(n, len(files))
         return [files[i::n] for i in range(n)]
 
@@ -246,9 +277,7 @@ class TextDirCorpus:
                     self.stats.chars += len(text)
                     yield f'{rel}:{lineno}', rel, text
             except OSError as e:
-                self.stats.decode_errors += 1
-                if len(self.stats.error_samples) < 20:
-                    self.stats.error_samples.append((rel, repr(e)[:200]))
+                self.stats.unread_row(rel, 'decode_errors', repr(e)[:200])
 
     def enrich(self, con):
         _default_enrich(con)
@@ -258,10 +287,13 @@ def _default_enrich(con):
     con.execute(tanach.EVIDENCE_SCHEMA)
     con.executescript(f'''
         CREATE TABLE occurrences_full AS
-          SELECT o.word, e.errtype, e.suggestion, e.score, o.ctx_hits,
+          SELECT o.word, e.errtype,
+                 COALESCE(o.occ_sugg, e.suggestion) AS suggestion,
+                 COALESCE(o.occ_score, e.score) AS score, o.ctx_hits,
                  o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet,
-                 '' AS origin, o.doc AS doc, {tanach.ENRICH_COLS}
+                 '' AS origin, o.doc AS doc, o.evidence AS evidence,
+                 {tanach.ENRICH_COLS}
           FROM occurrences o JOIN errors e ON e.word = o.word
           {tanach.ENRICH_JOIN};
         CREATE TABLE space_errors_full AS

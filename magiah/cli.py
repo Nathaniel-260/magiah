@@ -3,15 +3,18 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
-from . import core
+from . import core, runstate
 from .config import Config
-from .corpus import OTZARIA_DB
+from .corpus import OTZARIA_DB, check_source
 from .corpus_hybrid import DEFAULT_LIBRARY
-from .textsource import TextSourceError
+from .textsource import TextSourceError, db_error_message
 
 RUN_CONFIG = 'run_config.json'
+# the stages each pipeline command runs, in order
+PIPELINE = {'all': ('lexicon', 'detect', 'locate', 'report')}
 
 
 def _build_spec(args):
@@ -45,10 +48,28 @@ def _load_run_config(out_dir):
     return None
 
 
-def _save_run_config(out_dir, spec, cfg):
+def _save_run_config(out_dir, spec, cfg, prev=None):
+    new = {'corpus': spec, 'config': cfg.to_run_config()}
+    # an unchanged setting is not rewritten: the file's age tells the review
+    # UI whether a scan was started after report.db (webui.db
+    # .config_root_for_report), and `magiah book` or `report` start none
+    if prev is not None and json.dumps(prev, sort_keys=True) == json.dumps(
+            new, sort_keys=True):
+        return
     with open(os.path.join(out_dir, RUN_CONFIG), 'w', encoding='utf-8') as f:
-        json.dump({'corpus': spec, 'config': cfg.to_dict()}, f,
-                  ensure_ascii=False, indent=2)
+        json.dump(new, f, ensure_ascii=False, indent=2)
+
+
+def _non_negative(text):
+    """argparse type of --allow-unread: a count, never negative."""
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f'expected a non-negative number of rows, got {text!r}')
+    return n
 
 
 def _guess_book_source(key):
@@ -92,20 +113,23 @@ def _run_book_cmd(args, spec, cfg, out_dir):
               file=sys.stderr, flush=True)
         return 1
     source = args.book_source or _guess_book_source(args.book)
-    try:
-        result = book_scan.scan_book(
-            out_dir, source, args.book, cfg=cfg, db_path=db_path,
-            library_dir=library_dir, verify_ctx=args.book_verify_ctx,
-            spec=spec, progress=lambda s: print(s, flush=True))
-    except (book_scan.BookScanError, book_source.BookNotFound) as e:
-        print(str(e), file=sys.stderr, flush=True)
-        return 1
     from .webui import db as uidb
-    try:
-        counts = uidb.import_book_scan(out_dir, result)
-    except uidb.DecisionsLocked as e:
-        print(str(e), file=sys.stderr, flush=True)
-        return 1
+    # recorded apart from the pipeline's runs: a book scan never touches the
+    # full scan's results, so it must neither raise nor clear their warning
+    with runstate.BookRun(out_dir, source, args.book,
+                          library_dir=library_dir) as run:
+        try:
+            result = book_scan.scan_book(
+                out_dir, source, args.book, cfg=cfg, db_path=db_path,
+                library_dir=library_dir, verify_ctx=args.book_verify_ctx,
+                spec=spec, progress=lambda s: print(s, flush=True))
+            counts = uidb.merge_book_scan(out_dir, result)
+        except (book_scan.BookScanError, book_source.BookNotFound,
+                uidb.DecisionsLocked, TextSourceError) as e:
+            run.fail(str(e))
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
+        run.done(title=counts['title'])
     print(f"[book] «{counts['title']}»: נוספו {counts['added']:,} ממצאים, "
           f"הוחלפו {counts['replaced']:,}, "
           f"נשמרו {counts['preserved']:,} החלטות", flush=True)
@@ -166,11 +190,25 @@ def main(argv=None):
                           'a hybrid corpus: repo files + Sefaria books from '
                           f'seforim.db (default dir: {DEFAULT_LIBRARY})')
     ap.add_argument('--out', default='magiah_out', help='output directory')
+    ap.add_argument('--calibrate-from-machine', action='store_true',
+                    help='calibrate: learn from the machine report.db when no '
+                         'human-reviewed findings exist (output labelled '
+                         'machine_unreviewed)')
     ap.add_argument('--top', type=int, default=0,
                     help='report: export only the N highest-ranked rows')
     ap.add_argument('--whitelist', action='append', metavar='FILE',
                     help='word-list file (one word per line); listed words are '
                          'never flagged. May be given multiple times.')
+    ap.add_argument('--allow-unread', type=_non_negative, default=0,
+                    metavar='N',
+                    help='go on when at most N input rows cannot be read '
+                         '(corrupt or missing in the database; with text '
+                         'files, each file that cannot be read): they are '
+                         'skipped and every output built on them is marked '
+                         'partial. Also needed to USE such outputs in a '
+                         'later run. Default 0: any unreadable row stops the '
+                         'stage. Applies to this run only — never remembered '
+                         'in run_config.json.')
     tune = ap.add_argument_group('thresholds')
     for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
               'workers', 'n_chunks'):
@@ -189,7 +227,8 @@ def main(argv=None):
     spec = _build_spec(args) or (prev and prev['corpus'])
     if spec is None:
         ap.error('no corpus source: use --otzaria, --sqlite or --textdir')
-    cfg = Config.from_dict(prev['config']) if prev else Config()
+    cfg = Config.from_run_config(prev['config']) if prev else Config()
+    cfg.allow_unread = args.allow_unread
     for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
               'workers', 'n_chunks'):
         v = getattr(args, f)
@@ -197,30 +236,49 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
-    _save_run_config(out_dir, spec, cfg)
+    if args.command in ('lexicon', 'detect', 'locate', 'all'):
+        # a folder that is not there is refused before run_config.json is
+        # rewritten with it, and before any stage starts
+        try:
+            check_source(spec)
+        except TextSourceError as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
+    _save_run_config(out_dir, spec, cfg, prev)
 
+    if args.command == 'review':
+        from . import review
+        review.serve(out_dir, port=args.port or 8765)
+        return
+
+    steps = {
+        'lexicon': lambda: core.build_lexicon(spec, cfg, out_dir),
+        'calibrate': lambda: core.calibrate(
+            cfg, out_dir, from_machine=args.calibrate_from_machine),
+        'detect': lambda: core.detect(spec, cfg, out_dir),
+        'locate': lambda: core.locate(spec, cfg, out_dir),
+        'report': lambda: core.report(cfg, out_dir, top=args.top),
+    }
     try:
         if args.command == 'book':
             return _run_book_cmd(args, spec, cfg, out_dir)
-        if args.command in ('lexicon', 'all'):
-            core.build_lexicon(spec, cfg, out_dir)
-        if args.command == 'calibrate':
-            core.calibrate(cfg, out_dir)
-        if args.command == 'review':
-            from . import review
-            review.serve(out_dir, port=args.port or 8765)
-            return
-        if args.command in ('detect', 'all'):
-            core.detect(spec, cfg, out_dir)
-        if args.command in ('locate', 'all'):
-            core.locate(spec, cfg, out_dir)
-        if args.command in ('report', 'all'):
-            core.report(cfg, out_dir, top=args.top)
+        stages = PIPELINE.get(args.command, (args.command,))
+        # the run records itself (run_state/), so a run that fails or never
+        # finishes cannot leave the previous results looking current
+        with runstate.track_scan(out_dir, stages) as run:
+            for stage in stages:
+                run.enter(stage)
+                steps[stage]()
     except (core.StageError, TextSourceError) as e:
         # a stage was run before its prerequisite, or the database cannot be
         # read (missing, not Otzaria's, no zstd decoder): print the Hebrew
         # guidance (no traceback — this is a user error, not a crash)
         print(str(e), file=sys.stderr, flush=True)
+        return 1
+    except sqlite3.DatabaseError as e:
+        # a database the readers do not wrap (report.db, ui_review.db, a
+        # query outside textsource) failed: still Hebrew, exit code 1
+        print(db_error_message('', e), file=sys.stderr, flush=True)
         return 1
 
 

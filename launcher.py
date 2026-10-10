@@ -13,9 +13,11 @@ Data/out dir resolution (first match wins):
 The console window is kept open on any startup error so a double-click user
 can read the Hebrew message instead of the window vanishing.
 """
+import importlib
 import multiprocessing
 import os
 import socket
+import subprocess
 import sys
 
 
@@ -73,6 +75,44 @@ def _pause(msg):
         pass
 
 
+# seforim.db stores its text as zstd frames: Python 3.14+ decodes them with
+# the standard library, older interpreters need this package (pyproject.toml)
+ZSTD_REQUIREMENT = 'zstandard>=0.22'
+
+
+def _has_zstandard():
+    importlib.invalidate_caches()
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _ensure_zstd(run=subprocess.call):
+    """Install `zstandard` when this interpreter needs it and lacks it.
+
+    Before Python 3.14 nothing else provides a zstd decoder, and without one
+    every scan of seforim.db stops at once. A frozen exe bundles what it was
+    built with and has no pip, so it is left alone. A failed install is
+    reported in Hebrew and the UI starts anyway (a library of text files
+    needs no decoder). Returns whether a decoder is available."""
+    if getattr(sys, 'frozen', False) or sys.version_info >= (3, 14):
+        return True
+    if _has_zstandard():
+        return True
+    print('מתקין את החבילה zstandard (נדרשת לקריאת מסד הספרים של אוצריא '
+          'בגרסת Python זו)...', flush=True)
+    rc = run([sys.executable, '-m', 'pip', 'install', ZSTD_REQUIREMENT])
+    if rc == 0 and _has_zstandard():
+        return True
+    print('אזהרה: החבילה zstandard לא הותקנה, ולכן לא ניתן יהיה לקרוא את '
+          'מסד הספרים הדחוס של אוצריא. אפשר להתקין אותה ידנית:  '
+          f'"{sys.executable}" -m pip install zstandard  '
+          'או להשתמש ב-Python 3.14 ומעלה.', flush=True)
+    return False
+
+
 STAGES = ('lexicon', 'calibrate', 'detect', 'locate', 'report', 'all', 'book')
 
 
@@ -99,6 +139,7 @@ def main():
         _pause('לא ניתן ליצור את תיקיית הנתונים. בדוק את הנתיב שנתת ב־--out '
                'ואת ההרשאות לתיקייה. פרטים: %s' % e)
         return 1
+    _ensure_zstd()
     port = _free_port()
 
     try:

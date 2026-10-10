@@ -54,6 +54,7 @@ Hebrew warning in the API response instead of being silently destroyed.
 """
 import csv
 import glob
+import hashlib
 import json
 import math
 import os
@@ -62,7 +63,8 @@ import sqlite3
 import time
 from datetime import datetime
 
-from . import hebrew
+from . import hebrew, result_status
+from ..corpus_hybrid import DEFAULT_LIBRARY
 # one URI builder for every sqlite3 connect: pathname2url breaks UNC paths
 from ..textsource import sqlite_uri as _uri
 
@@ -71,6 +73,8 @@ REPORT_DB_F = 'report.db'
 DECISIONS_F = 'decisions.db'
 TOKDIAG_GLOB = '*tokdiag_source_he.csv'
 BACKUP_DIR = 'backups'
+# meta key: the library root (and scan time) of the report import_all imported
+IMPORT_SOURCE_KEY = 'import_source'
 
 # --- copied VERBATIM from magiah/core.py (keep in sync) --------------------
 RANK_SQL = '''score
@@ -119,17 +123,49 @@ CREATE TABLE IF NOT EXISTS word_rules(
   status TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- who set a word rule; beside word_rules, whose 3 columns earlier versions
+-- write positionally
+CREATE TABLE IF NOT EXISTS word_rule_ext(
+  word TEXT PRIMARY KEY, decided_by TEXT
+);
 
+-- prev_state: JSON snapshot of what this entry replaced, so undo restores
+-- it exactly — {"review": row|null} or {"kind", "key", "row": row|null}
 CREATE TABLE IF NOT EXISTS history(
   id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL,
   action TEXT NOT NULL,
   finding_id INTEGER, word TEXT,
   old_status TEXT, new_status TEXT,
-  note TEXT
+  note TEXT,
+  prev_state TEXT, decided_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+
+-- per-decision details kept beside `review` (whose column list must stay
+-- fixed: positional INSERTs into it exist outside this module).
+--   scope: occurrence | replacement | book | word
+--   approved_suggestion: the correction actually approved (D2)
+--   flag: 'stale_approval' when a re-scan changed what was approved
+CREATE TABLE IF NOT EXISTS review_ext(
+  finding_id INTEGER PRIMARY KEY,
+  scope TEXT, approved_suggestion TEXT, decided_by TEXT,
+  flag TEXT, prev_decision TEXT
+);
+
+-- scoped rules beside word_rules (global): a book's spelling convention and
+-- a rejected (word -> suggestion) pair
+CREATE TABLE IF NOT EXISTS book_rules(
+  word TEXT NOT NULL, doc TEXT NOT NULL, status TEXT NOT NULL,
+  decided_by TEXT, updated_at TEXT NOT NULL,
+  PRIMARY KEY(word, doc)
+);
+CREATE TABLE IF NOT EXISTS replacement_rules(
+  word TEXT NOT NULL, suggestion TEXT NOT NULL, status TEXT NOT NULL,
+  decided_by TEXT, updated_at TEXT NOT NULL,
+  PRIMARY KEY(word, suggestion)
+);
 
 -- provenance for decisions.db: which (word, unit) keys THIS ui wrote.
 -- decisions.db itself must stay byte-compatible with the old tool, so the
@@ -162,17 +198,67 @@ CREATE INDEX IF NOT EXISTS idx_fe_key ON file_edits(book_key);
 
 # Tables SCHEMA creates; connect() only runs the script when one is missing.
 SCHEMA_TABLES = {'findings', 'review', 'word_rules', 'history', 'meta',
-                 'owned_decisions', 'file_edits'}
+                 'owned_decisions', 'file_edits', 'review_ext', 'book_rules',
+                 'replacement_rules', 'word_rule_ext'}
 
-# effective status: per-finding review wins, else the word rule, else pending.
-# A word-wide approval does not reach a row marked tanach_legacy: such a row
-# needs its own re-check, like a dropped per-row approval (a word-wide
-# not_error / ignored judges the word itself and still applies).
-EFF = ("COALESCE(r.status, CASE WHEN w.status IN ('approved', 'fixed') AND "
-       "COALESCE(f.extra, '') LIKE '%tanach_legacy%' THEN NULL "
-       "ELSE w.status END, 'pending')")
+# columns added to tables that predate them (additive; see _migrate)
+ADDED_COLUMNS = {
+    'history': (('prev_state', 'TEXT'), ('decided_by', 'TEXT')),
+}
+SCHEMA_REV = 5
+
+# A book's stable identity. `source` is only a display title and several
+# books share one, so it is never the key of a row on a DB line: a doc-less
+# row there (one whose book no import could establish, see _resolve_docs)
+# is keyed by its own line, 'line:<id>', a book of its own. Only a row with
+# neither a doc nor a line id falls back to its title.
+_DB_LINE = "({u} != '' AND {u} NOT GLOB '*[^0-9]*')"
+BOOKKEY = ("COALESCE(NULLIF(f.doc, ''), CASE WHEN "
+           + _DB_LINE.format(u='f.unit') +
+           " THEN 'line:' || f.unit ELSE 'src:' || COALESCE(f.source, '') "
+           "END)")
+
+
+def book_key(f):
+    """BOOKKEY of one finding row (a mapping with doc, unit and source)."""
+    if f['doc']:
+        return f['doc']
+    unit = f['unit'] or ''
+    if re.fullmatch('[0-9]+', unit):
+        return 'line:' + unit
+    return 'src:' + (f['source'] or '')
+
+
+def _rule_status(col):
+    """A rule's status as it reaches one finding. An approval made by a rule
+    (word-wide, book or replacement) does not reach a row marked
+    tanach_legacy: such a row needs its own re-check, like a dropped per-row
+    approval. A rule's not_error / ignored judges the word itself and still
+    applies."""
+    return (f"CASE WHEN {col} IN ('approved', 'fixed') AND "
+            f"COALESCE(f.extra, '') LIKE '%tanach_legacy%' THEN NULL "
+            f"ELSE {col} END")
+
+
+# effective status, narrowest decision first: this occurrence, the book's
+# convention, the (word, suggestion) pair, the global word rule, else pending
+EFF = (f"COALESCE(r.status, {_rule_status('rb.status')}, "
+       f"{_rule_status('rr.status')}, {_rule_status('w.status')}, 'pending')")
 JOINS = ('LEFT JOIN review r ON r.finding_id = f.id '
+         'LEFT JOIN book_rules rb ON rb.word = f.word '
+         f'AND rb.doc = {BOOKKEY} '
+         'LEFT JOIN replacement_rules rr ON rr.word = f.word '
+         'AND rr.suggestion = f.suggestion '
          'LEFT JOIN word_rules w ON w.word = f.word')
+EXT_JOIN = 'LEFT JOIN review_ext x ON x.finding_id = f.id'
+# who set the word rule aliased `w`
+WORD_DECIDER = '(SELECT e.decided_by FROM word_rule_ext e WHERE e.word = w.word)'
+EXT_COLS = ('x.scope AS scope, x.approved_suggestion AS approved_suggestion, '
+            'x.decided_by AS decided_by, x.flag AS flag, '
+            'x.prev_decision AS prev_decision')
+
+SCOPES = ('occurrence', 'replacement', 'book', 'word')
+ACTORS = ('human', 'agent')
 
 KEY_COLS = "family, COALESCE(word,''), COALESCE(unit,''), errtype, " \
            "COALESCE(ref,'')"
@@ -228,11 +314,15 @@ def connect(outdir):
                           timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute('PRAGMA busy_timeout=30000')
+    con.create_function('magiah_doc_of_unit', 1, doc_of_unit,
+                        deterministic=True)
     have = {r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if not SCHEMA_TABLES <= have:
         con.executescript(SCHEMA)
-    elif not con.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+    if _schema_rev(con) < SCHEMA_REV:
+        _migrate(con, outdir)
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
                          "AND name='idx_f_doc'").fetchone():
         # added with the single-book scan; existing databases predate it and
         # would otherwise scan the whole findings table on every book merge
@@ -245,20 +335,302 @@ def connect(outdir):
     return con
 
 
+def doc_of_unit(unit):
+    """The book (doc) a line unit belongs to, when the unit itself says so.
+
+    'file:<rel>:<n>' -> <rel>, 'local:<abs>:<n>' -> 'local:<abs>' and a text
+    folder's '<rel>:<n>' -> <rel> (the doc each corpus writes for them). A
+    plain DB line id carries no book and yields None.
+    """
+    if not isinstance(unit, str):
+        return None
+    base, sep, n = unit.rpartition(':')
+    if not sep or not base or not n.isdigit():
+        return None
+    if base.startswith('file:'):
+        return base[len('file:'):] or None
+    return base
+
+
+def _fill_missing_docs(cur, table):
+    """Give doc-less rows of `table` a doc: from the unit itself, else from
+    another row on the same line (only when that line maps to one doc).
+    Only the doc-less rows and their lines are visited."""
+    # GLOB keeps the Python UDF to the '<x>:<n>' units it can resolve, and
+    # it runs once per such row
+    cur.execute(f'''UPDATE {table} SET doc = magiah_doc_of_unit(unit)
+                    WHERE (doc IS NULL OR doc = '')
+                      AND unit GLOB '*:[0-9]*' ''')
+    cur.execute(f'''CREATE TEMP TABLE u2d AS
+        SELECT unit, MIN(doc) AS doc FROM {table}
+        WHERE doc IS NOT NULL AND doc != '' AND unit IN (
+            SELECT unit FROM {table} WHERE doc IS NULL OR doc = '')
+        GROUP BY unit HAVING COUNT(DISTINCT doc) = 1''')
+    cur.execute('CREATE UNIQUE INDEX temp.ix_u2d ON u2d(unit)')
+    cur.execute(f'''UPDATE {table}
+        SET doc = (SELECT u.doc FROM u2d u WHERE u.unit = {table}.unit)
+        WHERE (doc IS NULL OR doc = '')
+          AND unit IN (SELECT unit FROM u2d)''')
+    cur.execute('DROP TABLE u2d')
+
+
+def _docs_from_db(cur, table, db_path):
+    """Doc-less rows of `table` on a DB line take the book id of their line
+    from the Otzaria DB the scan read — the doc every other row of that book
+    carries. A DB that cannot be read leaves them as they are."""
+    if not db_path or not os.path.isfile(db_path):
+        return
+    units = [r[0] for r in cur.execute(
+        f"SELECT DISTINCT unit FROM {table} WHERE (doc IS NULL OR doc = '') "
+        f"AND {_DB_LINE.format(u='unit')}")]
+    if not units:
+        return
+    # the DB must still be the one scanned: line ids change when it is
+    # rebuilt, so the rows whose doc is known must all agree with it
+    known = cur.execute(
+        f"SELECT unit, doc FROM {table} WHERE doc IS NOT NULL AND doc != '' "
+        f"AND {_DB_LINE.format(u='unit')} LIMIT 200").fetchall()
+    if not known:
+        return
+
+    def books(src, ids):
+        out = []
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            out += src.execute('SELECT id, bookId FROM line WHERE id IN (%s)'
+                               % ','.join('?' * len(part)),
+                               [int(u) for u in part]).fetchall()
+        return out
+    try:
+        src = sqlite3.connect(_uri(db_path, ro=True), uri=True)
+        try:
+            seen = {str(i): str(b) for i, b in books(src, [u for u, _ in known])}
+            if any(seen.get(u) != d for u, d in known):
+                return
+            found = books(src, units)
+        finally:
+            src.close()
+    except (sqlite3.Error, ValueError):
+        return
+    cur.execute('CREATE TEMP TABLE l2b(unit TEXT PRIMARY KEY, doc TEXT)')
+    cur.executemany('INSERT OR IGNORE INTO l2b VALUES(?,?)',
+                    [(str(i), str(b)) for i, b in found if b is not None])
+    cur.execute(f'''UPDATE {table}
+        SET doc = (SELECT l.doc FROM l2b l WHERE l.unit = {table}.unit)
+        WHERE (doc IS NULL OR doc = '')
+          AND unit IN (SELECT unit FROM l2b)''')
+    cur.execute('DROP TABLE l2b')
+
+
+def _docs_from_spans(cur, table):
+    """A doc-less row of `table` on a DB line takes the doc of the book of
+    its title whose span of known line ids (its rows that have a doc)
+    contains the line. An Otzaria DB stores each book's lines under
+    consecutive ids, so a line inside one book's span is that book's. A line
+    outside every span of its title, or inside two, stays doc-less: another
+    book of the same title may own it."""
+    line = _DB_LINE.format(u='unit')
+    if not cur.execute(f"SELECT 1 FROM {table} WHERE (doc IS NULL OR "
+                       f"doc = '') AND {line} LIMIT 1").fetchone():
+        return
+    cur.execute(f'''CREATE TEMP TABLE docless AS
+        SELECT DISTINCT unit, source FROM {table}
+        WHERE (doc IS NULL OR doc = '') AND {line}''')
+    cur.execute(f'''CREATE TEMP TABLE spans AS
+        SELECT source, doc, MIN(CAST(unit AS INTEGER)) AS lo,
+               MAX(CAST(unit AS INTEGER)) AS hi
+        FROM {table}
+        WHERE doc IS NOT NULL AND doc != '' AND {line}
+          AND source IN (SELECT source FROM docless)
+        GROUP BY source, doc''')
+    cur.execute('CREATE INDEX temp.ix_spans ON spans(source, lo)')
+    cur.execute('''CREATE TEMP TABLE l2d AS
+        SELECT t.unit AS unit, t.source AS source, MIN(s.doc) AS doc
+        FROM docless t JOIN spans s ON s.source = t.source
+         AND CAST(t.unit AS INTEGER) BETWEEN s.lo AND s.hi
+        GROUP BY t.unit, t.source HAVING COUNT(DISTINCT s.doc) = 1''')
+    cur.execute('CREATE UNIQUE INDEX temp.ix_l2d ON l2d(unit, source)')
+    cur.execute(f'''UPDATE {table}
+        SET doc = (SELECT l.doc FROM l2d l WHERE l.unit = {table}.unit
+                   AND l.source = {table}.source)
+        WHERE (doc IS NULL OR doc = '') AND EXISTS (
+            SELECT 1 FROM l2d l WHERE l.unit = {table}.unit
+               AND l.source = {table}.source)''')
+    for t in ('docless', 'spans', 'l2d'):
+        cur.execute(f'DROP TABLE {t}')
+
+
+def _resolve_docs(cur, table, db_path=None):
+    """Give doc-less rows of `table` the doc of their book wherever it can be
+    established: from the unit itself or another row on the same line
+    (:func:`_fill_missing_docs`), from the scan's Otzaria DB, from the line
+    spans of same-titled books. What is left keys by its own line (BOOKKEY),
+    never by its title, so books that share a title stay apart."""
+    _fill_missing_docs(cur, table)
+    _docs_from_db(cur, table, db_path)
+    _docs_from_spans(cur, table)
+
+
+# a row whose own decision was made with book scope: the row the book rule
+# was set from ("correct in this book" was said of ITS book)
+BOOK_CLICKED = ("EXISTS(SELECT 1 FROM review_ext bx WHERE bx.finding_id = "
+                "{id} AND bx.scope = 'book')")
+
+
+def _rekey_book_rules(cur, pairs_sql, params=()):
+    """A book rule follows a finding whose book key changed (a doc-less row
+    whose book was established). `pairs_sql` selects (word, old_key,
+    new_key, clicked); a rule on (word, old_key) is copied onto
+    (word, new_key), unless that pair has a rule of its own, when the copy
+    reaches no row the user did not judge:
+
+    * from a line key ('line:<id>'): the rule was said of that line's book,
+      now known;
+    * to a line key: it covers the same rows as before;
+    * from a title key ('src:<title>', which lumped same-titled books) to a
+      book: only the book of the row the rule was set from (`clicked`).
+      Rows of the title in other books drop back to their own status: the
+      rule was never said of their book.
+    """
+    cur.execute(f'''INSERT OR IGNORE INTO book_rules(word, doc, status,
+                                                     decided_by, updated_at)
+        SELECT DISTINCT b.word, p.new_key, b.status, b.decided_by,
+               b.updated_at
+        FROM ({pairs_sql}) p
+        JOIN book_rules b ON b.word = p.word AND b.doc = p.old_key
+        WHERE p.new_key != p.old_key
+          AND (p.old_key LIKE 'line:%' OR p.new_key LIKE 'line:%'
+               OR p.clicked)''', params)
+
+
+def _schema_rev(con):
+    row = con.execute(
+        "SELECT value FROM meta WHERE key = 'schema_rev'").fetchone()
+    try:
+        return int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _migrate(con, outdir=None):
+    """Bring an existing ui_review.db up to SCHEMA_REV, additively.
+
+    rev 2: review rows are scoped 'occurrence' (a review row was always one
+    finding's decision), approvals record the suggestion they were made on
+    (:func:`_bind_old_approvals`; one that cannot be bound is demoted to
+    'unsure'), doc-less rows get a doc where one can be derived.
+    rev 3: word_rules is back to its original 3 columns (decided_by moves to
+    word_rule_ext) and the keyset sort indexes exist.
+    rev 4: word-wide approvals are bound to the suggestion decisions.db
+    recorded for them (:func:`_bind_word_approvals`).
+    rev 5: doc-less rows on DB lines get the doc of their book where the
+    line spans establish it (:func:`_resolve_docs`); the rest key by their
+    line instead of their title (BOOKKEY), and book rules made under a
+    title key move to each row's new key.
+    Never touches a database of a newer revision; safe to run concurrently.
+    decisions.db (when a step writes it) commits first; a lock on it, like
+    one on ui_review.db, leaves the upgrade to the next connection.
+    """
+    for table, cols in ADDED_COLUMNS.items():
+        have = {r[1] for r in con.execute(f'PRAGMA table_info({table})')}
+        for name, typ in cols:
+            if name not in have:
+                try:
+                    con.execute(f'ALTER TABLE {table} ADD COLUMN {name} {typ}')
+                except sqlite3.OperationalError:
+                    pass               # another connection just added it
+    dec, gone = None, []
+    try:
+        cur = con.cursor()
+        cur.execute('BEGIN IMMEDIATE')
+        rev = _schema_rev(con)
+        if rev >= SCHEMA_REV:
+            con.rollback()
+            return
+        if rev < 2:
+            cur.execute('''INSERT OR IGNORE INTO review_ext(finding_id, scope)
+                           SELECT finding_id, 'occurrence' FROM review''')
+            dec, gone = _bind_old_approvals(con, outdir)
+            _fill_missing_docs(cur, 'findings')
+        if rev < 3:
+            have = {r[1] for r in con.execute('PRAGMA table_info(word_rules)')}
+            if 'decided_by' in have:
+                cur.execute('''INSERT OR REPLACE INTO word_rule_ext
+                               SELECT word, decided_by FROM word_rules
+                               WHERE decided_by IS NOT NULL''')
+                cur.execute('ALTER TABLE word_rules DROP COLUMN decided_by')
+            for stmt in _sort_index_sql().split(';'):
+                if stmt.strip():
+                    cur.execute(stmt)
+        if rev < 4 and con.execute("SELECT 1 FROM word_rules WHERE status = "
+                                   "'approved' LIMIT 1").fetchone():
+            path = outdir and os.path.join(outdir, DECISIONS_F)
+            if path and os.path.exists(path):
+                if dec is None:
+                    dec = _decisions_con(outdir,
+                                         timeout=MIGRATE_DECISIONS_TIMEOUT)
+                _bind_word_approvals(con, dec)
+        if rev < 5:
+            rekey = con.execute("SELECT 1 FROM book_rules "
+                                "WHERE doc LIKE 'src:%' LIMIT 1").fetchone()
+            if rekey:
+                # the key every doc-less row had before rev 5
+                cur.execute('''CREATE TEMP TABLE bk_old AS
+                    SELECT id, 'src:' || COALESCE(source, '') AS okey
+                    FROM findings WHERE (doc IS NULL OR doc = '')
+                      AND word IN (SELECT word FROM book_rules
+                                   WHERE doc LIKE 'src:%')''')
+            _resolve_docs(cur, 'findings')
+            if rekey:
+                _rekey_book_rules(cur, f'''
+                    SELECT f.word AS word, o.okey AS old_key,
+                           {BOOKKEY} AS new_key,
+                           {BOOK_CLICKED.format(id='f.id')} AS clicked
+                    FROM bk_old o JOIN findings f ON f.id = o.id''')
+                cur.execute('DROP TABLE bk_old')
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('schema_rev', ?)",
+                    (str(SCHEMA_REV),))
+        if dec is not None:
+            _commit_decisions_first(con, dec, gone)
+        else:
+            con.commit()
+    except (sqlite3.OperationalError, DecisionsLocked):
+        con.rollback()                 # locked: the next connection retries
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
+
+
 DECISIONS_TIMEOUT = 30.0      # seconds to wait for a decisions.db lock
+# ...inside connect()'s schema upgrade, which a lock only postpones
+MIGRATE_DECISIONS_TIMEOUT = 2.0
 
 
-def _decisions_con(outdir):
-    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F),
-                          timeout=DECISIONS_TIMEOUT)
-    con.execute(f'PRAGMA busy_timeout={int(DECISIONS_TIMEOUT * 1000)}')
-    if not con.execute("SELECT name FROM sqlite_master WHERE type='table' "
-                       "AND name='decisions'").fetchone():
+def _decisions_con(outdir, timeout=None):
+    """decisions.db. Its `decisions` table stays exactly as the legacy tool
+    created it; the explicit scope of each row lives in `decision_scope`
+    (unit '*' = global, anything else = this occurrence only)."""
+    if timeout is None:
+        timeout = DECISIONS_TIMEOUT
+    con = sqlite3.connect(os.path.join(outdir, DECISIONS_F), timeout=timeout)
+    con.execute(f'PRAGMA busy_timeout={int(timeout * 1000)}')
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'decisions' not in have:
         con.execute('''CREATE TABLE IF NOT EXISTS decisions(
             word TEXT, unit TEXT, errtype TEXT, verdict TEXT,
             suggestion TEXT, source TEXT, ref TEXT,
             PRIMARY KEY(word, unit))''')
-        con.commit()
+    if 'decision_scope' not in have:
+        con.execute('''CREATE TABLE IF NOT EXISTS decision_scope(
+            word TEXT NOT NULL, unit TEXT NOT NULL, scope TEXT NOT NULL,
+            decided_by TEXT, PRIMARY KEY(word, unit))''')
+        # backfill legacy rows: only an explicit '*' row is global
+        con.execute('''INSERT OR IGNORE INTO decision_scope(word, unit, scope)
+            SELECT COALESCE(word, ''), COALESCE(unit, ''),
+                   CASE WHEN unit = '*' THEN 'global' ELSE 'occurrence' END
+            FROM decisions''')
+    con.commit()
     return con
 
 
@@ -285,12 +657,58 @@ class DecisionsLocked(PermissionError, ValueError):
     the server answers 423 with it, a book scan reports it as its error."""
 
 
+def _withdraw_todo(con, keys):
+    """Which (word, unit) `keys` have a decisions.db mirror to withdraw after
+    their approval was dropped: keys this UI owns (an unowned row is the old
+    tool's own decision) on which no approved / fixed finding still stands."""
+    keys = {(w or '', u or '') for w, u in keys}
+    return [(word, unit) for word, unit in sorted(keys)
+            if _owns_decision(con, word, unit) and not con.execute(
+                '''SELECT 1 FROM review r
+                   JOIN findings f ON f.id = r.finding_id
+                   WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
+                     AND r.status IN ('approved', 'fixed') LIMIT 1''',
+                (word, unit)).fetchone()]
+
+
+def _withdraw_accepts(dec, todo):
+    """Delete the 'accept' rows of `todo` (see :func:`_withdraw_todo`) on an
+    open decisions.db connection, leaving the commit to the caller. Returns
+    the keys under which nothing is left; their ownership markers go only
+    after decisions.db committed (:func:`_drop_owned`)."""
+    gone = []
+    for word, unit in todo:
+        dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
+                    "AND verdict = 'accept'", (word, unit))
+        # nothing of ours left under this key (also after a retry)
+        if not dec.execute('SELECT 1 FROM decisions '
+                           'WHERE word = ? AND unit = ?',
+                           (word, unit)).fetchone():
+            dec.execute('DELETE FROM decision_scope '
+                        'WHERE word = ? AND unit = ?', (word, unit))
+            gone.append((word, unit))
+    return gone
+
+
+def _drop_owned(con, gone):
+    for word, unit in gone:
+        con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
+                    (word, unit))
+
+
+def _count_keys(gone, keys):
+    """How many of the withdrawn keys `gone` are among `keys`."""
+    return len(set(gone) & {(w or '', u or '') for w, u in keys})
+
+
 def _clear_dropped_decisions(con, outdir, keys):
-    """Withdraw the decisions.db 'accept' rows of dropped legacy approvals.
+    """Withdraw the decisions.db 'accept' rows of dropped approvals: legacy
+    Tanach approvals an import dropped, and approvals that went stale because
+    their finding now proposes another correction.
 
     The approval is gone from `review`, but its mirror in decisions.db still
-    carries the old Tanach suggestion: the old review tool would keep honouring
-    it, and /api/import_legacy would turn it back into an approval. Only rows
+    carries the old suggestion: the old review tool would keep honouring it,
+    and /api/import_legacy would turn it back into an approval. Only rows
     this UI owns are removed (an unowned row is the old tool's own decision),
     and only while no other approved / fixed finding still stands on the same
     (word, unit) key. The `history` record of the drop is kept.
@@ -302,42 +720,112 @@ def _clear_dropped_decisions(con, outdir, keys):
     to withdraw. If decisions.db cannot be written (another program holds a
     lock on it) nothing is withdrawn and :class:`DecisionsLocked` is raised,
     so the caller rolls back the drop as well and the next refresh redoes
-    both. Returns the number of decisions withdrawn.
+    both. Returns the (word, unit) keys withdrawn.
     """
-    keys = {(w or '', u or '') for w, u in keys}
     if not keys or not os.path.exists(os.path.join(outdir, DECISIONS_F)):
-        return 0
-    todo = [(word, unit) for word, unit in sorted(keys)
-            if _owns_decision(con, word, unit) and not con.execute(
-                '''SELECT 1 FROM review r
-                   JOIN findings f ON f.id = r.finding_id
-                   WHERE COALESCE(f.word,'') = ? AND COALESCE(f.unit,'') = ?
-                     AND r.status IN ('approved', 'fixed') LIMIT 1''',
-                (word, unit)).fetchone()]
+        return []
+    todo = _withdraw_todo(con, keys)
     if not todo:
-        return 0
+        return []
     dec = None
     try:
         dec = _decisions_con(outdir)
-        gone = []
-        for word, unit in todo:
-            dec.execute("DELETE FROM decisions WHERE word = ? AND unit = ? "
-                        "AND verdict = 'accept'", (word, unit))
-            # nothing of ours left under this key (also after a retry)
-            if not dec.execute('SELECT 1 FROM decisions '
-                               'WHERE word = ? AND unit = ?',
-                               (word, unit)).fetchone():
-                gone.append((word, unit))
+        gone = _withdraw_accepts(dec, todo)
         dec.commit()
     except sqlite3.OperationalError as e:
         raise DecisionsLocked(hebrew.MESSAGES['decisions_locked']) from e
     finally:
         if dec is not None:
             dec.close()                 # without a commit: rolled back
-    for word, unit in gone:
-        con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
-                    (word, unit))
-    return len(gone)
+    _drop_owned(con, gone)
+    return gone
+
+
+def _decisions_for_write(outdir):
+    """decisions.db with its write lock already taken, for an action that
+    writes it in one transaction with ui_review.db (undo, restoring a
+    backup). Another program's lock fails the action up front with
+    :class:`DecisionsLocked` (HTTP 423), before anything was changed."""
+    dec = None
+    try:
+        dec = _decisions_con(outdir)
+        dec.execute('BEGIN IMMEDIATE')
+    except sqlite3.OperationalError as e:
+        if dec is not None:
+            dec.close()
+        raise DecisionsLocked(
+            hebrew.MESSAGES['decisions_locked_action']) from e
+    return dec
+
+
+def _commit_decisions_first(con, dec, gone=()):
+    """Commit decisions.db, then ui_review.db (dropping the ownership markers
+    of `gone`, the keys :func:`_withdraw_accepts` emptied, in between). If
+    ui_review.db then fails, nothing there changed and repeating the action
+    rewrites the same decisions.db rows; the other way round a failure would
+    leave decisions.db behind for good."""
+    try:
+        dec.commit()
+    except sqlite3.OperationalError as e:
+        raise DecisionsLocked(
+            hebrew.MESSAGES['decisions_locked_action']) from e
+    _drop_owned(con, gone)
+    con.commit()
+
+
+def config_root_for_report(outdir):
+    """The configured library (run_config.json), standing in as the root of
+    a report.db that does not name its own (one written before scan_meta).
+
+    None when run_config.json was rewritten after report.db: a later scan
+    has been started since, so the setting may describe that scan instead.
+    """
+    from . import scanner
+    rc = os.path.join(outdir, scanner.RUN_CONFIG)
+    rep = os.path.join(outdir, REPORT_DB_F)
+    try:
+        if os.path.isfile(rc) and os.path.isfile(rep) \
+                and os.path.getmtime(rc) > os.path.getmtime(rep):
+            return None
+    except OSError:
+        return None
+    try:
+        lib = scanner.scan_config(outdir)['corpus'].get('library_dir')
+    except Exception:                       # config unreadable -> the default
+        lib = None
+    return os.path.abspath(lib or DEFAULT_LIBRARY)
+
+
+def _report_db_path(cur):
+    """The Otzaria DB the scan behind the attached report (``rep``) read,
+    from its scan_meta; None when the report does not say."""
+    if not cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                       "AND name='scan_meta'").fetchone():
+        return None
+    row = cur.execute(
+        "SELECT value FROM rep.scan_meta WHERE key = 'corpus'").fetchone()
+    try:
+        spec = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    if not isinstance(spec, dict):
+        return None
+    from ..core import spec_db
+    return spec_db(spec)
+
+
+def _report_source(cur, outdir):
+    """The identity of the report.db attached as ``rep``: the library root
+    its scan read and when it was written, from its own scan_meta table."""
+    if cur.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                   "AND name='scan_meta'").fetchone():
+        meta = dict(cur.execute('SELECT key, value FROM rep.scan_meta'))
+        return {'root': meta.get('library_root') or None,
+                'scanned_at': meta.get('scanned_at') or None,
+                'basis': 'scan_meta'}
+    root = config_root_for_report(outdir)
+    return {'root': root, 'scanned_at': None,
+            'basis': 'run_config' if root else 'unknown'}
 
 
 def import_all(outdir, migrate_legacy=False):
@@ -355,6 +843,10 @@ def import_all(outdir, migrate_legacy=False):
     if not os.path.exists(report_path):
         raise FileNotFoundError(
             hebrew.MESSAGES['report_missing'].format(outdir=outdir))
+    # identifies the report.db these findings come from (result_status.py:
+    # a newer report.db means a refresh is due); taken before reading, so a
+    # report.db replaced meanwhile reads as newer, never as already loaded
+    report_mtime = os.path.getmtime(report_path)
     con = connect(outdir)
     try:
         con.execute('ATTACH DATABASE ? AS rep', (_uri(report_path, ro=True),))
@@ -490,6 +982,10 @@ def import_all(outdir, migrate_legacy=False):
                             ','.join('?' * 18) + ')', tok_rows)
         counts['tokdiag'] = len(tok_rows)
 
+        # report.db has no doc for extra_space / tanach / tokdiag rows; a
+        # book scan must still find (and only find) its own rows by doc
+        _resolve_docs(cur, 'imp', _report_db_path(cur))
+
         # -- stable-id assignment (see module docstring) ---------------------
         cur.execute(f'''CREATE TEMP TABLE imp2 AS
             SELECT imp.*, rowid AS irow, {_legacy_lg()} AS lg,
@@ -502,7 +998,8 @@ def import_all(outdir, migrate_legacy=False):
             SELECT id, family, COALESCE(word,'') AS w, COALESCE(unit,'') AS u,
                    errtype, COALESCE(ref,'') AS r, {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
-                                      ORDER BY id) AS seq
+                                      ORDER BY id) AS seq,
+                   {BOOKKEY} AS bkey
             FROM findings f''')
         cur.execute('''CREATE INDEX temp.ix_oldmap ON oldmap(
             family, w, u, errtype, r, seq)''')
@@ -544,6 +1041,15 @@ def import_all(outdir, migrate_legacy=False):
             WHERE doc IN (SELECT doc FROM keep_docs)''')
         kept = cur.execute('SELECT COUNT(*) FROM keep_rows').fetchone()[0]
 
+        # rebuilding every row through ~10 secondary indexes costs more
+        # than building them once afterwards, so they are dropped meanwhile
+        index_sql = [r[0] for r in cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'findings' AND sql IS NOT NULL")]
+        for name, in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'findings' AND sql IS NOT NULL").fetchall():
+            cur.execute(f'DROP INDEX "{name}"')
         cur.execute('DELETE FROM findings WHERE id NOT IN '
                     '(SELECT id FROM keep_rows)')
         cols17 = ('family, errtype, word, suggestion, score, rank, ctx_hits, '
@@ -563,6 +1069,18 @@ def import_all(outdir, migrate_legacy=False):
             SELECT ? + ROW_NUMBER() OVER (ORDER BY i.irow), {icols}
             FROM imp2 i JOIN assign a ON a.irow = i.irow
             WHERE a.old_id IS NULL''', (max_id,))
+        if cur.execute('SELECT 1 FROM book_rules LIMIT 1').fetchone():
+            # a row whose book was established by this import keeps the
+            # book rules it was under (they keyed it by line or title)
+            cur.execute('CREATE INDEX temp.ix_oldmap_bk ON oldmap(w, bkey)')
+            _rekey_book_rules(cur, f'''
+                SELECT o.w AS word, o.bkey AS old_key, {BOOKKEY} AS new_key,
+                       {BOOK_CLICKED.format(id='f.id')} AS clicked
+                FROM book_rules b
+                JOIN oldmap o ON o.w = b.word AND o.bkey = b.doc
+                JOIN findings f ON f.id = o.id''')
+        for sql in index_sql:
+            cur.execute(sql)
         total = cur.execute('SELECT COUNT(*) FROM findings').fetchone()[0]
         new_max = cur.execute(
             'SELECT COALESCE(MAX(id), 0) FROM findings').fetchone()[0]
@@ -570,27 +1088,34 @@ def import_all(outdir, migrate_legacy=False):
                     (str(max(max_id, new_max)),))
 
         # approvals that may rest on legacy Tanach evidence: re-check
-        stale = cur.execute('''
+        legacy = cur.execute('''
             SELECT r.finding_id, f.word, f.unit FROM review r
             JOIN assign a ON a.old_id = r.finding_id AND a.lg_changed
             JOIN findings f ON f.id = r.finding_id
             WHERE r.status = 'approved' ''').fetchall()
         ts = _now()
-        for fid, word, _unit in stale:
+        for fid, word, _unit in legacy:
             cur.execute('INSERT INTO history(ts, action, finding_id, word, '
                         'old_status, new_status, note) '
                         'VALUES(?,?,?,?,?,?,?)',
                         (ts, 'legacy_recheck', fid, word, 'approved', None,
                          'tanach_legacy'))
             cur.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
-        counts['legacy_approvals_dropped'] = len(stale)
+        counts['legacy_approvals_dropped'] = len(legacy)
 
         # drop review rows of vanished findings; count what survived
         cur.execute('''DELETE FROM review WHERE finding_id NOT IN
                        (SELECT id FROM findings)''')
+        cur.execute('''DELETE FROM review_ext WHERE finding_id NOT IN
+                       (SELECT finding_id FROM review)''')
+        # approvals whose finding now proposes another correction
+        stale = _mark_stale_approvals(cur)
         preserved = cur.execute('SELECT COUNT(*) FROM review').fetchone()[0]
-        withdrawn = _clear_dropped_decisions(con, outdir,
-                                             [(w, u) for _, w, u in stale])
+        # withdraw the decisions.db mirror of both kinds of dropped approval,
+        # decisions.db first (raises DecisionsLocked: all rolled back, the
+        # next refresh redoes it)
+        legacy_keys = [(w, u) for _, w, u in legacy]
+        gone = _clear_dropped_decisions(con, outdir, legacy_keys + stale)
 
         counts.update({
             'total': total,
@@ -599,13 +1124,32 @@ def import_all(outdir, migrate_legacy=False):
             'added': total - matched - kept,
             'removed': old_total - matched - kept,
             'preserved': preserved,
-            'legacy_decisions_withdrawn': withdrawn,
+            'legacy_decisions_withdrawn': _count_keys(gone, legacy_keys),
+            'decisions_withdrawn': len(gone),
             'book_scan_kept': kept,
+            'stale_approvals': len(stale),
         })
+        # what the scan behind these findings could not read: report.db
+        # carries it only when locate wrote it partial (--allow-unread)
+        _set_meta_json(cur, 'coverage', _report_coverage(cur))
+        # a book scan's record stays only while the book's rows do
+        books = _meta_json(cur, 'book_coverage') or {}
+        kept_docs = {r[0] for r in cur.execute('SELECT doc FROM keep_docs')}
+        _set_meta_json(cur, 'book_coverage',
+                       {d: v for d, v in books.items() if d in kept_docs})
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES('report_mtime', ?)",
+                    (repr(report_mtime),))
         cur.execute("INSERT OR REPLACE INTO meta VALUES('import_counts', ?)",
                     (json.dumps(counts, ensure_ascii=False),))
+        # which library these rows were scanned from, committed with the rows
+        # themselves: the fixer reads it from here and never infers it from
+        # timestamps (a book-scan merge also moves last_import)
+        cur.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (IMPORT_SOURCE_KEY,
+                     json.dumps(_report_source(cur, outdir),
+                                ensure_ascii=False)))
         cur.execute('DROP TABLE imp')
         cur.execute('DROP TABLE imp2')
         cur.execute('DROP TABLE oldmap')
@@ -621,6 +1165,66 @@ def import_all(outdir, migrate_legacy=False):
         return counts
     finally:
         con.close()
+
+
+# ---------------------------------------------------------------------------
+# coverage: findings that rest on rows the scan could not read
+# ---------------------------------------------------------------------------
+
+def _meta_json(con, key):
+    """A JSON object stored in `meta`, or None (absent or unreadable)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (key,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _set_meta_json(con, key, value):
+    if value:
+        con.execute('INSERT OR REPLACE INTO meta VALUES(?, ?)',
+                    (key, json.dumps(value, ensure_ascii=False)))
+    else:
+        con.execute('DELETE FROM meta WHERE key = ?', (key,))
+
+
+def _gap_summary(rec):
+    """What the UI needs of a coverage record (core.gap_record): not the row
+    ids, which may run to thousands."""
+    return {k: rec[k] for k in ('unread_rows', 'allow_unread', 'unread_refs',
+                                'inherited', 'unread_kind') if k in rec}
+
+
+def _report_coverage(con):
+    """The gap summary report.db (attached as `rep`) carries, or None."""
+    if not con.execute("SELECT 1 FROM rep.sqlite_master WHERE type='table' "
+                       "AND name='coverage'").fetchone():
+        return None
+    row = con.execute('SELECT info FROM rep.coverage').fetchone()
+    try:
+        info = json.loads(row[0]) if row else None
+    except (TypeError, ValueError):
+        info = None
+    if not isinstance(info, dict):
+        # a mark that cannot be read still says "partial", count unknown
+        return {'unread_rows': None, 'allow_unread': None, 'unread_refs': []}
+    return _gap_summary(info)
+
+
+# The rows of book `doc` a merge replaces (params: doc, then doc, title, lo,
+# hi twice; see import_book_scan). One OR over the doc and the doc-less
+# rows' conditions scans the whole table; each branch alone is an idx_f_doc
+# lookup.
+_DOCLESS_OF_BOOK = '''(magiah_doc_of_unit(f.unit) = ?
+    OR (f.source = ? AND f.unit != '' AND f.unit NOT GLOB '*[^0-9]*'
+        AND CAST(f.unit AS INTEGER) BETWEEN ? AND ?))'''
+BOOK_ROWS_SQL = f'''SELECT f.id AS id FROM findings f WHERE f.doc = ?
+    UNION SELECT f.id FROM findings f
+          WHERE f.doc IS NULL AND {_DOCLESS_OF_BOOK}
+    UNION SELECT f.id FROM findings f
+          WHERE f.doc = '' AND {_DOCLESS_OF_BOOK}'''
 
 
 def import_book_scan(outdir, result):
@@ -643,14 +1247,14 @@ def import_book_scan(outdir, result):
 
     Which rows belong to the book
     -----------------------------
-    ``doc`` is the book identity, but ``import_all`` leaves ``doc`` NULL for the
-    ``extra_space`` and ``tokdiag`` families (report.db carries no doc for
-    them). Matching on ``doc`` alone would leave those full-scan rows behind:
-    the user re-scans a book, is told it was refreshed, and still sees hundreds
-    of stale findings a current scan would not produce — and the extra_space
-    ones would be duplicated, since a book scan *does* emit that family with a
-    doc set. So the book's rows are ``doc = ?`` OR the NULL-doc rows whose
-    ``source`` (book title) is this book's.
+    ``doc`` is the book identity; the title is NOT (several books share one).
+    ``import_all`` derives a doc for every row it can (:func:`_resolve_docs`),
+    but a row on a DB line whose book it could not establish stays doc-less.
+    Such a row is taken as this book's only when its unit names this doc, or
+    when it has this book's title AND its line id lies within the span of
+    this book's own line ids — a same-titled other book lives on other line
+    ids. Both kinds are found through idx_f_doc; a book rule on a doc-less
+    row taken over moves to this doc.
 
     A book that yields no findings still counts as scanned: its old rows are
     removed, which is the correct outcome for a book the user has just fixed.
@@ -661,14 +1265,21 @@ def import_book_scan(outdir, result):
     if not doc:
         raise ValueError(hebrew.SCAN_MESSAGES['book_no_doc'])
     title = result.get('title') or ''
-    # rows of this book: its own doc, plus the doc-less full-scan families
-    # (extra_space / tokdiag) that belong to it by title
-    where = '(f.doc = ? OR (f.doc IS NULL AND f.source = ?))'
-    wparams = (doc, title)
     con = connect(outdir)
     try:
         cur = con.cursor()
         cur.execute('BEGIN IMMEDIATE')
+        line_ids = [v for v in cur.execute(
+            "SELECT MIN(CAST(unit AS INTEGER)), MAX(CAST(unit AS INTEGER)) "
+            "FROM findings WHERE doc = ? AND unit != '' "
+            "AND unit NOT GLOB '*[^0-9]*'", (doc,)).fetchone()
+            if v is not None]
+        line_ids += [int(r['unit']) for r in (result.get('findings') or []) +
+                     (result.get('space_errors') or [])
+                     if str(r.get('unit') or '').isdigit()]
+        lo, hi = (min(line_ids), max(line_ids)) if line_ids else (1, 0)
+        cur.execute(f'CREATE TEMP TABLE bookids AS {BOOK_ROWS_SQL}',
+                    (doc,) + (doc, title, lo, hi) * 2)
 
         # -- remember the decisions currently attached to this book ---------
         cur.execute(f'''CREATE TEMP TABLE oldbook AS
@@ -677,13 +1288,18 @@ def import_book_scan(outdir, result):
                    f.errtype AS errtype, COALESCE(f.ref,'') AS r,
                    {_legacy_lg('f.')} AS lg,
                    ROW_NUMBER() OVER (PARTITION BY {KEY_COLS}
-                                      ORDER BY f.id) AS seq
-            FROM findings f WHERE {where}''', wparams)
+                                      ORDER BY f.id) AS seq,
+                   {BOOKKEY} AS bkey,
+                   {BOOK_CLICKED.format(id='f.id')} AS clicked
+            FROM findings f WHERE f.id IN (SELECT id FROM bookids)''')
         old_total = cur.execute('SELECT COUNT(*) FROM oldbook').fetchone()[0]
         cur.execute('''CREATE TEMP TABLE oldrev AS
             SELECT o.family, o.w, o.u, o.errtype, o.r, o.seq,
-                   r.status, r.note, r.custom_suggestion, r.updated_at
+                   r.status, r.note, r.custom_suggestion, r.updated_at,
+                   x.scope, x.approved_suggestion, x.decided_by, x.flag,
+                   x.prev_decision
             FROM oldbook o JOIN review r ON r.finding_id = o.id
+            LEFT JOIN review_ext x ON x.finding_id = o.id
             WHERE o.lg = 0 OR r.status != 'approved' ''')
         # ...and the legacy approvals it leaves behind (as in import_all)
         cur.execute('''CREATE TEMP TABLE dropped AS
@@ -694,12 +1310,14 @@ def import_book_scan(outdir, result):
         # -- out with the old rows of this book ------------------------------
         cur.execute('DELETE FROM review WHERE finding_id IN '
                     '(SELECT id FROM oldbook)')
+        cur.execute('DELETE FROM review_ext WHERE finding_id IN '
+                    '(SELECT id FROM oldbook)')
         # history rows of removed findings would otherwise dangle onto whatever
         # id is issued next
         cur.execute('DELETE FROM history WHERE finding_id IN '
                     '(SELECT id FROM oldbook)')
-        cur.execute(f'DELETE FROM findings WHERE {where.replace("f.", "")}',
-                    wparams)
+        cur.execute('DELETE FROM findings WHERE id IN '
+                    '(SELECT id FROM oldbook)')
 
         # -- in with the new -------------------------------------------------
         # Staged in a temp table so `rank` and `verified` can be computed by
@@ -786,39 +1404,278 @@ def import_book_scan(outdir, result):
               ON o.family = n.family AND o.w = n.w AND o.u = n.u
              AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
         preserved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        cur.execute('''INSERT OR REPLACE INTO review_ext(
+                finding_id, scope, approved_suggestion, decided_by, flag,
+                prev_decision)
+            SELECT n.id, o.scope, o.approved_suggestion, o.decided_by, o.flag,
+                   o.prev_decision
+            FROM newbook n JOIN oldrev o
+              ON o.family = n.family AND o.w = n.w AND o.u = n.u
+             AND o.errtype = n.errtype AND o.r = n.r AND o.seq = n.seq''')
+        # approvals whose re-scanned row proposes another correction
+        stale = _mark_stale_approvals(
+            cur, 'f.doc = ? AND f.id > ?', (doc, max_id))
+        # book rules on the doc-less rows taken over now key by this doc
+        _rekey_book_rules(cur, 'SELECT w AS word, bkey AS old_key, '
+                               '? AS new_key, clicked FROM oldbook', (doc,))
 
-        # -- log the dropped legacy approvals, withdraw their decisions -----
+        # -- log the dropped legacy approvals --------------------------------
         # The old ids are gone with their history; the entry points at the
         # new row of the same identity when the re-scan still has one.
-        stale = cur.execute('''
+        legacy = cur.execute('''
             SELECT n.id, d.w, d.u FROM dropped d LEFT JOIN newbook n
               ON n.family = d.family AND n.w = d.w AND n.u = d.u
              AND n.errtype = d.errtype AND n.r = d.r AND n.seq = d.seq
             ''').fetchall()
         ts = _now()
-        for fid, word, _unit in stale:
+        for fid, word, _unit in legacy:
             cur.execute('INSERT INTO history(ts, action, finding_id, word, '
                         'old_status, new_status, note) '
                         'VALUES(?,?,?,?,?,?,?)',
                         (ts, 'legacy_recheck', fid, word, 'approved', None,
                          'tanach_legacy'))
-        withdrawn = _clear_dropped_decisions(con, outdir,
-                                             [(w, u) for _, w, u in stale])
+        # ...and withdraw the decisions.db mirror of both kinds of dropped
+        # approval, decisions.db first (raises DecisionsLocked: all rolled
+        # back, the next re-scan redoes it)
+        legacy_keys = [(w, u) for _, w, u in legacy]
+        gone = _clear_dropped_decisions(con, outdir, legacy_keys + stale)
 
+        # each scan of the book replaces its coverage record; a complete one
+        # removes it
+        books = _meta_json(cur, 'book_coverage') or {}
+        books.pop(doc, None)
+        if result.get('coverage'):
+            books[doc] = dict(_gap_summary(result['coverage']), title=title)
+        _set_meta_json(cur, 'book_coverage', books)
         cur.execute("INSERT OR REPLACE INTO meta VALUES('last_import', ?)",
                     (_now(),))
-        for t in ('oldbook', 'oldrev', 'dropped', 'newbook'):
+        for t in ('bookids', 'oldbook', 'oldrev', 'dropped', 'newbook'):
             cur.execute(f'DROP TABLE {t}')
         con.commit()
         return {'doc': doc, 'title': result.get('title'),
                 'added': added, 'replaced': old_total,
-                'preserved': preserved,
-                'legacy_approvals_dropped': len(stale),
-                'legacy_decisions_withdrawn': withdrawn,
+                'preserved': preserved, 'stale_approvals': len(stale),
+                'legacy_approvals_dropped': len(legacy),
+                'legacy_decisions_withdrawn': _count_keys(gone, legacy_keys),
+                'decisions_withdrawn': len(gone),
                 'findings': len(result.get('findings') or []),
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
         con.close()
+
+
+def _mark_stale_approvals(cur, where='1', params=()):
+    """Approvals whose finding now proposes a different correction drop back
+    to 'pending' with flag 'stale_approval'; the old decision is kept in
+    prev_decision. A user-typed correction stays bound to its occurrence.
+    Returns the (word, unit) of every demoted finding."""
+    rows = cur.execute(f'''
+        SELECT f.id, f.word, f.unit, r.status, r.note, r.updated_at,
+               x.approved_suggestion, x.decided_by, x.scope
+        FROM findings f JOIN review r ON r.finding_id = f.id
+        JOIN review_ext x ON x.finding_id = f.id
+        WHERE {where} AND r.status = 'approved'
+          AND COALESCE(r.custom_suggestion, '') = ''
+          AND x.approved_suggestion IS NOT NULL
+          AND x.approved_suggestion != COALESCE(f.suggestion, '')''',
+        params).fetchall()
+    ts = _now()
+    for r in rows:
+        prev = json.dumps({'status': r[3], 'approved_suggestion': r[6],
+                           'decided_by': r[7], 'scope': r[8],
+                           'updated_at': r[5]}, ensure_ascii=False)
+        cur.execute("UPDATE review SET status = 'pending', updated_at = ? "
+                    'WHERE finding_id = ?', (ts, r[0]))
+        cur.execute("UPDATE review_ext SET flag = 'stale_approval', "
+                    'prev_decision = ? WHERE finding_id = ?', (prev, r[0]))
+    return [(r[1], r[2]) for r in rows]
+
+
+# -- approvals recorded without the suggestion they approved ----------------
+# ui_review.db before schema rev 2, backups written before approved_suggestion
+# existed, and word-wide approvals of earlier versions carry no suggestion.
+# Bound to the finding's CURRENT suggestion they would approve whatever a
+# re-scan proposed since.
+
+def _accepted_in_decisions(dec, keys):
+    """{(word, unit): suggestion} of decisions.db's 'accept' rows on `keys`
+    that name a suggestion: every approval was mirrored there with the
+    correction it approved."""
+    out = {}
+    if dec is None:
+        return out
+    for word, unit in set(keys):
+        row = dec.execute("SELECT suggestion FROM decisions WHERE word = ? "
+                          "AND unit = ? AND verdict = 'accept'",
+                          (word, unit)).fetchone()
+        if row and row[0]:
+            out[(word, unit)] = row[0]
+    return out
+
+
+def _last_import(con):
+    row = con.execute(
+        "SELECT value FROM meta WHERE key = 'last_import'").fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _approval_basis(con, f, row, last_import, accepted, shared):
+    """The suggestion an approval recorded without one was made against, or
+    None when that cannot be established:
+
+    * the user's own correction, when there is one;
+    * the finding's current suggestion, when the findings were not
+      (re)imported since the approval was made (``last_import`` is older
+      than the approval's ``updated_at``, or there was no import at all);
+    * the suggestion of decisions.db's 'accept' row on the finding's
+      (word, unit), when this UI wrote that row and no other approval shares
+      the key (`shared`), so the row is this approval's own mirror.
+    """
+    if row.get('custom_suggestion'):
+        return row['custom_suggestion']
+    upd = row.get('updated_at')
+    if last_import is None or (upd and str(upd) >= last_import):
+        return f['suggestion'] or ''
+    key = (f['word'] or '', f['unit'] or '')
+    if key in accepted and key not in shared and _owns_decision(con, *key):
+        return accepted[key]
+    return None
+
+
+def _shared_keys(pairs):
+    """The (word, unit) keys more than one of `pairs` stands on."""
+    seen, shared = set(), set()
+    for word, unit in pairs:
+        key = (word or '', unit or '')
+        (shared if key in seen else seen).add(key)
+    return shared
+
+
+def _recheck_note(msg, sugg, note):
+    """A demoted approval's note: why it must be checked again, then the
+    note it had."""
+    text = hebrew.MESSAGES[msg].format(sugg=sugg or '—')
+    return text + (' · ' + note if note else '')
+
+
+def _bind_old_approvals(con, outdir):
+    """Schema rev 2: bind the approvals of an older ui_review.db, which
+    recorded no suggestion, to the one each was made against
+    (:func:`_approval_basis`). An approval that cannot be bound is demoted
+    to 'unsure' with a note, as migrate_legacy_decisions demotes an accept it
+    cannot trust, and its decisions.db mirror is withdrawn (rows this UI
+    owns only). A 'fixed' row is never demoted (the book was corrected);
+    it is bound where possible.
+
+    Returns (dec, gone): the decisions.db connection holding the withdrawal
+    (None when nothing was withdrawn), for the caller to commit first.
+    """
+    rows = con.execute('''
+        SELECT f.id, f.word, f.unit, f.suggestion, r.status, r.note,
+               r.custom_suggestion, r.updated_at
+        FROM review r JOIN findings f ON f.id = r.finding_id
+        LEFT JOIN review_ext x ON x.finding_id = r.finding_id
+        WHERE r.status IN ('approved', 'fixed')
+          AND x.approved_suggestion IS NULL''').fetchall()
+    shared = _shared_keys((r['word'], r['unit']) for r in rows)
+    last = _last_import(con)
+    dec = None
+    if outdir and any(_approval_basis(con, r, dict(r), last, {}, shared)
+                      is None for r in rows) and \
+            os.path.exists(os.path.join(outdir, DECISIONS_F)):
+        # a short wait: this runs inside connect(); a lock makes the next
+        # connection retry the whole migration
+        dec = _decisions_con(outdir, timeout=MIGRATE_DECISIONS_TIMEOUT)
+        try:
+            dec.execute('BEGIN IMMEDIATE')
+        except sqlite3.OperationalError:
+            dec.close()
+            raise
+    accepted = _accepted_in_decisions(
+        dec, [(r['word'] or '', r['unit'] or '') for r in rows])
+    demoted = []
+    for r in rows:
+        basis = _approval_basis(con, r, dict(r), last, accepted, shared)
+        if basis is not None:
+            con.execute('UPDATE review_ext SET approved_suggestion = ? '
+                        'WHERE finding_id = ?', (basis, r['id']))
+        elif r['status'] == 'approved':
+            con.execute("UPDATE review SET status = 'unsure', note = ? "
+                        'WHERE finding_id = ?',
+                        (_recheck_note('unbound_approval_recheck',
+                                       r['suggestion'], r['note']), r['id']))
+            demoted.append((r['word'], r['unit']))
+    gone = []
+    if dec is not None:
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, demoted))
+    return dec, gone
+
+
+def _bind_word_approvals(con, dec):
+    """Word-wide approvals (word_rules 'approved', from earlier versions of
+    this UI and from the old tool's global accepts) approve whatever any
+    finding of the word proposes, now or after a re-scan. Where decisions.db's
+    global row (unit '*') names the suggestion that was approved, the
+    approval becomes an approved replacement rule on that (word, suggestion)
+    pair (unless that pair already has a rule of its own, which outranked
+    the word rule anyway).
+
+    Without such a suggestion the rule is left as it is: there is nothing it
+    can be bound to, and dropping or demoting it would throw away a decision
+    the user made on purpose. set_status no longer creates one, the rule
+    stays visible in the finding's history and can be revoked there, and it
+    never reaches the detector (only a global not_error does). Returns how
+    many were bound."""
+    words = [r[0] for r in con.execute(
+        "SELECT word FROM word_rules WHERE status = 'approved'")]
+    accepted = _accepted_in_decisions(dec, [(w, '*') for w in words])
+    bound = 0
+    for word in words:
+        sugg = accepted.get((word, '*'))
+        if not sugg:
+            continue
+        rule = _get_rule(con, 'word', {'word': word})
+        key = {'word': word, 'suggestion': sugg}
+        if _get_rule(con, 'replacement', key) is None:
+            _put_rule(con, 'replacement', key,
+                      {'status': 'approved', 'decided_by': rule['decided_by'],
+                       'updated_at': rule['updated_at']})
+        _put_rule(con, 'word', {'word': word}, None)
+        bound += 1
+    return bound
+
+
+def _restored_approval_dropped(con, fid, rv):
+    """A backed-up approval that a refresh has since dropped as resting on
+    the old Tanach heuristic (``legacy_recheck``) must not come back with
+    the backup: the refresh logged the drop after the approval was made, or
+    the finding is a legacy row now and the backup does not show it was
+    already marked so when it was approved."""
+    if con.execute("SELECT 1 FROM history WHERE action = 'legacy_recheck' "
+                   'AND finding_id = ? AND ts >= ? LIMIT 1',
+                   (fid, rv.get('updated_at') or '')).fetchone():
+        return True
+    lg = con.execute(f'SELECT {_legacy_lg()} FROM findings WHERE id = ?',
+                     (fid,)).fetchone()[0]
+    return lg != 0 and not rv.get('legacy_marked')
+
+
+def _mark_stale_ids(con, ids):
+    if not ids:
+        return []
+    return _mark_stale_approvals(
+        con.cursor(), 'f.id IN (SELECT value FROM json_each(?))',
+        (json.dumps(list(ids)),))
+
+
+def _ids_of(con, stale, candidates):
+    """Which of `candidates` were just marked stale."""
+    if not stale:
+        return []
+    return [r[0] for r in con.execute(
+        "SELECT finding_id FROM review_ext WHERE flag = 'stale_approval' "
+        'AND finding_id IN (SELECT value FROM json_each(?))',
+        (json.dumps(list(candidates)),))]
 
 
 def migrate_legacy_decisions(con, outdir):
@@ -826,9 +1683,13 @@ def migrate_legacy_decisions(con, outdir):
 
     accept -> approved (decision suggestion kept as custom_suggestion when it
     differs from the finding's own suggestion); reject -> not_error; ignore
-    -> ignored. A unit='*' row becomes a word_rules row of the same status
-    (the old tool's "reject everywhere" -> 'not_error'). Matching is on
-    (word, unit); existing review rows are never overwritten. Returns counts.
+    -> ignored. A per-unit row is a decision on that occurrence only (scope
+    'occurrence'); a unit='*' row becomes a word_rules row of the same status
+    (the old tool's "reject everywhere" -> 'not_error', the only global
+    scope; this UI's earlier versions also mirrored word-wide approvals
+    there). Matching is on (word, unit); existing review rows are never
+    overwritten. The decider of a legacy row is unknown, so decided_by stays
+    empty. Returns counts.
 
     Exception: an accept on a Tanach-backed finding (a tanach_legacy row, a
     row with tanach != 0, or a tanach_* family row) is imported as 'unsure',
@@ -865,9 +1726,16 @@ def migrate_legacy_decisions(con, outdir):
         _own_decision(con, word, unit)
         if unit == '*':
             # the old tool writes '*' only for "reject everywhere"; this UI
-            # mirrors every word-wide status there, an approval included
-            con.execute('INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (word, status, ts))
+            # mirrored every word-wide status there, an approval included.
+            # An approval naming its suggestion is bound to that pair, as a
+            # replacement rule (see _bind_word_approvals)
+            if status == 'approved' and sugg:
+                _put_rule(con, 'replacement',
+                          {'word': word, 'suggestion': sugg},
+                          {'status': status, 'updated_at': ts})
+            else:
+                con.execute('INSERT OR REPLACE INTO word_rules(word, status, '
+                            'updated_at) VALUES(?,?,?)', (word, status, ts))
             out['word_rules'] += 1
             continue
         fids = con.execute(
@@ -887,8 +1755,16 @@ def migrate_legacy_decisions(con, outdir):
             elif (verdict == 'accept' and sugg and sugg != (fsugg or '')):
                 custom = sugg
             n = con.execute(
-                'INSERT OR IGNORE INTO review VALUES(?,?,?,?,?)',
+                'INSERT OR IGNORE INTO review(finding_id, status, note, '
+                'custom_suggestion, updated_at) VALUES(?,?,?,?,?)',
                 (fid, st, note, custom, ts)).rowcount
+            if n:
+                # bound to what was approved, like an approval made here
+                con.execute(
+                    'INSERT OR REPLACE INTO review_ext(finding_id, scope, '
+                    'approved_suggestion) VALUES(?,?,?)',
+                    (fid, 'occurrence',
+                     (custom or fsugg or '') if st == 'approved' else None))
             out['review'] += n
             if st == 'unsure':
                 out['recheck'] += n
@@ -910,7 +1786,9 @@ def _rowdict(row):
     return d
 
 
-def get_meta(con):
+def get_meta(con, outdir=None):
+    """Labels, counts and — given the output folder — ``result_status``:
+    whether the findings are those of the latest scan (result_status.py)."""
     origins = []
     for raw, cnt, done in con.execute(f'''
             SELECT f.origin, COUNT(*),
@@ -956,10 +1834,14 @@ def get_meta(con):
             'extra_labels': hebrew.EXTRA_LABELS,
             # no findings yet -> the UI shows its "run a scan first" screen
             'no_scan': total == 0,
-            'last_import': last_import[0] if last_import else None}
+            'last_import': last_import[0] if last_import else None,
+            'result_status': (result_status.build(con, outdir)
+                              if outdir else None)}
 
 
 def get_books(con, origin=None, q=None):
+    """Books by stable key (doc). Two books with one title stay two
+    entries; `source` is the title to display, `key` is what to filter on."""
     where, params = [], []
     if origin:
         where.append('f.origin = ?')
@@ -969,14 +1851,26 @@ def get_books(con, origin=None, q=None):
         params.append(q)
     wsql = ('WHERE ' + ' AND '.join(where)) if where else ''
     rows = con.execute(f'''
-        SELECT f.source, COUNT(*) AS count,
+        SELECT {BOOKKEY} AS bkey, MIN(f.source), COUNT(*) AS count,
                SUM(CASE WHEN {EFF} = 'pending' THEN 1 ELSE 0 END) AS pending,
                SUM(CASE WHEN {EFF} = 'approved' THEN 1 ELSE 0 END)
         FROM findings f {JOINS} {wsql}
-        GROUP BY f.source ORDER BY COUNT(*) DESC''', params).fetchall()
-    return [{'source': r[0] or '', 'count': r[1], 'pending_count': r[2] or 0,
-             'approved_count': r[3] or 0}
+        GROUP BY bkey ORDER BY COUNT(*) DESC''', params).fetchall()
+    return [{'key': r[0], 'source': r[1] or '', 'count': r[2],
+             'pending_count': r[3] or 0, 'approved_count': r[4] or 0}
             for r in rows]
+
+
+def _book_key_where(key):
+    """SQL for "this finding belongs to book `key`" (see BOOKKEY); split so
+    the common doc case can use idx_f_doc."""
+    if key.startswith('src:'):
+        return ("(f.doc IS NULL OR f.doc = '') AND f.source = ? AND NOT "
+                "(f.unit IS NOT NULL AND " + _DB_LINE.format(u='f.unit')
+                + ')'), key[4:]
+    if key.startswith('line:'):
+        return "(f.doc IS NULL OR f.doc = '') AND f.unit = ?", key[5:]
+    return 'f.doc = ?', key
 
 
 def _findings_where(filters):
@@ -984,7 +1878,23 @@ def _findings_where(filters):
     if filters.get('origin'):
         where.append('f.origin = ?')
         params.append(filters['origin'])
-    if filters.get('book'):
+    if filters.get('ids'):
+        # a known set of findings (the card queue re-checking its cards)
+        ids = filters['ids']
+        if isinstance(ids, str):
+            ids = ids.split(',')
+        try:
+            ids = [int(i) for i in ids if str(i).strip()]
+        except ValueError:
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        where.append('f.id IN (SELECT value FROM json_each(?))')
+        params.append(json.dumps(ids))
+    if filters.get('book_key'):
+        sql, p = _book_key_where(filters['book_key'])
+        where.append(sql)
+        params.append(p)
+    elif filters.get('book'):
+        # legacy: by display title, which several books may share
         where.append('f.source = ?')
         params.append(filters['book'])
     if filters.get('errtype'):
@@ -997,7 +1907,8 @@ def _findings_where(filters):
         sts = filters['status']
         if isinstance(sts, str):
             sts = [s for s in sts.split(',') if s]
-        where.append(f'{EFF} IN (%s)' % ','.join('?' * len(sts)))
+        # not %-formatting: EFF itself holds LIKE '%...%' patterns
+        where.append(f"{EFF} IN ({','.join('?' * len(sts))})")
         params.extend(sts)
     if filters.get('verified') not in (None, '', '0'):
         where.append('f.verified = 1')
@@ -1020,39 +1931,206 @@ SORTS = {
 }
 
 
+def _direction(sort, direction):
+    d = 'ASC' if str(direction).lower() == 'asc' else 'DESC'
+    if sort == 'rank' and direction in (None, ''):
+        d = 'DESC'
+    return d
+
+
+def _count(con, filters, wsql, params):
+    # the status joins cost ~4 lookups per row; only a status filter needs them
+    joins = JOINS if filters.get('status') else ''
+    return con.execute(f'SELECT COUNT(*) FROM findings f {joins} {wsql}',
+                       params).fetchone()[0]
+
+
 def query_findings(con, filters, sort='rank', direction='desc',
                    page=1, page_size=50):
     page = max(1, int(page or 1))
     page_size = min(500, max(1, int(page_size or 50)))
-    d = 'ASC' if str(direction).lower() == 'asc' else 'DESC'
-    if sort == 'rank' and direction in (None, ''):
-        d = 'DESC'
-    order = SORTS.get(sort, SORTS['rank']).format(d=d)
+    order = SORTS.get(sort, SORTS['rank']).format(d=_direction(sort,
+                                                               direction))
     wsql, params = _findings_where(filters)
-    total = con.execute(
-        f'SELECT COUNT(*) FROM findings f {JOINS} {wsql}',
-        params).fetchone()[0]
+    total = _count(con, filters, wsql, params)
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
-               r.custom_suggestion AS custom_suggestion
-        FROM findings f {JOINS} {wsql}
+               r.custom_suggestion AS custom_suggestion, {EXT_COLS}
+        FROM findings f {JOINS} {EXT_JOIN} {wsql}
         ORDER BY {order} LIMIT ? OFFSET ?''',
         params + [page_size, (page - 1) * page_size]).fetchall()
     return [_rowdict(r) for r in rows], total
+
+
+# Keyset sort keys. Each list is the ORDER BY of one sort (all one
+# direction, then f.id), and SORT_INDEXES indexes exactly these expressions:
+# a page is then an index range seek, never a sort of the whole table.
+# NULLs are folded so that `<`/`>` on the keys agree with ORDER BY.
+_UNIT_KEY = 'COALESCE(%s, 0)' % UNIT_ORDER.format(u='{p}unit')
+KEYSET_KEYS = {
+    'rank': ['COALESCE({p}rank, -1e300)'],
+    'source': ["COALESCE({p}source, '')", _UNIT_KEY],
+    'word': ["COALESCE({p}word, '')", "COALESCE({p}unit, '')"],
+}
+SORT_INDEXES = {
+    'idx_f_kr': KEYSET_KEYS['rank'],
+    'idx_f_ks': KEYSET_KEYS['source'],
+    'idx_f_kw': KEYSET_KEYS['word'],
+}
+
+
+def _sort_index_sql():
+    return ''.join(
+        'CREATE INDEX IF NOT EXISTS %s ON findings(%s);\n'
+        % (name, ', '.join(e.format(p='') for e in exprs))
+        for name, exprs in SORT_INDEXES.items())
+
+
+def _mix32(v):
+    v = ((v ^ (v >> 16)) * 0x45d9f3b) & 0xffffffff
+    v = ((v ^ (v >> 16)) * 0x45d9f3b) & 0xffffffff
+    return v ^ (v >> 16)
+
+
+def _shuffle(x, bits, keys):
+    """A seed-keyed bijection on [0, 2**bits) (balanced Feistel network)."""
+    h = bits // 2
+    mask = (1 << h) - 1
+    left, right = x >> h, x & mask
+    for k in keys:
+        left, right = right, left ^ (_mix32(right ^ k) & mask)
+    return (left << h) | right
+
+
+def _id_bits(con):
+    """The random walk's width: every id issued so far is below 2**bits
+    (the high-water mark counts too: ids are never reissued)."""
+    top = con.execute('SELECT MAX(id) FROM findings').fetchone()[0] or 0
+    row = con.execute(
+        "SELECT value FROM meta WHERE key='max_finding_id'").fetchone()
+    try:
+        top = max(top, int(row[0])) if row else top
+    except (TypeError, ValueError):
+        pass
+    bits = max(2, top.bit_length())
+    return bits + bits % 2
+
+
+def _random_page(con, wsql, params, page_size, cursor, seed):
+    """'random' sort: walk a seed-keyed permutation of the id space.
+
+    Position k of the walk holds id _shuffle(k); every id is visited once,
+    a different seed gives a different order, and a page costs only primary
+    key lookups for a few hundred candidate ids — no table-wide sort.
+
+    The cursor is [position, bits]. One that is not a position of a walk
+    this table could have started (two integers, an even width no wider
+    than the ids issued so far) is refused: a crafted width of 62 made the
+    server walk 2**62 positions.
+    """
+    bits = _id_bits(con)
+    k = -1
+    if cursor:
+        try:
+            ck, cbits = json.loads(cursor)
+            if not all(type(v) is int for v in (ck, cbits)):
+                raise TypeError
+        except (ValueError, TypeError):
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        # ids only grow: a cursor's walk is never wider than one started now
+        if not (2 <= cbits <= bits and cbits % 2 == 0
+                and -1 <= ck < (1 << cbits)):
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        k, bits = ck, cbits
+    digest = hashlib.sha256(str(seed or 0).encode('utf-8')).digest()
+    keys = [int.from_bytes(digest[i:i + 4], 'big') for i in range(0, 16, 4)]
+    end = 1 << bits
+    where = (wsql + ' AND ' if wsql else 'WHERE ') + \
+        'f.id IN (SELECT value FROM json_each(?))'
+    found, batch = [], page_size * 2
+    while len(found) <= page_size and k < end - 1:
+        span = range(k + 1, min(end, k + 1 + batch))
+        ids = [_shuffle(i, bits, keys) for i in span]
+        rows = {r['id']: r for r in con.execute(f'''
+            SELECT f.*, {EFF} AS effective_status, r.note AS note,
+                   r.custom_suggestion AS custom_suggestion, {EXT_COLS}
+            FROM findings f {JOINS} {EXT_JOIN} {where}''',
+            params + [json.dumps(ids)])}
+        found += [(i, rows[fid]) for i, fid in zip(span, ids) if fid in rows]
+        k = span[-1]
+        batch = min(batch * 4, 50000)
+    more = len(found) > page_size
+    found = found[:page_size]
+    nxt = json.dumps([found[-1][0], bits]) if more else None
+    return [_rowdict(r) for _, r in found], nxt
+
+
+def query_findings_page(con, filters, sort='rank', direction='desc',
+                        page_size=50, cursor='', seed=None, with_total=False):
+    """Keyset ("cursor") paging: rows strictly after `cursor` in a stable
+    order. Unlike OFFSET paging it never skips rows when decisions remove
+    earlier rows from a status-filtered set — the card queue relies on it.
+
+    The total is counted only on request: it costs a scan of the filtered
+    set, which a page itself never needs.
+    Returns (rows, total or None, next_cursor); next_cursor is None on the
+    last page.
+    """
+    page_size = min(500, max(1, int(page_size or 50)))
+    wsql, params = _findings_where(filters)
+    total = _count(con, filters, wsql, params) if with_total else None
+    if sort == 'random':
+        rows, nxt = _random_page(con, wsql, params, page_size, cursor, seed)
+        return rows, total, nxt
+    d = _direction(sort, direction)
+    exprs = [e.format(p='f.') for e in KEYSET_KEYS.get(sort,
+                                                       KEYSET_KEYS['rank'])]
+    keys = exprs + ['f.id']
+    if cursor:
+        try:
+            vals = json.loads(cursor)
+        except ValueError:
+            vals = None
+        if not isinstance(vals, list) or len(vals) != len(keys):
+            raise ValueError(hebrew.MESSAGES['bad_request'])
+        op = '<' if d == 'DESC' else '>'
+        # the redundant bound on the leading key is what lets SQLite seek
+        # into the index instead of scanning it from the start
+        cond = (f'{exprs[0]} {op}= ? AND ({", ".join(keys)}) {op} '
+                f'({", ".join("?" * len(keys))})')
+        wsql = (wsql + ' AND ' if wsql else 'WHERE ') + cond
+        params = params + [vals[0]] + vals
+    kcols = ', '.join(f'{e} AS _k{i}' for i, e in enumerate(keys))
+    order = ', '.join(f'{e} {d}' for e in keys)
+    rows = con.execute(f'''
+        SELECT f.*, {EFF} AS effective_status, r.note AS note,
+               r.custom_suggestion AS custom_suggestion, {EXT_COLS}, {kcols}
+        FROM findings f {JOINS} {EXT_JOIN} {wsql}
+        ORDER BY {order} LIMIT ?''', params + [page_size + 1]).fetchall()
+    more = len(rows) > page_size
+    out, last = [], None
+    for r in rows[:page_size]:
+        d_ = _rowdict(r)
+        last = [d_.pop(f'_k{i}') for i in range(len(keys))]
+        out.append(d_)
+    return out, total, (json.dumps(last) if more else None)
 
 
 def get_finding(con, fid):
     row = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion,
-               r.updated_at AS updated_at
-        FROM findings f {JOINS} WHERE f.id = ?''', (fid,)).fetchone()
+               r.updated_at AS updated_at, {EXT_COLS}
+        FROM findings f {JOINS} {EXT_JOIN} WHERE f.id = ?''',
+        (fid,)).fetchone()
     if row is None:
         return None
     d = _rowdict(row)
     d['history'] = [dict(h) for h in con.execute(
         '''SELECT * FROM history
-           WHERE finding_id = ? OR (action = 'word_rule' AND word = ?)
+           WHERE finding_id = ? OR (action IN ('word_rule', 'book_rule',
+                                               'replacement_rule')
+                                    AND word = ?)
            ORDER BY id DESC LIMIT 50''', (fid, d['word']))]
     return d
 
@@ -1060,6 +2138,40 @@ def get_finding(con, fid):
 # ---------------------------------------------------------------------------
 # status writes + decisions.db sync
 # ---------------------------------------------------------------------------
+
+class StatusConflict(ValueError):
+    """The finding is no longer in the state the client acted on (G3): a
+    double click, another tab or reviewer got there first, or a rule (word,
+    book, replacement) set since decides it. `cause` maps each finding id to
+    'decision' or the kind of rule that decides it now; the message names
+    the rule when one does."""
+
+    def __init__(self, current, cause=None):
+        cause = cause or {}
+        rules = [(k, current.get(i)) for i, k in cause.items()
+                 if k in hebrew.RULE_LABELS]
+        if rules:
+            kind, st = rules[0]
+            msg = hebrew.MESSAGES['status_conflict_rule'].format(
+                rule=hebrew.RULE_LABELS[kind], status=hebrew.status_hebrew(st))
+        else:
+            msg = hebrew.MESSAGES['status_conflict']
+        super().__init__(msg)
+        self.current = current
+        self.cause = cause
+
+
+def _conflict_cause(f):
+    """What decides finding row `f` (see set_status) now: its own decision,
+    or the narrowest rule whose status is its effective status."""
+    if f['own_status'] is not None or f['eff'] == 'pending':
+        return 'decision'
+    for kind, col in (('book', 'book_rule'), ('replacement', 'repl_rule'),
+                      ('word', 'word_rule')):
+        if f[col] == f['eff']:
+            return kind
+    return 'decision'
+
 
 def _own_decision(con, word, unit):
     """Record that this UI owns the decisions.db row keyed (word, unit)."""
@@ -1074,12 +2186,16 @@ def _owns_decision(con, word, unit):
 
 
 def _sync_decision(con, dec, finding, status, custom_suggestion=None,
-                   word_scope=False):
+                   word_scope=False, decided_by=None, scope=None):
     """Mirror one status into old-schema decisions.db.
 
-    ``con`` is the ui_review.db connection, used for the ownership table.
-    Returns a Hebrew warning string when a delete was declined because the
-    matching decisions.db row is a legacy row this UI never wrote, else None.
+    Only a word-scope decision becomes the global unit='*' row (the one the
+    detect whitelist reads); every other decision is mirrored on its own
+    unit, with its real scope in decision_scope (an audit table for readers
+    of decisions.db). ``custom_suggestion`` is the correction to record —
+    callers pass the approved one, never a suggestion the user did not see. ``con`` is the ui_review.db connection, used for the ownership
+    table. Returns a Hebrew warning string when a delete was declined because
+    the matching decisions.db row is a legacy row this UI never wrote.
     """
     verdict = hebrew.STATUSES[status]['verdict']
     word = finding['word']
@@ -1092,90 +2208,255 @@ def _sync_decision(con, dec, finding, status, custom_suggestion=None,
             return hebrew.MESSAGES['legacy_decision_kept'] + (word or '')
         dec.execute('DELETE FROM decisions WHERE word = ? AND unit = ?',
                     (word, unit))
+        dec.execute('DELETE FROM decision_scope WHERE word = ? AND unit = ?',
+                    (word or '', unit))
         con.execute('DELETE FROM owned_decisions WHERE word = ? AND unit = ?',
                     (word or '', unit or ''))
     else:
-        sugg = custom_suggestion or finding['suggestion'] or ''
-        dec.execute('INSERT OR REPLACE INTO decisions VALUES(?,?,?,?,?,?,?)',
-                    (word, unit, finding['errtype'] or '', verdict, sugg,
-                     finding['source'] or '', finding['ref'] or ''))
+        f = dict(finding)
+        sugg = custom_suggestion or f.get('suggestion') or ''
+        dec.execute('INSERT OR REPLACE INTO decisions(word, unit, errtype, '
+                    'verdict, suggestion, source, ref) VALUES(?,?,?,?,?,?,?)',
+                    (word, unit, f.get('errtype') or '', verdict, sugg,
+                     f.get('source') or '', f.get('ref') or ''))
+        dec.execute('INSERT OR REPLACE INTO decision_scope VALUES(?,?,?,?)',
+                    (word or '', unit,
+                     'global' if word_scope else (scope or 'occurrence'),
+                     decided_by))
         _own_decision(con, word, unit)
     return None
 
 
+REVIEW_COLS = ('status', 'note', 'custom_suggestion', 'updated_at')
+EXT_FIELDS = ('scope', 'approved_suggestion', 'decided_by', 'flag',
+              'prev_decision')
+# what makes two review states different (timestamps and actor do not)
+_SAME_FIELDS = ('status', 'note', 'custom_suggestion', 'scope',
+                'approved_suggestion', 'flag')
+
+RULES = {   # scope -> (table, key columns)
+    'word': ('word_rules', ('word',)),
+    'book': ('book_rules', ('word', 'doc')),
+    'replacement': ('replacement_rules', ('word', 'suggestion')),
+}
+
+
+def _get_review(con, fid):
+    """The full decision on one finding (review + review_ext), or None."""
+    r = con.execute(f'''
+        SELECT r.status, r.note, r.custom_suggestion, r.updated_at,
+               {', '.join('x.' + c for c in EXT_FIELDS)}
+        FROM review r LEFT JOIN review_ext x ON x.finding_id = r.finding_id
+        WHERE r.finding_id = ?''', (fid,)).fetchone()
+    return dict(r) if r else None
+
+
+def _put_review(con, fid, row):
+    """Write (or with row=None delete) the full decision on one finding."""
+    if row is None:
+        con.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
+        con.execute('DELETE FROM review_ext WHERE finding_id = ?', (fid,))
+        return
+    con.execute('INSERT OR REPLACE INTO review(finding_id, status, note, '
+                'custom_suggestion, updated_at) VALUES(?,?,?,?,?)',
+                (fid,) + tuple(row.get(c) for c in REVIEW_COLS))
+    con.execute('INSERT OR REPLACE INTO review_ext(finding_id, %s) '
+                'VALUES(?,%s)' % (', '.join(EXT_FIELDS),
+                                  ','.join('?' * len(EXT_FIELDS))),
+                (fid,) + tuple(row.get(c) for c in EXT_FIELDS))
+
+
+def _rule_key(scope, f):
+    if scope == 'book':
+        return {'word': f['word'], 'doc': book_key(f)}
+    if scope == 'replacement':
+        return {'word': f['word'], 'suggestion': f['suggestion'] or ''}
+    return {'word': f['word']}
+
+
+def _get_rule(con, scope, key):
+    table, cols = RULES[scope]
+    who = (WORD_DECIDER.replace('w.word', 'word_rules.word')
+           if scope == 'word' else 'decided_by')
+    r = con.execute(
+        f'SELECT status, {who} AS decided_by, updated_at FROM {table} WHERE '
+        + ' AND '.join(f'{c} = ?' for c in cols),
+        [key[c] for c in cols]).fetchone()
+    return dict(r) if r else None
+
+
+def _put_rule(con, scope, key, row):
+    table, cols = RULES[scope]
+    vals = [key[c] for c in cols]
+    where = ' AND '.join(f'{c} = ?' for c in cols)
+    if scope == 'word':
+        # word_rules keeps its original 3 columns (positional writers exist)
+        if row is None:
+            con.execute('DELETE FROM word_rules WHERE word = ?', vals)
+            con.execute('DELETE FROM word_rule_ext WHERE word = ?', vals)
+            return
+        con.execute('INSERT OR REPLACE INTO word_rules(word, status, '
+                    'updated_at) VALUES(?,?,?)',
+                    vals + [row['status'], row.get('updated_at') or _now()])
+        con.execute('INSERT OR REPLACE INTO word_rule_ext VALUES(?,?)',
+                    vals + [row.get('decided_by')])
+        return
+    if row is None:
+        con.execute(f'DELETE FROM {table} WHERE {where}', vals)
+        return
+    con.execute(f'INSERT OR REPLACE INTO {table}({", ".join(cols)}, status, '
+                f'decided_by, updated_at) VALUES({",".join("?" * len(cols))}'
+                ',?,?,?)',
+                vals + [row['status'], row.get('decided_by'),
+                        row.get('updated_at') or _now()])
+
+
+def _sync_rule(con, dec, scope, key, status, decided_by=None):
+    """Only the global (word) rule has a decisions.db mirror."""
+    if scope != 'word':
+        return None
+    fake = {'word': key['word'], 'unit': '*', 'errtype': '',
+            'suggestion': '', 'source': '', 'ref': ''}
+    return _sync_decision(con, dec, fake, status, word_scope=True,
+                          decided_by=decided_by)
+
+
 def set_status(con, outdir, ids, status, note=None, custom_suggestion=None,
-               scope='occurrence'):
+               scope='occurrence', decided_by='human', expect_status=None):
     """Set the status of one or more findings (one undo step).
 
-    scope='word' additionally writes a word_rules row (reject-everywhere
-    semantics) for each distinct word — decisions.db gets a unit='*' row.
-    Every change is appended to history and mirrored into decisions.db.
+    scope says how far the decision reaches beyond the clicked finding:
+    'occurrence' (this finding only), 'replacement' (every finding proposing
+    the same word -> suggestion), 'book' (the word in this book) or 'word'
+    (everywhere — the only scope that feeds the detect whitelist).
+
+    expect_status, when given, is the effective status the client saw; if a
+    finding no longer has it nothing is written and StatusConflict is raised.
+    A write that changes nothing is skipped and leaves no history entry.
+    History stores the complete prior state, so undo restores it exactly.
     """
     if status not in hebrew.STATUSES:
         raise ValueError(hebrew.MESSAGES['bad_status'])
+    if scope not in SCOPES:
+        raise ValueError(hebrew.MESSAGES['bad_request'])
+    if status in ('approved', 'fixed') and scope in ('book', 'word'):
+        # an approval is bound to one suggestion; a book/word rule would
+        # approve whatever a future scan proposes
+        raise ValueError(hebrew.MESSAGES['scoped_approval'])
+    if decided_by not in ACTORS:
+        decided_by = 'human'
     ids = [int(i) for i in ids]
     if not ids:
         raise ValueError(hebrew.MESSAGES['no_ids'])
-    ts = _now()
-    action = 'bulk' if len(ids) > 1 else 'set_status'
-    dec = _decisions_con(outdir)
-    updated = word_rules = 0
-    warnings = []
+    # the expect_status check and the write are one transaction, so two tabs
+    # cannot both pass the check
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
     try:
+        found = []
         for fid in ids:
             f = con.execute(f'''
-                SELECT f.*, {EFF} AS eff FROM findings f {JOINS}
-                WHERE f.id = ?''', (fid,)).fetchone()
-            if f is None:
-                continue
-            con.execute('INSERT INTO history(ts, action, finding_id, word, '
-                        'old_status, new_status, note) VALUES(?,?,?,?,?,?,?)',
-                        (ts, action, fid, f['word'], f['eff'], status, note))
+                SELECT f.*, {EFF} AS eff, r.status AS own_status,
+                       rb.status AS book_rule, rr.status AS repl_rule,
+                       w.status AS word_rule
+                FROM findings f {JOINS} WHERE f.id = ?''', (fid,)).fetchone()
+            if f is not None:
+                found.append(f)
+        if expect_status is not None and any(f['eff'] != expect_status
+                                             for f in found):
+            raise StatusConflict(
+                {str(f['id']): f['eff'] for f in found},
+                {str(f['id']): _conflict_cause(f) for f in found
+                 if f['eff'] != expect_status})
+        return _set_status_locked(con, outdir, ids, found, status, note,
+                                  custom_suggestion, scope, decided_by)
+    except BaseException:
+        con.rollback()
+        raise
+
+
+def _set_status_locked(con, outdir, ids, found, status, note,
+                       custom_suggestion, scope, decided_by):
+    ts = _now()
+    action = 'bulk' if len(ids) > 1 else 'set_status'
+    # decisions.db committed before ui_review.db: a write that changes
+    # nothing is skipped, so a retry could never re-sync a decisions.db that
+    # fell behind a committed ui_review.db
+    dec = _decisions_for_write(outdir)
+    updated = word_rules = 0
+    warnings = []
+
+    def warn(w):
+        if w and w not in warnings:
+            warnings.append(w)
+
+    try:
+        for f in found:
+            fid = f['id']
+            old = _get_review(con, fid)
             if status == 'pending' and not note and not custom_suggestion:
-                con.execute('DELETE FROM review WHERE finding_id = ?', (fid,))
+                new = None
             else:
-                con.execute('''
-                    INSERT INTO review(finding_id, status, note,
-                                       custom_suggestion, updated_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(finding_id) DO UPDATE SET
-                      status = excluded.status,
-                      note = COALESCE(excluded.note, review.note),
-                      custom_suggestion = COALESCE(excluded.custom_suggestion,
-                                                   review.custom_suggestion),
-                      updated_at = excluded.updated_at''',
-                    (fid, status, note, custom_suggestion, ts))
-            w = _sync_decision(con, dec, f, status, custom_suggestion)
-            if w and w not in warnings:
-                warnings.append(w)
-            updated += 1
-            if scope == 'word' and f['word']:
-                old_ws = con.execute(
-                    'SELECT status FROM word_rules WHERE word = ?',
-                    (f['word'],)).fetchone()
-                con.execute('INSERT INTO history(ts, action, finding_id, '
-                            'word, old_status, new_status, note) '
-                            'VALUES(?,?,?,?,?,?,?)',
-                            (ts, 'word_rule', None, f['word'],
-                             old_ws[0] if old_ws else None, status, note))
-                if status == 'pending':
-                    con.execute('DELETE FROM word_rules WHERE word = ?',
-                                (f['word'],))
-                else:
-                    con.execute(
-                        'INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (f['word'], status, ts))
-                w = _sync_decision(con, dec, f, status, custom_suggestion,
-                                   word_scope=True)
-                if w and w not in warnings:
-                    warnings.append(w)
+                base = old or {}
+                new = {'status': status,
+                       'note': note if note is not None else base.get('note'),
+                       'custom_suggestion': (
+                           custom_suggestion if custom_suggestion is not None
+                           else base.get('custom_suggestion')),
+                       'updated_at': ts, 'scope': scope,
+                       'decided_by': decided_by, 'flag': None,
+                       'prev_decision': base.get('prev_decision')}
+                new['approved_suggestion'] = (
+                    (new['custom_suggestion'] or f['suggestion'] or '')
+                    if status in ('approved', 'fixed') else None)
+            same = (old is None and new is None) or (
+                old is not None and new is not None
+                and all(old.get(k) == new.get(k) for k in _SAME_FIELDS))
+            rule = None
+            if scope in RULES and f['word']:
+                key = _rule_key(scope, f)
+                old_rule = _get_rule(con, scope, key)
+                if not (old_rule is None and status == 'pending') and not (
+                        old_rule is not None
+                        and old_rule['status'] == status):
+                    rule = (key, old_rule)
+            if same and rule is None:
+                continue
+            if not same:
+                con.execute(
+                    'INSERT INTO history(ts, action, finding_id, word, '
+                    'old_status, new_status, note, prev_state, decided_by) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (ts, action, fid, f['word'], f['eff'], status, note,
+                     json.dumps({'review': old}, ensure_ascii=False),
+                     decided_by))
+                _put_review(con, fid, new)
+                warn(_sync_decision(
+                    con, dec, f, new['status'] if new else 'pending',
+                    new and (new['approved_suggestion']
+                             or new['custom_suggestion']),
+                    decided_by=decided_by, scope=scope))
+                updated += 1
+            if rule is not None:
+                key, old_rule = rule
+                con.execute(
+                    'INSERT INTO history(ts, action, finding_id, word, '
+                    'old_status, new_status, note, prev_state, decided_by) '
+                    'VALUES(?,?,?,?,?,?,?,?,?)',
+                    (ts, scope + '_rule', None, f['word'],
+                     old_rule['status'] if old_rule else None, status, note,
+                     json.dumps({'kind': scope, 'key': key, 'row': old_rule},
+                                ensure_ascii=False), decided_by))
+                _put_rule(con, scope, key, None if status == 'pending' else
+                          {'status': status, 'decided_by': decided_by,
+                           'updated_at': ts})
+                warn(_sync_rule(con, dec, scope, key, status, decided_by))
                 word_rules += 1
-        con.commit()
-        dec.commit()
+        _commit_decisions_first(con, dec)
     finally:
-        dec.close()
+        dec.close()                     # without a commit: rolled back
     out = {'updated': updated, 'word_rules': word_rules, 'status': status,
-           'ts': ts}
+           'scope': scope, 'decided_by': decided_by, 'ts': ts}
     if warnings:
         out['warnings'] = warnings
     return out
@@ -1185,53 +2466,113 @@ def set_status(con, outdir, ids, status, note=None, custom_suggestion=None,
 NOT_UNDOABLE = "('undo', 'legacy_recheck')"
 
 
+def _legacy_dropped_after(con, fid, hid):
+    """An import dropped this finding's approval (``legacy_recheck``) after
+    history entry `hid`: undoing that entry must not approve it again."""
+    return con.execute("SELECT 1 FROM history WHERE action = 'legacy_recheck' "
+                       'AND finding_id = ? AND id > ? LIMIT 1',
+                       (fid, hid)).fetchone() is not None
+
+
 def undo(con, outdir):
     """Revert the most recent not-yet-undone history group (one API call =
     one ts = one undo step, bulk included). Returns what was reverted.
 
+    Entries carrying prev_state are restored exactly (review row, note,
+    custom suggestion, scope, rule rows — or their absence); older entries
+    written before prev_state existed fall back to restoring the status.
+
     A ``legacy_recheck`` entry is not a user action but an import dropping an
     approval that rested on the old Tanach heuristic; undo never restores it
-    and reverts the user's last own action instead."""
-    undone = {r[0] for r in con.execute(
-        "SELECT note FROM history WHERE action = 'undo'")}
-    row = con.execute(
-        f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
-        + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
-           if undone else '')
-        + 'ORDER BY id DESC LIMIT 1',
-        list(undone)).fetchone()
+    and reverts the user's last own action instead. Nor does reverting an
+    earlier entry bring such an approval back: an approval an import dropped
+    after that entry is restored as pending.
+
+    decisions.db is written in the same step and committed first (see
+    :func:`_commit_decisions_first`); a lock on it fails the undo with
+    :class:`DecisionsLocked` and changes nothing. ui_review.db is locked
+    before decisions.db, in the order every status write takes them, and
+    for the whole step, so two undo requests revert two steps."""
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    try:
+        undone = {r[0] for r in con.execute(
+            "SELECT note FROM history WHERE action = 'undo'")}
+        row = con.execute(
+            f"SELECT ts FROM history WHERE action NOT IN {NOT_UNDOABLE} "
+            + ('AND ts NOT IN (%s) ' % ','.join('?' * len(undone))
+               if undone else '')
+            + 'ORDER BY id DESC LIMIT 1',
+            list(undone)).fetchone()
+        if row is not None:
+            entries = con.execute(
+                f"SELECT * FROM history WHERE ts = ? AND action NOT IN "
+                f"{NOT_UNDOABLE} ORDER BY id DESC", (row[0],)).fetchall()
+            dec = _decisions_for_write(outdir)
+    except BaseException:
+        con.rollback()
+        raise
     if row is None:
+        con.rollback()
         return None
     group_ts = row[0]
-    entries = con.execute(
-        f"SELECT * FROM history WHERE ts = ? AND action NOT IN {NOT_UNDOABLE} "
-        'ORDER BY id DESC', (group_ts,)).fetchall()
-    dec = _decisions_con(outdir)
-    reverted = []
+    reverted, restored = [], []
     warnings = []
+
+    def warn(w):
+        if w and w not in warnings:
+            warnings.append(w)
+
     try:
         for e in entries:
             old = e['old_status']
-            if e['action'] == 'word_rule':
+            prev = None
+            if e['prev_state']:
+                try:
+                    prev = json.loads(e['prev_state'])
+                except ValueError:
+                    prev = None
+            relegacy = False
+            if prev is not None and 'kind' in prev:
+                kind, key, rrow = prev['kind'], prev['key'], prev['row']
+                _put_rule(con, kind, key, rrow)
+                warn(_sync_rule(con, dec, kind, key,
+                                rrow['status'] if rrow else 'pending',
+                                rrow and rrow.get('decided_by')))
+            elif prev is not None and e['finding_id'] is not None:
+                rv = prev.get('review')
+                if rv and rv.get('status') == 'approved' and \
+                        _legacy_dropped_after(con, e['finding_id'], e['id']):
+                    rv, relegacy = None, True
+                _put_review(con, e['finding_id'], rv)
+                restored.append(e['finding_id'])
+                f = con.execute('SELECT * FROM findings WHERE id = ?',
+                                (e['finding_id'],)).fetchone()
+                if f is not None:
+                    warn(_sync_decision(
+                        con, dec, f, rv['status'] if rv else 'pending',
+                        rv and (rv.get('approved_suggestion')
+                                or rv.get('custom_suggestion')),
+                        decided_by=rv and rv.get('decided_by'),
+                        scope=rv and rv.get('scope')))
+            elif e['action'] == 'word_rule':
                 if old is None or old == 'pending':
                     con.execute('DELETE FROM word_rules WHERE word = ?',
                                 (e['word'],))
                 else:
-                    con.execute(
-                        'INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (e['word'], old, _now()))
-                fake = {'word': e['word'], 'unit': '*', 'errtype': '',
-                        'suggestion': '', 'source': '', 'ref': ''}
-                w = _sync_decision(con, dec, fake, old or 'pending',
-                                   word_scope=True)
-                if w and w not in warnings:
-                    warnings.append(w)
+                    con.execute('INSERT OR REPLACE INTO word_rules(word, '
+                                'status, updated_at) VALUES(?,?,?)',
+                                (e['word'], old, _now()))
+                warn(_sync_rule(con, dec, 'word', {'word': e['word']},
+                                old or 'pending'))
             elif e['finding_id'] is not None:
                 f = con.execute('SELECT * FROM findings WHERE id = ?',
                                 (e['finding_id'],)).fetchone()
+                if old == 'approved' and \
+                        _legacy_dropped_after(con, e['finding_id'], e['id']):
+                    old, relegacy = None, True
                 if old is None or old == 'pending':
-                    con.execute('DELETE FROM review WHERE finding_id = ?',
-                                (e['finding_id'],))
+                    _put_review(con, e['finding_id'], None)
                 else:
                     con.execute('''
                         INSERT INTO review(finding_id, status, note,
@@ -1242,20 +2583,33 @@ def undo(con, outdir):
                           updated_at = excluded.updated_at''',
                         (e['finding_id'], old, _now()))
                 if f is not None:
-                    w = _sync_decision(con, dec, f, old or 'pending')
-                    if w and w not in warnings:
-                        warnings.append(w)
-            reverted.append({'finding_id': e['finding_id'], 'word': e['word'],
-                             'restored': old or 'pending',
-                             'was': e['new_status']})
+                    warn(_sync_decision(con, dec, f, old or 'pending'))
+            entry = {'finding_id': e['finding_id'], 'word': e['word'],
+                     'restored': 'pending' if relegacy else (old or 'pending'),
+                     'was': e['new_status']}
+            if relegacy:
+                entry['legacy_recheck'] = True
+            reverted.append(entry)
         con.execute('INSERT INTO history(ts, action, note) VALUES(?,?,?)',
                     (_now(), 'undo', group_ts))
-        con.commit()
-        dec.commit()
+        # an approval brought back onto a finding whose suggestion has since
+        # changed must not come back as approved...
+        stale = _mark_stale_ids(con, restored)
+        stale_ids = set(_ids_of(con, stale, restored))
+        for e in reverted:
+            if e['finding_id'] in stale_ids:
+                e['restored'] = 'pending'
+                e['stale_approval'] = True
+        # ...nor stay in decisions.db, which the loop above just wrote
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, stale))
+        _commit_decisions_first(con, dec, gone)
+    except BaseException:
+        con.rollback()
+        raise
     finally:
-        dec.close()
+        dec.close()                     # without a commit: rolled back
     out = {'reverted': len(reverted), 'group_ts': group_ts,
-           'entries': reverted}
+           'entries': reverted, 'stale_approvals': len(stale)}
     if warnings:
         out['warnings'] = warnings
     return out
@@ -1290,28 +2644,39 @@ def get_stats(con):
         for s in hebrew.STATUS_ORDER)
     books = []
     for row in con.execute(f'''
-            SELECT f.source, f.origin, COUNT(*),
+            SELECT MIN(f.source), f.origin, COUNT(*),
                    SUM(CASE WHEN {EFF} != 'pending' THEN 1 ELSE 0 END),
-                   {status_cols}
+                   {status_cols}, {BOOKKEY} AS bkey
             FROM findings f {JOINS}
-            GROUP BY f.source, f.origin
+            GROUP BY bkey, f.origin
             ORDER BY COUNT(*) DESC LIMIT 50'''):
         src, org, total, done = row[0], row[1], row[2], row[3]
-        books.append({'source': src or '', 'origin': org or '',
+        books.append({'source': src or '', 'key': row[-1],
+                      'origin': org or '',
                       'origin_hebrew': hebrew.origin_hebrew(org),
                       'total': total, 'done': done or 0,
                       'statuses': {s: row[4 + i] or 0 for i, s in
                                    enumerate(hebrew.STATUS_ORDER)}})
     totals = {st: n for st, n in con.execute(
         f'SELECT {EFF}, COUNT(*) FROM findings f {JOINS} GROUP BY {EFF}')}
+    # per-finding decisions by who made them; '' = made before this was
+    # recorded (unknown), never counted as a human decision
+    by_actor = {}
+    for actor, st, n in con.execute('''
+            SELECT COALESCE(x.decided_by, ''), r.status, COUNT(*)
+            FROM review r LEFT JOIN review_ext x
+              ON x.finding_id = r.finding_id
+            GROUP BY 1, 2'''):
+        by_actor.setdefault(actor or 'unknown', {})[st] = n
     return {'origins': origins, 'errtypes': errtypes, 'books': books,
-            'totals': totals}
+            'totals': totals, 'by_actor': by_actor}
 
 
-def get_fixlist(con, book=None, origin=None, statuses=None):
-    """Fixer-mode worklist. With book=None returns the books that still have
-    findings in the requested statuses (default: approved), with remaining
-    counts; with a book returns its worklist in reading order (unit asc)."""
+def get_fixlist(con, book=None, origin=None, statuses=None, book_key=None):
+    """Fixer-mode worklist. Without a book returns the books (by stable key)
+    that still have findings in the requested statuses (default: approved),
+    with remaining counts; with `book_key` (or the legacy title `book`)
+    returns that book's worklist in reading order (unit asc)."""
     if not statuses:
         statuses = ['approved']
     if isinstance(statuses, str):
@@ -1322,34 +2687,40 @@ def get_fixlist(con, book=None, origin=None, statuses=None):
     if origin:
         owhere = ' AND f.origin = ?'
         params.append(origin)
-    if book is None:
+    if book is None and book_key is None:
         rows = con.execute(f'''
-            SELECT f.source, f.origin, COUNT(*) FROM findings f {JOINS}
+            SELECT MIN(f.source), f.origin, COUNT(*), {BOOKKEY} AS bkey
+            FROM findings f {JOINS}
             WHERE {EFF} IN ({sph}){owhere}
-            GROUP BY f.source, f.origin ORDER BY COUNT(*) DESC''',
+            GROUP BY bkey, f.origin ORDER BY COUNT(*) DESC''',
             params).fetchall()
-        books = [{'source': r[0] or '', 'origin': r[1] or '',
+        books = [{'source': r[0] or '', 'key': r[3], 'origin': r[1] or '',
                   'origin_hebrew': hebrew.origin_hebrew(r[1]),
                   'remaining': r[2]} for r in rows]
         return {'books': books, 'rows': books, 'total': len(books)}
-    params.append(book)
+    if book_key is not None:
+        bsql, bval = _book_key_where(book_key)
+    else:
+        bsql, bval = 'f.source = ?', book
+    params.append(bval)
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
-               r.custom_suggestion AS custom_suggestion
-        FROM findings f {JOINS}
-        WHERE {EFF} IN ({sph}){owhere} AND f.source = ?
+               r.custom_suggestion AS custom_suggestion, {EXT_COLS}
+        FROM findings f {JOINS} {EXT_JOIN}
+        WHERE {EFF} IN ({sph}){owhere} AND {bsql}
         ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
         params).fetchall()
     total = con.execute(f'''
         SELECT COUNT(*) FROM findings f {JOINS}
-        WHERE {EFF} IN ('approved','fixed') AND f.source = ?''',
-        (book,)).fetchone()[0]
+        WHERE {EFF} IN ('approved','fixed') AND {bsql}''',
+        (bval,)).fetchone()[0]
     fixed = con.execute(f'''
         SELECT COUNT(*) FROM findings f {JOINS}
-        WHERE {EFF} = 'fixed' AND f.source = ?''', (book,)).fetchone()[0]
+        WHERE {EFF} = 'fixed' AND {bsql}''', (bval,)).fetchone()[0]
     items = [_rowdict(r) for r in rows]
-    return {'book': book, 'items': items, 'rows': items,
-            'total': len(items), 'fixed': fixed, 'total_approved': total}
+    return {'book': book, 'book_key': book_key, 'items': items,
+            'rows': items, 'total': len(items), 'fixed': fixed,
+            'total_approved': total}
 
 
 # ---------------------------------------------------------------------------
@@ -1420,34 +2791,46 @@ def get_fixer_books(con, origin=None, statuses=None, query=None):
     return out
 
 
+def find_book_unit(con, key):
+    """A stored ``unit`` of the file a fixer book key names, whatever its
+    status or origin; None when the review DB has no finding in that file
+    (it was never scanned). Lets the fixer take a book's path from what was
+    scanned rather than from the key a request carries."""
+    from . import patcher
+    # LIKE narrows (its '_' and '%' may over-match), the parse confirms
+    for (unit,) in con.execute('SELECT unit FROM findings WHERE unit LIKE ?',
+                               (key + ':%',)):
+        if patcher.book_key_of(unit) == key:
+            return unit
+    return None
+
+
 def get_fixer_items(con, key, statuses=None, origin=None):
     """The worklist for ONE file, in reading order, with occurrence numbers.
 
     Rows are matched by the file part of `unit` (see the module note above),
     so two books sharing a filename never share a worklist.
+
+    Occurrence numbers are assigned over EVERY finding of the file, whatever
+    its status or origin, and only then is the list filtered. The writer
+    (fixer_api.apply) numbers them that way, and the page must agree with it:
+    numbered among the shown statuses only, a repeated word whose sibling is
+    'not_error' looked "count changed" on the page while apply accepted it.
     """
     from . import patcher
     if not statuses:
         statuses = ['approved']
     if isinstance(statuses, str):
         statuses = [s for s in statuses.split(',') if s]
-    sph = ','.join('?' * len(statuses))
-    params = list(statuses)
-    where = ''
-    if origin:
-        where = ' AND f.origin = ?'
-        params.append(origin)
     # narrow with LIKE (indexable-ish, keeps the scan small), then confirm
     # each row by parsing its unit — LIKE alone could match a longer path
-    params.append(key + ':%')
     rows = con.execute(f'''
         SELECT f.*, {EFF} AS effective_status, r.note AS note,
                r.custom_suggestion AS custom_suggestion
         FROM findings f {JOINS}
-        WHERE ({EFF} IN ({sph}) OR {EFF} = 'fixed'){where}
-          AND f.unit LIKE ?
+        WHERE f.unit LIKE ?
         ORDER BY {UNIT_ORDER.format(u='f.unit')} ASC, f.id ASC''',
-        params).fetchall()
+        (key + ':%',)).fetchall()
     items = []
     for r in rows:
         d = _rowdict(r)
@@ -1460,7 +2843,9 @@ def get_fixer_items(con, key, statuses=None, origin=None):
         d['correction'] = d.get('custom_suggestion') or d.get('suggestion') or ''
         items.append(d)
     patcher.assign_occurrences(items)
-    return items
+    keep = set(statuses) | {'fixed'}
+    return [d for d in items if d['effective_status'] in keep
+            and (not origin or d.get('origin') == origin)]
 
 
 def get_fixer_mode(con, key, default='replace'):
@@ -1478,16 +2863,200 @@ def set_fixer_mode(con, key, mode):
     return mode
 
 
+# Fixer additions, applied lazily so existing databases upgrade in place:
+# file_edits gains journal_id (ties a row to its write-journal intent, which
+# makes recovery idempotent), backup_sha and source_root; fixer_sources holds
+# the library root each scan was made against ('report' or 'doc:<doc>') and,
+# for book scans, the fingerprint of the bytes the scan read (file_sha and
+# file_size, taken when the file was read — not when the result was merged).
+_FILE_EDIT_COLS = ('journal_id', 'backup_sha', 'source_root')
+_SOURCE_COLS = (('file_sha', 'TEXT'), ('file_size', 'INTEGER'))
+
+
+def _ensure_fixer_schema(con):
+    have = {r[1] for r in con.execute('PRAGMA table_info(file_edits)')}
+    missing = [c for c in _FILE_EDIT_COLS if c not in have]
+    src = {r[1] for r in con.execute('PRAGMA table_info(fixer_sources)')}
+    if not missing and all(c in src for c, _t in _SOURCE_COLS):
+        return
+    for col in missing:
+        try:
+            con.execute(f'ALTER TABLE file_edits ADD COLUMN {col} TEXT')
+        except sqlite3.OperationalError:
+            pass                       # another connection added it first
+    con.execute('''CREATE TABLE IF NOT EXISTS fixer_sources(
+        scope TEXT PRIMARY KEY, root TEXT NOT NULL, stamp TEXT,
+        recorded_at TEXT NOT NULL, file_sha TEXT, file_size INTEGER)''')
+    for col, typ in _SOURCE_COLS:
+        if src and col not in src:
+            try:
+                con.execute(f'ALTER TABLE fixer_sources ADD COLUMN {col} {typ}')
+            except sqlite3.OperationalError:
+                pass
+    con.commit()
+
+
 def record_file_edit(con, path, book_key, backup, mode, finding_ids, detail,
-                     fp_before, fp_after):
+                     fp_before, fp_after, journal_id=None, backup_sha=None,
+                     source_root=None):
+    _ensure_fixer_schema(con)
     cur = con.execute(
         'INSERT INTO file_edits(ts, path, book_key, backup, mode, '
-        'finding_ids, detail, fp_before, fp_after, undone_at) '
-        'VALUES(?,?,?,?,?,?,?,?,?,NULL)',
+        'finding_ids, detail, fp_before, fp_after, undone_at, journal_id, '
+        'backup_sha, source_root) '
+        'VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?)',
         (_now(), path, book_key, backup, mode,
-         json.dumps(finding_ids), detail, fp_before, fp_after))
+         json.dumps(finding_ids), detail, fp_before, fp_after, journal_id,
+         backup_sha, source_root))
     con.commit()
     return cur.lastrowid
+
+
+def find_file_edit_by_journal(con, journal_id):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT id FROM file_edits WHERE journal_id = ?',
+                      (journal_id,)).fetchone()
+    return row[0] if row else None
+
+
+def get_live_edit_entries(con, key):
+    """``{finding_id: detail entry}`` of the newest live edit per finding."""
+    out = {}
+    for row in con.execute('SELECT detail FROM file_edits WHERE book_key = ? '
+                           'AND undone_at IS NULL ORDER BY id', (key,)):
+        try:
+            entries = json.loads(row[0])
+        except (ValueError, TypeError):
+            continue
+        for e in entries:
+            if isinstance(e, dict) and e.get('id') is not None:
+                out[e['id']] = e
+    return out
+
+
+def record_source_root(con, scope, root, stamp=None, file_sha=None,
+                       file_size=None):
+    _ensure_fixer_schema(con)
+    con.execute('INSERT OR REPLACE INTO fixer_sources(scope, root, stamp, '
+                'recorded_at, file_sha, file_size) VALUES(?,?,?,?,?,?)',
+                (scope, os.path.abspath(root) if root else '', stamp, _now(),
+                 file_sha, file_size))
+    con.commit()
+
+
+def get_source_root(con, scope):
+    _ensure_fixer_schema(con)
+    row = con.execute('SELECT root, stamp, file_sha, file_size '
+                      'FROM fixer_sources WHERE scope = ?',
+                      (scope,)).fetchone()
+    return ({'root': row[0] or None, 'stamp': row[1], 'file_sha': row[2],
+             'file_size': row[3]} if row else None)
+
+
+def advance_scan_file_sha(con, scope, old, new, new_size):
+    """The fixer's own write moved the file from `old` to `new` without
+    moving any line, so line numbers recorded at scan time stay valid.
+
+    Only a fingerprint taken when the scan READ the file (it has a size) is
+    carried forward; one recorded at merge time proves nothing to carry."""
+    _ensure_fixer_schema(con)
+    con.execute('UPDATE fixer_sources SET file_sha = ?, file_size = ? '
+                'WHERE scope = ? AND file_sha = ? AND file_size IS NOT NULL',
+                (new, new_size, scope, old))
+    con.commit()
+
+
+def get_import_source(con):
+    """What import_all recorded about the report it imported —
+    ``{'root', 'scanned_at', 'basis'}`` — or None for an import made by an
+    older version, which recorded nothing. A book-scan merge never changes
+    it: those rows carry their own source (``fixer_sources``)."""
+    row = con.execute('SELECT value FROM meta WHERE key = ?',
+                      (IMPORT_SOURCE_KEY,)).fetchone()
+    try:
+        src = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+    return src if isinstance(src, dict) else None
+
+
+def full_import_stamp(con):
+    """A value that changes with every full import (import_all writes
+    import_counts; a book-scan merge does not), so a root pinned to an old
+    import can tell it is stale. NOT last_import: book-scan merges move it."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'import_counts'"
+                      ).fetchone()
+    return (row[0] if row else None) or ''
+
+
+def record_book_scan_source(outdir, result):
+    """Pin the library root a single-book scan read, under 'doc:<doc>',
+    with the fingerprint of the bytes the scan read.
+
+    The scan's library comes from the request, not from run_config.json, so
+    without this the fixer could only guess which folder the rows describe.
+    The fingerprint is the scan's own (``file_sha`` / ``file_size`` of the
+    result), never a hash of the file taken now: a book edited while it was
+    being scanned would then look unchanged, and its rows would skip the
+    identity checks that tell a line from its parallel twin.
+    """
+    if result.get('kind') not in ('library', 'file') \
+            or not result.get('doc') or not result.get('path'):
+        return None
+    root = None
+    if result['kind'] == 'library':
+        root = os.path.abspath(result['path'])
+        for _part in str(result['doc']).split('/'):
+            root = os.path.dirname(root)
+    sha, size = result.get('file_sha'), result.get('file_size')
+    if not sha or size is None:
+        sha = size = None              # an unproven read is never "unchanged"
+    con = connect(outdir)
+    try:
+        record_source_root(con, 'doc:' + result['doc'], root, file_sha=sha,
+                           file_size=size)
+    finally:
+        con.close()
+    return root
+
+
+def merge_book_scan(outdir, result):
+    """Merge a single-book scan and record where it came from — the one
+    path both the web UI and the CLI use, so neither can forget the root.
+
+    The rows and their source are two commits. The book's previous source
+    record is set aside first, so a crash between them leaves the new rows
+    with no source (the fixer refuses them: source_unknown) — never under
+    an earlier scan's root and fingerprint. A merge that fails puts it
+    back."""
+    scope = 'doc:%s' % result['doc'] if result.get('doc') else None
+    old = _take_source_root(outdir, scope) if scope else None
+    try:
+        counts = import_book_scan(outdir, result)
+    except BaseException:
+        if old is not None:
+            con = connect(outdir)
+            try:
+                record_source_root(con, scope, old['root'], old['stamp'],
+                                   old['file_sha'], old['file_size'])
+            finally:
+                con.close()
+        raise
+    record_book_scan_source(outdir, result)
+    return counts
+
+
+def _take_source_root(outdir, scope):
+    """Remove and return the source record of `scope` (None if none)."""
+    con = connect(outdir)
+    try:
+        rec = get_source_root(con, scope)
+        if rec is not None:
+            con.execute('DELETE FROM fixer_sources WHERE scope = ?', (scope,))
+            con.commit()
+        return rec
+    finally:
+        con.close()
 
 
 def get_file_edits(con, key=None, limit=50, include_undone=True):
@@ -1527,6 +3096,10 @@ def get_file_edit(con, edit_id):
         d['finding_ids'] = json.loads(d['finding_ids'])
     except (ValueError, TypeError):
         d['finding_ids'] = []
+    try:
+        d['detail'] = json.loads(d['detail'])
+    except (ValueError, TypeError):
+        d['detail'] = []
     return d
 
 
@@ -1575,9 +3148,18 @@ def write_backup(con, outdir):
     path = os.path.join(bdir, f'ui_backup_{ts}.json')
     review = [dict(r) for r in con.execute('''
         SELECT v.finding_id, v.status, v.note, v.custom_suggestion,
-               v.updated_at, f.family, f.word, f.unit, f.errtype, f.ref
-        FROM review v JOIN findings f ON f.id = v.finding_id''')]
-    word_rules = [dict(r) for r in con.execute('SELECT * FROM word_rules')]
+               v.updated_at, f.family, f.word, f.unit, f.errtype, f.ref,
+               x.scope, x.approved_suggestion, x.decided_by, x.flag,
+               x.prev_decision,
+               COALESCE(f.extra, '') LIKE '%tanach_legacy%' AS legacy_marked
+        FROM review v JOIN findings f ON f.id = v.finding_id
+        LEFT JOIN review_ext x ON x.finding_id = v.finding_id''')]
+    word_rules = [dict(r) for r in con.execute(
+        'SELECT w.*, e.decided_by FROM word_rules w '
+        'LEFT JOIN word_rule_ext e ON e.word = w.word')]
+    book_rules = [dict(r) for r in con.execute('SELECT * FROM book_rules')]
+    replacement_rules = [dict(r) for r in con.execute(
+        'SELECT * FROM replacement_rules')]
     history = [dict(r) for r in con.execute(
         'SELECT * FROM history ORDER BY id')]
     # the file-edit log records which books were physically rewritten and
@@ -1587,6 +3169,8 @@ def write_backup(con, outdir):
         'SELECT * FROM file_edits ORDER BY id')]
     with open(path, 'w', encoding='utf-8') as f:
         json.dump({'ts': _now(), 'review': review, 'word_rules': word_rules,
+                   'book_rules': book_rules,
+                   'replacement_rules': replacement_rules,
                    'history': history, 'file_edits': file_edits},
                   f, ensure_ascii=False)
     return path
@@ -1597,29 +3181,42 @@ def reset(con, outdir, scope='statuses'):
     empties decisions.db — the escape hatch from the whitelist feedback."""
     if scope not in ('statuses', 'all'):
         raise ValueError(hebrew.MESSAGES['bad_request'])
-    backup = write_backup(con, outdir)
-    counts = {
-        'review': con.execute('SELECT COUNT(*) FROM review').fetchone()[0],
-        'word_rules': con.execute(
-            'SELECT COUNT(*) FROM word_rules').fetchone()[0],
-        'history': con.execute('SELECT COUNT(*) FROM history').fetchone()[0],
-    }
-    con.execute('DELETE FROM review')
-    con.execute('DELETE FROM word_rules')
-    con.execute('DELETE FROM history')
-    con.commit()
-    counts['decisions'] = 0
-    if scope == 'all':
-        dec = _decisions_con(outdir)
-        try:
+    # ui_review.db locked first, then decisions.db, which commits first (the
+    # order every write takes): a lock on decisions.db fails the whole reset
+    # with DecisionsLocked (423) before anything was cleared
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
+    dec = None
+    try:
+        if scope == 'all':
+            dec = _decisions_for_write(outdir)
+        backup = write_backup(con, outdir)
+        counts = {
+            'review': con.execute('SELECT COUNT(*) FROM review').fetchone()[0],
+            'word_rules': con.execute(
+                'SELECT COUNT(*) FROM word_rules').fetchone()[0],
+            'history': con.execute(
+                'SELECT COUNT(*) FROM history').fetchone()[0],
+        }
+        for t in ('review', 'review_ext', 'word_rules', 'word_rule_ext',
+                  'book_rules', 'replacement_rules', 'history'):
+            con.execute(f'DELETE FROM {t}')
+        counts['decisions'] = 0
+        if dec is not None:
             counts['decisions'] = dec.execute(
                 'SELECT COUNT(*) FROM decisions').fetchone()[0]
             dec.execute('DELETE FROM decisions')
-            dec.commit()
+            dec.execute('DELETE FROM decision_scope')
             con.execute('DELETE FROM owned_decisions')
+            _commit_decisions_first(con, dec)
+        else:
             con.commit()
-        finally:
-            dec.close()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        if dec is not None:
+            dec.close()                 # without a commit: rolled back
     return {'backup': backup, 'cleared': counts, 'scope': scope}
 
 
@@ -1638,19 +3235,55 @@ def list_backups(outdir):
 def restore_backup(con, outdir, filename):
     """Re-import a backup written by write_backup. Review rows are matched
     best-effort by finding identity (family, word, unit, errtype, ref);
-    restored statuses are re-synced into decisions.db."""
+    restored statuses are re-synced into decisions.db.
+
+    An approval comes back bound to the suggestion it was approved against.
+    A backup written before that was recorded binds it by
+    :func:`_approval_basis`; one that cannot be bound comes back 'unsure'
+    with a note (``unbound_recheck``). An approval a refresh dropped as
+    resting on the old Tanach heuristic comes back 'unsure' with the note
+    migrate_legacy_decisions gives such an accept (``legacy_recheck``).
+    Word-wide approvals are bound as in the schema upgrade
+    (:func:`_bind_word_approvals`)."""
     base = os.path.basename(filename)
-    if not re.fullmatch(r'ui_backup_[\w.-]+\.json', base):
+    # 'ui_backup_<name>.json', tested piecewise: one regex with both the
+    # class's '.' and the literal '\.json' backtracks on long names
+    if not (base.startswith('ui_backup_') and base.endswith('.json')
+            and len(base) > len('ui_backup_.json')
+            and re.fullmatch(r'[\w.-]+', base)):
         raise ValueError(hebrew.MESSAGES['bad_request'])
-    path = os.path.join(outdir, BACKUP_DIR, base)
+    bdir = os.path.normpath(os.path.abspath(os.path.join(outdir, BACKUP_DIR)))
+    path = os.path.normpath(os.path.join(bdir, base))
+    if not path.startswith(bdir + os.sep):
+        raise ValueError(hebrew.MESSAGES['bad_request'])
     if not os.path.exists(path):
         raise FileNotFoundError(hebrew.MESSAGES['not_found'])
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
-    dec = _decisions_con(outdir)
-    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0}
-    warnings = []
+    # ui_review.db first, then decisions.db: the order every write takes
+    if not con.in_transaction:
+        con.execute('BEGIN IMMEDIATE')
     try:
+        dec = _decisions_for_write(outdir)
+    except BaseException:
+        con.rollback()
+        raise
+    out = {'review': 0, 'word_rules': 0, 'unmatched': 0, 'history': 0,
+           'unbound_recheck': 0, 'legacy_recheck': 0}
+    warnings, restored = [], []
+    try:
+        approvals = [rv for rv in data.get('review', [])
+                     if rv.get('status') in ('approved', 'fixed')]
+        shared = _shared_keys((rv.get('word'), rv.get('unit'))
+                              for rv in approvals)
+        # read before this restore rewrites the rows it reads
+        accepted = _accepted_in_decisions(
+            dec, [(rv.get('word') or '', rv.get('unit') or '')
+                  for rv in approvals if not rv.get('approved_suggestion')])
+        word_accepted = _accepted_in_decisions(
+            dec, [(wr.get('word'), '*') for wr in data.get('word_rules', [])
+                  if wr.get('status') == 'approved'])
+        last = _last_import(con)
         for rv in data.get('review', []):
             fids = con.execute('''
                 SELECT id FROM findings
@@ -1663,38 +3296,85 @@ def restore_backup(con, outdir, filename):
                 out['unmatched'] += 1
                 continue
             for (fid,) in fids:
-                con.execute('INSERT OR REPLACE INTO review VALUES(?,?,?,?,?)',
-                            (fid, rv['status'], rv.get('note'),
-                             rv.get('custom_suggestion'),
-                             rv.get('updated_at') or _now()))
+                row = {k: rv.get(k) for k in REVIEW_COLS + EXT_FIELDS}
                 f = con.execute('SELECT * FROM findings WHERE id = ?',
                                 (fid,)).fetchone()
-                w = _sync_decision(con, dec, f, rv['status'],
-                                   rv.get('custom_suggestion'))
+                demote = None
+                if row['status'] == 'approved' and \
+                        _restored_approval_dropped(con, fid, rv):
+                    demote = 'legacy_recheck'
+                    sugg = (row['custom_suggestion']
+                            or row['approved_suggestion'] or f['suggestion'])
+                elif row['status'] in ('approved', 'fixed') and \
+                        not row['approved_suggestion']:
+                    basis = _approval_basis(con, f, row, last, accepted,
+                                            shared)
+                    if basis is not None:
+                        row['approved_suggestion'] = basis
+                    elif row['status'] == 'approved':
+                        demote = 'unbound_recheck'
+                        sugg = f['suggestion']
+                if demote:
+                    note = _recheck_note(
+                        'legacy_accept_recheck' if demote == 'legacy_recheck'
+                        else 'unbound_approval_recheck', sugg, row['note'])
+                    row.update(status='unsure', note=note,
+                               approved_suggestion=None, flag=None)
+                    out[demote] += 1
+                row['updated_at'] = row['updated_at'] or _now()
+                row['scope'] = row['scope'] or 'occurrence'
+                _put_review(con, fid, row)
+                restored.append(fid)
+                w = _sync_decision(con, dec, f, row['status'],
+                                   row['approved_suggestion']
+                                   or row['custom_suggestion'],
+                                   decided_by=row['decided_by'],
+                                   scope=row['scope'])
                 if w and w not in warnings:
                     warnings.append(w)
                 out['review'] += 1
         for wr in data.get('word_rules', []):
-            con.execute('INSERT OR REPLACE INTO word_rules VALUES(?,?,?)',
-                        (wr['word'], wr['status'],
-                         wr.get('updated_at') or _now()))
+            sugg = (word_accepted.get((wr['word'], '*'))
+                    if wr.get('status') == 'approved' else None)
+            if sugg:
+                # bound to the pair it approved (see _bind_word_approvals)
+                key = {'word': wr['word'], 'suggestion': sugg}
+                if _get_rule(con, 'replacement', key) is None:
+                    _put_rule(con, 'replacement', key, wr)
+                out['word_rules'] += 1
+                continue
+            _put_rule(con, 'word', {'word': wr['word']}, wr)
             fake = {'word': wr['word'], 'unit': '*', 'errtype': '',
                     'suggestion': '', 'source': '', 'ref': ''}
             w = _sync_decision(con, dec, fake, wr['status'], word_scope=True)
             if w and w not in warnings:
                 warnings.append(w)
             out['word_rules'] += 1
+        for scope in ('book', 'replacement'):
+            table, cols = RULES[scope]
+            for rr in data.get(table, []):
+                _put_rule(con, scope, {c: rr.get(c) for c in cols}, rr)
+                out['word_rules'] += 1
         for h in data.get('history', []):
             con.execute('INSERT INTO history(ts, action, finding_id, word, '
-                        'old_status, new_status, note) VALUES(?,?,?,?,?,?,?)',
+                        'old_status, new_status, note, prev_state, '
+                        'decided_by) VALUES(?,?,?,?,?,?,?,?,?)',
                         (h.get('ts'), h.get('action'), h.get('finding_id'),
                          h.get('word'), h.get('old_status'),
-                         h.get('new_status'), h.get('note')))
+                         h.get('new_status'), h.get('note'),
+                         h.get('prev_state'), h.get('decided_by')))
             out['history'] += 1
-        con.commit()
-        dec.commit()
+        # the backup may predate a re-scan that changed what was approved:
+        # such an approval returns as pending, and leaves decisions.db again
+        stale = _mark_stale_ids(con, restored)
+        out['stale_approvals'] = len(stale)
+        gone = _withdraw_accepts(dec, _withdraw_todo(con, stale))
+        _commit_decisions_first(con, dec, gone)
+    except BaseException:
+        con.rollback()
+        raise
     finally:
-        dec.close()
+        dec.close()                     # without a commit: rolled back
     if warnings:
         out['warnings'] = warnings
     return out
