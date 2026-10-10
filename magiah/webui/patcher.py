@@ -73,7 +73,7 @@ CONFLICT_CODES = frozenset((
     'not_approved', 'line_mismatch', 'ambiguous_line', 'source_mismatch',
     'source_unknown', 'file_busy', 'already_applied', 'already_bracketed',
     'backup_corrupt', 'journal_conflict', 'journal_pending',
-    'moved_unproven', 'copy_moved',
+    'moved_unproven', 'copy_moved', 'bracket_unproven',
 ))
 
 # Encodings tried in order. Decoding is STRICT: a lossy read (errors='replace')
@@ -729,9 +729,10 @@ def _bracket_origin(line, a, b, snippet, corrections, own_edits):
     pair nests brackets into it or overwrites the original half — data lost.
     So every doubt counts as the fixer's, in this order:
 
-    1. a live record of the fixer sitting exactly there, matched by its text
-       and context on whatever line it is now (lines move; matching a twin
-       line by mistake only refuses) — ``'record'``;
+    1. a live record of the fixer that wrote this very text, on any line
+       and whatever its context now (lines move, and a hand edit next to
+       the brackets breaks the recorded context; a false match only
+       refuses) — ``'record'``;
     2. the parenthesized text is what this finding writes, or the detector's
        suggestion for it — ``'own'``. Bracket output keeps the original typo
        inside "[...]", so every later scan flags it again, and a scan in a new
@@ -740,14 +741,16 @@ def _bracket_origin(line, a, b, snippet, corrections, own_edits):
        brackets;
     3. the layout is missing from the scan's snippet: brackets that came
        after the scan with nothing to explain them — ``'later'``;
-    4. otherwise the book had this pair when it was scanned and nothing ties
-       it to the fixer: ketiv/qere, corrected like any word — ``'scanned'``.
-       (Left open: a pair the fixer wrote with a custom correction, re-scanned
-       in a new folder, then re-applied with yet another correction.)
+    4. otherwise the pair was there when the book was scanned and no record
+       explains it — ``'scanned'``. It may be the book's own ketiv/qere, or
+       the fixer's output with a custom correction scanned again in a new
+       folder (a custom correction can be anything, so the text cannot rule
+       it out). plan_edit refuses it, and corrects it only when a human
+       points at the word.
     """
     text = line[a:b]
     for e, _at in own_edits or ():
-        if e.get('new') == text and _locate_entry(line, e) == a:
+        if e.get('new') == text:
             return 'record'
     paren = _bare(text[1:text.index(') [')])
     if paren and any(paren == _bare(c) for c in corrections if c):
@@ -1001,6 +1004,12 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
         if origin == 'later':
             raise PatchError('already_bracketed', _msg(
                 'already_bracketed', word=word, n=lineno + 1), id=fid)
+        if explicit is None:
+            # no record: the fixer's own output, written with a correction
+            # of the user's, reads exactly like a ketiv/qere pair
+            raise PatchError('bracket_unproven', _msg(
+                'bracket_unproven', word=word, n=lineno + 1), id=fid,
+                candidates=[[start, end]], located_line=lineno)
     if copy_moved:
         raise PatchError('copy_moved', _msg(
             'copy_moved', word=word, n=lineno + 1), id=fid,

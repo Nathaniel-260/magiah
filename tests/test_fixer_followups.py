@@ -234,6 +234,55 @@ class TestCopiesTheScannerSkips(TempCase):
                     patcher.plan_edit(self.doc(now + '\n'), dict(f))
 
 
+class TestBracketsWithACustomCorrection(TempCase):
+    """Bracket output written with a custom correction, re-scanned with its
+    record lost or its context broken by a hand edit, was overwritten:
+    "(בורכת) [בדכת]" became "(בורכת) [ברכת]"."""
+
+    T, S = 'בדכת', 'ברכת'
+    BASE = 'ויאמר משה בדכת שלום עליכם לתלמידיו'
+
+    def written(self):
+        d = self.doc(self.BASE)
+        p = patcher.plan_edit(d, finding(self.BASE, self.T, 'בורכת',
+                                         suggestion=self.S),
+                              mode=patcher.MODE_BRACKET)
+        patcher.apply_edits(d, [p])
+        self.assertEqual(d.lines[0],
+                         'ויאמר משה (בורכת) [בדכת] שלום עליכם לתלמידיו')
+        return d.lines[0], p.to_dict()
+
+    def refused(self, line, own, snippet_from, corr):
+        d = self.doc(line)
+        for mode in patcher.MODES:
+            with self.assertRaises(patcher.PatchError) as cm:
+                patcher.plan_edit(d, dict(finding(snippet_from, self.T, corr),
+                                          suggestion=self.S),
+                                  mode=mode, own_edits=own)
+            yield cm.exception.code
+
+    def test_a_live_record_is_matched_by_its_text_alone(self):
+        line, rec = self.written()
+        broken = line.replace('ויאמר משה', 'ויאמר אהרן')    # hand edit
+        for snip in (broken, self.BASE):
+            with self.subTest(snippet=snip):
+                self.assertEqual(set(self.refused(broken, [rec], snip,
+                                                  self.S)),
+                                 {'already_applied'})
+
+    def test_without_a_record_only_a_click_writes(self):
+        line, _rec = self.written()
+        for corr in (self.S, 'בורכות'):        # re-scanned in a new folder
+            with self.subTest(correction=corr):
+                self.assertEqual(set(self.refused(line, [], line, corr)),
+                                 {'bracket_unproven'})
+        d = self.doc(line)
+        a = line.index('[') + 1
+        p = patcher.plan_edit(d, dict(finding(line, self.T, self.S),
+                                      suggestion=self.S), explicit=(a, a + 4))
+        self.assertEqual(p.confidence, 'manual')
+
+
 # ---------------------------------------------------------------------------
 # recorded edits after lines moved
 # ---------------------------------------------------------------------------
