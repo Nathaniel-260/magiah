@@ -181,6 +181,10 @@ def _acquire_lock_file(lf, deadline):
                     raise _busy()
                 time.sleep(0.05)
                 continue
+        except OSError as e:
+            if patcher.name_too_long(lf):
+                raise patcher.denied_long(lf) from e
+            raise
         else:
             try:
                 os.write(fd, json.dumps({'pid': os.getpid(),

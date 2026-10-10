@@ -125,6 +125,20 @@ def denied_file(path):
     return AccessDenied('access_denied', _msg('access_denied', path=path))
 
 
+# Windows without long-path support refuses names past MAX_PATH, and the
+# fixer's temp and lock files add up to 45 characters to the book's name.
+MAX_PATH = 260
+MAX_PATH_APPLIES = os.name == 'nt'
+
+
+def name_too_long(name):
+    return MAX_PATH_APPLIES and len(os.path.abspath(name)) >= MAX_PATH
+
+
+def denied_long(path):
+    return AccessDenied('path_too_long', _msg('path_too_long', path=path))
+
+
 def _msg(code, **fmt):
     text = hebrew.FIXER_MESSAGES.get(code, code)
     return text.format(**fmt) if fmt else text
@@ -1378,6 +1392,9 @@ def atomic_write(path, data):
             if placed:
                 raise denied_file(path) from e        # locked or read-only
             raise denied_folder(os.path.dirname(path) or '.') from e
+        if isinstance(e, OSError) and not isinstance(e, AccessDenied) \
+                and not placed and name_too_long(tmp):
+            raise denied_long(path) from e
         raise
     return fingerprint_bytes(data)
 

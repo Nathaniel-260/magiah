@@ -562,5 +562,51 @@ class TestLockOwnership(FixerEnv):
         self.assertEqual(sorted(os.listdir(self.lib)), ['ספר.txt'])
 
 
+class TestNamesPastMaxPath(FixerEnv):
+    """Without long-path support Windows refuses a name past 260 chars; the
+    lock and temp names are longer than the book's own. Said in Hebrew,
+    and nothing is written."""
+
+    def test_a_lock_name_past_max_path_is_refused_in_hebrew(self):
+        real_open, real_max = journal.os.open, patcher.MAX_PATH
+
+        def too_long(path, *a, **kw):
+            if path.endswith(journal.LOCK_SUFFIX):
+                raise FileNotFoundError(2, 'No such file or directory', path)
+            return real_open(path, *a, **kw)
+        journal.os.open, patcher.MAX_PATH = too_long, 10
+        real_os, patcher.MAX_PATH_APPLIES = patcher.MAX_PATH_APPLIES, True
+        try:
+            with self.assertRaises(patcher.AccessDenied) as cm:
+                self.apply(self.key, [{'id': 1}])
+        finally:
+            journal.os.open, patcher.MAX_PATH = real_open, real_max
+            patcher.MAX_PATH_APPLIES = real_os
+        self.assertEqual(cm.exception.code, 'path_too_long')
+        self.assertTrue(any('א' <= c <= 'ת' for c in str(cm.exception)))
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+
+    def test_a_temp_name_past_max_path_is_refused_in_hebrew(self):
+        real_new, real_max = patcher._write_new, patcher.MAX_PATH
+
+        def too_long(path, data):
+            if path.endswith('.tmp'):
+                raise FileNotFoundError(2, 'No such file or directory', path)
+            return real_new(path, data)
+        patcher._write_new = too_long
+        fp = self.open_doc(self.key)['fingerprint']
+        patcher.MAX_PATH = 10
+        real_os, patcher.MAX_PATH_APPLIES = patcher.MAX_PATH_APPLIES, True
+        try:
+            with self.assertRaises(patcher.AccessDenied) as cm:
+                self.apply(self.key, [{'id': 1}], fingerprint=fp)
+        finally:
+            patcher._write_new, patcher.MAX_PATH = real_new, real_max
+            patcher.MAX_PATH_APPLIES = real_os
+        self.assertEqual(cm.exception.code, 'path_too_long')
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+        self.assertEqual(journal.pending(self.outdir), [])
+
+
 if __name__ == '__main__':
     unittest.main()
