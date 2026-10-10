@@ -171,6 +171,17 @@ def _resolve_book(con, outdir, key, rows):
     distinct root compared once: a book of thousands of rows is resolved on
     every page load, and comparing paths touches the disk (over a network
     share, slowly)."""
+    if key.startswith('local:'):
+        # A local key names an absolute path, and the request is no
+        # authority on which files may be read or written: only a book that
+        # was actually scanned (the review DB holds findings for it) is
+        # accepted, and its path is taken from the DB's own unit, never
+        # from the key the request sent.
+        unit = db.find_book_unit(con, key)
+        if unit is None:
+            raise patcher.PatchError('not_scanned')
+        kind, path, _ln = patcher.resolve_unit(unit)
+        return kind, path, None
     if not key.startswith('file:'):
         kind, path = patcher.resolve_key(key)
         return kind, path, None

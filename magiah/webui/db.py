@@ -2791,6 +2791,20 @@ def get_fixer_books(con, origin=None, statuses=None, query=None):
     return out
 
 
+def find_book_unit(con, key):
+    """A stored ``unit`` of the file a fixer book key names, whatever its
+    status or origin; None when the review DB has no finding in that file
+    (it was never scanned). Lets the fixer take a book's path from what was
+    scanned rather than from the key a request carries."""
+    from . import patcher
+    # LIKE narrows (its '_' and '%' may over-match), the parse confirms
+    for (unit,) in con.execute('SELECT unit FROM findings WHERE unit LIKE ?',
+                               (key + ':%',)):
+        if patcher.book_key_of(unit) == key:
+            return unit
+    return None
+
+
 def get_fixer_items(con, key, statuses=None, origin=None):
     """The worklist for ONE file, in reading order, with occurrence numbers.
 
@@ -3232,9 +3246,16 @@ def restore_backup(con, outdir, filename):
     Word-wide approvals are bound as in the schema upgrade
     (:func:`_bind_word_approvals`)."""
     base = os.path.basename(filename)
-    if not re.fullmatch(r'ui_backup_[\w.-]+\.json', base):
+    # 'ui_backup_<name>.json', tested piecewise: one regex with both the
+    # class's '.' and the literal '\.json' backtracks on long names
+    if not (base.startswith('ui_backup_') and base.endswith('.json')
+            and len(base) > len('ui_backup_.json')
+            and re.fullmatch(r'[\w.-]+', base)):
         raise ValueError(hebrew.MESSAGES['bad_request'])
-    path = os.path.join(outdir, BACKUP_DIR, base)
+    bdir = os.path.normpath(os.path.abspath(os.path.join(outdir, BACKUP_DIR)))
+    path = os.path.normpath(os.path.join(bdir, base))
+    if not path.startswith(bdir + os.sep):
+        raise ValueError(hebrew.MESSAGES['bad_request'])
     if not os.path.exists(path):
         raise FileNotFoundError(hebrew.MESSAGES['not_found'])
     with open(path, encoding='utf-8') as f:

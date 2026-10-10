@@ -7,7 +7,6 @@ returns a simple Hebrew placeholder page). All user-facing messages are in
 Hebrew; every response is UTF-8.
 """
 import json
-import mimetypes
 import os
 import sys
 import threading
@@ -41,6 +40,21 @@ def _static_dir():
 
 
 STATIC_DIR = _static_dir()
+
+# Content types of the files the UI ships, by extension. A fixed table rather
+# than mimetypes.guess_type: on Windows that reads the registry, where a
+# misconfigured machine serves .js as text/plain and the page will not load,
+# and the header is then never built from anything a request supplied.
+_STATIC_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+    '.woff2': 'font/woff2',
+}
 
 PLACEHOLDER = '''<!DOCTYPE html>
 <html lang="he" dir="rtl"><head><meta charset="utf-8">
@@ -110,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
             relpath = 'index.html'
         path = os.path.normpath(os.path.join(STATIC_DIR, relpath))
         base = os.path.normpath(STATIC_DIR)
-        if path != base and not path.startswith(base + os.sep):
+        # strictly inside: the static folder itself is no file to serve
+        if not path.startswith(base + os.sep):
             self._error(hebrew.MESSAGES['not_found'], 404)
             return
         if not os.path.isfile(path):
@@ -120,10 +135,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._error(hebrew.MESSAGES['not_found'], 404)
             return
-        ctype = mimetypes.guess_type(path)[0] or 'application/octet-stream'
-        if ctype.startswith('text/') or ctype in (
-                'application/javascript', 'application/json'):
-            ctype += '; charset=utf-8'
+        ctype = _STATIC_TYPES.get(os.path.splitext(path)[1].lower(),
+                                  'application/octet-stream')
         with open(path, 'rb') as f:
             self._send(200, f.read(), ctype)
 

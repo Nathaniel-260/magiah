@@ -148,6 +148,23 @@ def _msg(code, **fmt):
 # locating the file
 # ---------------------------------------------------------------------------
 
+def contained_path(path, root, code='outside_library'):
+    """`path` normalized, provided it lies strictly INSIDE `root`; otherwise
+    a :class:`PatchError` with `code`.
+
+    The single containment guard for every path built from request data:
+    callers must use the returned (normalized) value from here on, never the
+    `path` they passed in. Normalizing first collapses '..' segments, so the
+    prefix test cannot be walked around; the root itself is refused too (it
+    is a folder, never a book or a backup).
+    """
+    base = os.path.normpath(os.path.abspath(root))
+    full = os.path.normpath(os.path.abspath(path))
+    if not full.startswith(base.rstrip(os.sep) + os.sep):
+        raise PatchError(code, _msg(code))
+    return full
+
+
 def resolve_unit(unit, library_dir=None):
     """``unit`` -> ``(kind, abspath, lineno0)``; kind is 'library' | 'local'.
 
@@ -164,10 +181,9 @@ def resolve_unit(unit, library_dir=None):
         # DIRECTORY (often the library root itself) rather than a book
         if not rel or rel in ('.', '..') or rel.split('/')[-1] in ('.', '..'):
             raise PatchError('bad_unit', _msg('bad_unit', unit=unit))
-        path = os.path.join(library_dir, *rel.split('/'))
         # a crafted '../..' relpath must never read or write outside the repo
-        if book_source._rel_within(path, library_dir) is None:
-            raise PatchError('outside_library', _msg('outside_library'))
+        path = contained_path(os.path.join(library_dir, *rel.split('/')),
+                              library_dir)
         return 'library', path, lineno
     parsed = book_source.parse_local_unit(unit)
     if parsed is not None:
@@ -1311,8 +1327,8 @@ def backup_path(outdir, path):
     safe = re.sub(r'[^\w.\- ]+', '_', stem)[:60] or 'book'
     tag = hashlib.sha256(os.path.abspath(path).encode('utf-8')).hexdigest()[:8]
     ts = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    return os.path.join(bdir, '%s.%s.%s.%s.bak' % (safe, ts, tag,
-                                                  uuid.uuid4().hex[:8]))
+    name = '%s.%s.%s.%s.bak' % (safe, ts, tag, uuid.uuid4().hex[:8])
+    return contained_path(os.path.join(bdir, name), bdir, 'bad_backup')
 
 
 def temp_path_for(path):
