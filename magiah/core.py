@@ -331,6 +331,30 @@ def _coverage_info(stage, stats, extra=None, passes=None, policy=None):
     return info
 
 
+# the later passes of a stage (_coverage_info `passes`), for the log
+_PASS_HE = {'tanach_index': 'אינדקס התנ"ך', 'context': 'אימות ההקשר'}
+
+
+def coverage_line(info):
+    """The Hebrew log line of a coverage record: what the stage read, what
+    it could not, and — when it missed rows — what became of its output."""
+    stage = info['stage']
+    parts = [f'נקראו {info["lines"]:,} שורות ({info["chars"]:,} תווים)',
+             f'לא פוענחו {info["decode_errors"]:,}',
+             f'חסרות {info["missing"]:,}',
+             f'שורות גרסה שלא נסרקו {info["version_lines_skipped"]:,}']
+    for k, v in (info.get('passes') or {}).items():
+        parts.append(f'לא נקראו במעבר "{_PASS_HE.get(k, k)}" '
+                     f'{ReadStats.from_dict(v).unread():,}')
+    if not info['complete']:
+        outcome = ('התוצאה נכתבה ומסומנת כחלקית' if info['accepted']
+                   else 'לא נכתבה תוצאה')
+        parts.append(f'סך הכול לא נקראו {info["unread_rows"]:,} שורות, '
+                     f'הותרו {info["allow_unread"]:,} '
+                     f'(‎--allow-unread‎) — {outcome}')
+    return f'[{stage}] כיסוי: ' + '; '.join(parts)
+
+
 def _write_coverage(out_dir, info):
     """Persist what a stage actually read (the run's coverage evidence)."""
     stage = info['stage']
@@ -340,19 +364,7 @@ def _write_coverage(out_dir, info):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(info, f, ensure_ascii=False, indent=1)
     _replace_atomically(path, write)
-    passes = {k: ReadStats.from_dict(v)
-              for k, v in (info.get('passes') or {}).items()}
-    print(f'[{stage}] coverage: lines={info["lines"]:,} '
-          f'chars={info["chars"]:,} '
-          f'decode_errors={info["decode_errors"]:,} '
-          f'missing={info["missing"]:,} '
-          f'version_lines_skipped={info["version_lines_skipped"]:,}'
-          + ''.join(f' {k}.unread={v.unread():,}' for k, v in passes.items())
-          + ('' if info['complete'] else
-             f' unread_rows={info["unread_rows"]:,} '
-             f'accepted={info["accepted"]} '
-             f'allow_unread={info["allow_unread"]:,}'),
-          flush=True)
+    print(coverage_line(info), flush=True)
     if info.get('accepted'):
         print(_accepted_warning(info, path), flush=True)
     return info
@@ -381,8 +393,9 @@ def _fail_if_partial(stage, stats, out_dir, extra=None, passes=None,
     path = os.path.join(out_dir, COVERAGE_F.format(stage=stage))
     rows, limit = info['unread_rows'], info['allow_unread']
     lines = [f'שלב "{_STAGE_HE.get(stage, stage)}" לא הצליח לקרוא '
-             f'{rows:,} שורות מהקלט, ולכן התוצאה חלקית ואינה מוצגת '
-             f'כהצלחה.']
+             f'{rows:,} שורות מהקלט, ולכן לא נכתבה תוצאה. תוצרים קודמים של '
+             f'השלב, אם יש, נשארו כמות שהם, אך לא ייעשה בהם שימוש עד שהשלב '
+             f'ירוץ שוב ויקרא את כל הקלט.']
     if policy.inherited:
         lines.append('(כולל שורות שחסרו כבר בתוצרים של השלבים שקדמו לו.)')
     if limit:
@@ -500,8 +513,8 @@ def coverage_problem(out_dir, stage, allow_unread=0):
         state, rows, info = _latest_coverage(out_dir, st)
         path = os.path.join(out_dir, COVERAGE_F.format(stage=st))
         he = _STAGE_HE.get(st, st)
-        if state == 'partial':
-            return _partial_problem(out_dir, st, rows)
+        if state in ('partial', 'unreadable'):
+            return _partial_problem(out_dir, st, rows, state, info)
         if state == 'accepted' and rows > allow_unread:
             ran = ('ריצה זו לא אישרה דילוג על שורות שלא נקראו'
                    if not allow_unread else
@@ -519,12 +532,24 @@ def coverage_problem(out_dir, stage, allow_unread=0):
     return None
 
 
-def _partial_problem(out_dir, stage, rows):
+def _partial_problem(out_dir, stage, rows, state='partial', info=None):
     """The refusal of an output whose latest attempt read partially and was
-    not accepted (see :func:`coverage_problem`)."""
+    not accepted, or whose coverage record cannot be read (`state`
+    'unreadable', `info` naming the error) — see :func:`coverage_problem`.
+    """
     path = os.path.join(out_dir, COVERAGE_F.format(stage=stage))
-    msg = (f'הריצה האחרונה של שלב "{_STAGE_HE.get(stage, stage)}" לא קראה '
-           f'את כל הקלט ({rows:,} שורות לא נקראו), ולכן אין להשתמש בתוצרים '
+    he = _STAGE_HE.get(stage, stage)
+    if state == 'unreadable':
+        return (f'קובץ הכיסוי של שלב "{he}" פגום ואינו ניתן לקריאה '
+                f'({(info or {}).get("error", "")}), ולכן אי אפשר לדעת אם '
+                f'הריצה האחרונה של השלב קראה את כל הקלט. אין להשתמש בתוצרים '
+                f'שלו ושל השלבים שאחריו עד שהשלב ירוץ שוב.\n'
+                f'יש להריץ שוב:  {_all_cmd(out_dir)}\n'
+                f'פרטים: {path}')
+    count = (f'{rows:,} שורות לא נקראו' if rows else
+             'מספר השורות שלא נקראו לא נרשם')
+    msg = (f'הריצה האחרונה של שלב "{he}" לא קראה '
+           f'את כל הקלט ({count}), ולכן אין להשתמש בתוצרים '
            f'שלו ושל השלבים שאחריו.\n'
            f'יש לתקן את הבעיה ולהריץ שוב:  {_all_cmd(out_dir)}\n')
     if rows:
@@ -542,9 +567,9 @@ def failed_coverage(out_dir, stage):
     use it. Only a failed read makes the output out of date.
     """
     for st in _chain(stage):
-        state, rows, _ = _latest_coverage(out_dir, st)
-        if state == 'partial':
-            return _partial_problem(out_dir, st, rows)
+        state, rows, info = _latest_coverage(out_dir, st)
+        if state in ('partial', 'unreadable'):
+            return _partial_problem(out_dir, st, rows, state, info)
     return None
 
 
@@ -566,8 +591,9 @@ def _latest_coverage(out_dir, stage):
     `state` is 'complete' (also: no record — output from before coverage was
     recorded), 'accepted' (partial, written under ``--allow-unread``; `info`
     then carries a validated ``unread_rows`` and ``unread_refs``) or
-    'partial' (refused — also a record that cannot be read: unreadable
-    evidence is no evidence). `rows` counts the rows not read.
+    'partial' (refused), or 'unreadable' (refused too — unreadable evidence
+    is no evidence; `info` is then ``{'error': ...}``). `rows` counts the
+    rows not read.
     """
     path = os.path.join(out_dir, COVERAGE_F.format(stage=stage))
     if not os.path.exists(path):
@@ -594,8 +620,10 @@ def _latest_coverage(out_dir, stage):
             info['unread_units'] = ([str(u) for u in units]
                                     if isinstance(units, list) else [])
             return 'accepted', rows, info
-    except (OSError, ValueError, TypeError, AttributeError):
-        rows = 0
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        # no count to report: the refusal must say the record is unreadable,
+        # not that 0 rows were missed
+        return 'unreadable', 0, {'error': f'{type(e).__name__}: {e}'}
     return 'partial', max(rows, 0), None
 
 

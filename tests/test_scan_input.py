@@ -335,5 +335,36 @@ class DamagedDatabaseTest(unittest.TestCase):
         self.assertIn('שגיאה בקריאת מסד נתונים', err)
 
 
+class CoverageLineTest(unittest.TestCase):
+    """The per-stage coverage line of the log is Hebrew."""
+
+    def info(self, **kw):
+        st = ReadStats()
+        st.lines, st.chars = 1200, 34567
+        info = core._coverage_info('locate', st, passes={
+            'tanach_index': ReadStats(), 'context': ReadStats()})
+        info.update(kw)
+        return info
+
+    def test_complete(self):
+        line = core.coverage_line(self.info())
+        self.assertTrue(line.startswith('[locate] כיסוי: '))
+        self.assertIn('נקראו 1,200 שורות (34,567 תווים)', line)
+        self.assertIn('לא נקראו במעבר "אינדקס התנ"ך" 0', line)
+        self.assertIn('לא נקראו במעבר "אימות ההקשר" 0', line)
+        self.assertNotIn('סך הכול', line)
+        for english in ('coverage', 'lines=', 'unread', 'accepted'):
+            self.assertNotIn(english, line)
+
+    def test_accepted_and_refused(self):
+        base = dict(complete=False, unread_rows=3, allow_unread=5)
+        self.assertIn('סך הכול לא נקראו 3 שורות, הותרו 5',
+                      core.coverage_line(self.info(accepted=True, **base)))
+        self.assertIn('התוצאה נכתבה ומסומנת כחלקית',
+                      core.coverage_line(self.info(accepted=True, **base)))
+        self.assertIn('לא נכתבה תוצאה',
+                      core.coverage_line(self.info(accepted=False, **base)))
+
+
 if __name__ == '__main__':
     unittest.main()

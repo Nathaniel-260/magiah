@@ -146,10 +146,23 @@ class ReadStatsUnitsTest(unittest.TestCase):
 
 class ThresholdTest(_Case):
     def test_default_stops_and_names_the_option(self):
-        with _quiet(), self.assertRaises(core.PartialRead) as cm:
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log), \
+                self.assertRaises(core.PartialRead) as cm:
             core.build_lexicon(self.spec, self.cfg(), self.out)
         msg = str(cm.exception)
         self.assertIn('לא הצליח לקרוא 2 שורות', msg)
+        # what happens now: no output at all, not "a partial result"
+        self.assertIn('ולכן לא נכתבה תוצאה', msg)
+        self.assertNotIn('אינה מוצגת כהצלחה', msg)
+        # the coverage line of the log is Hebrew, and says the same
+        (line,) = [x for x in log.getvalue().splitlines()
+                   if x.startswith('[lexicon] כיסוי:')]
+        self.assertIn('לא פוענחו 1', line)
+        self.assertIn('חסרות 1', line)
+        self.assertIn('סך הכול לא נקראו 2 שורות, הותרו 0', line)
+        self.assertIn('לא נכתבה תוצאה', line)
+        self.assertNotIn('coverage', log.getvalue())
         self.assertIn('--allow-unread 2', msg)
         self.assertIn(core.ALLOW_UNREAD_UI, msg)
         self.assertIn('ספר א, ref 2', msg)                # where the rows are
@@ -322,10 +335,23 @@ class RecordValidationTest(_Case):
                 self.assertEqual(core.accepted_gaps(self.out, 'lexicon'), {})
 
     def test_unreadable_record_is_refused(self):
-        self.write_record('{not json')
+        for bad in ('{not json', '[]', json.dumps({'complete': False,
+                                                   'unread_rows': 'many'})):
+            with self.subTest(record=bad):
+                self.write_record(bad)
+                for msg in (core.coverage_problem(self.out, 'lexicon', 100),
+                            core.failed_coverage(self.out, 'detect')):
+                    # says what is wrong — not that "0 rows" were missed
+                    self.assertIn('קובץ הכיסוי של שלב "מילון" פגום', msg)
+                    self.assertNotIn('0 שורות', msg)
+                    self.assertNotIn('--allow-unread', msg)  # no count
+
+    def test_partial_record_without_a_count_says_so(self):
+        self.write_record({'stage': 'lexicon', 'complete': False,
+                           'unread_rows': 0})
         msg = core.coverage_problem(self.out, 'lexicon', 100)
-        self.assertIn('0 שורות', msg)
-        self.assertNotIn('--allow-unread', msg)        # no count to offer
+        self.assertIn('מספר השורות שלא נקראו לא נרשם', msg)
+        self.assertNotIn('0 שורות', msg)
 
 
 class DistinctRowsTest(_Case):
