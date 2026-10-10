@@ -899,6 +899,62 @@ function evLabel(code) {
   return (typeof code === "string" && m[code]) || code;
 }
 
+// An independent source of the Tanach evidence ("host:<site>" or
+// "source:<Otzaria source>") in Hebrew.
+function tanachSourceLabel(g) {
+  if (typeof g !== "string") return String(g);
+  if (g.startsWith("host:")) return "אתר " + g.slice(5);
+  if (g.startsWith("source:")) {
+    const name = g.slice(7);
+    return "מאגר " + (originInfo(name).hebrew || name);
+  }
+  return g;
+}
+
+// One edition of a Tanach book, as the evidence names it
+// ({edition, book_id, version_id}): where its text is in the database.
+function editionRefText(e) {
+  if (!e || typeof e !== "object") return String(e);
+  const where = e.version_id != null ? "גרסה " + e.version_id
+    : "טקסט ראשי של ספר " + (e.book_id != null ? e.book_id : "");
+  return (e.edition || "") + " (" + where + ")";
+}
+
+const CTX_SCOPE_HE = { book: "בתוך הספר בלבד", corpus: "בכל המאגר" };
+
+// The lines of readable Hebrew the drawer shows for one key of a finding's
+// `extra`: never raw JSON, English keys or bare "host:" codes.
+function extraLines(k, v) {
+  if (v == null || v === "") return [];
+  if (typeof v === "boolean") return [v ? "כן" : "לא"];
+  if (k === "evidence_kind" || k === "reason") return [String(evLabel(v))];
+  if (k === "source" || k === "minority_source") return [tanachSourceLabel(v)];
+  if (k === "ctx_scope") return [CTX_SCOPE_HE[v] || String(v)];
+  const list = (x) => (Array.isArray(x) ? x : [x]).map(String).join(", ");
+  if (k === "witnesses" && Array.isArray(v))
+    return v.map((w) => (w && typeof w === "object")
+      ? tanachSourceLabel(w.source) + ": " + list(w.editions || [])
+      : String(w));
+  if (k === "readings" && typeof v === "object" && !Array.isArray(v))
+    // {reading: [editions]} (one source), or {reading: {source: [editions]}}
+    return Object.entries(v).map(([reading, by]) => "«" + reading + "» — " +
+      ((by && typeof by === "object" && !Array.isArray(by))
+        ? Object.entries(by).map(([g, eds]) =>
+            tanachSourceLabel(g) + " (" + list(eds) + ")").join("; ")
+        : list(by)));
+  if (k === "word_editions" && Array.isArray(v)) return v.map(editionRefText);
+  const labels = (S.meta && S.meta.extra_labels) || {};
+  const flat = (x) => (x && typeof x === "object")
+    ? (Array.isArray(x) ? x.map(flat).join(", ")
+      : Object.entries(x).map(([kk, vv]) =>
+          (labels[kk] || kk) + ": " + flat(vv)).join("; "))
+    : String(x);
+  if (Array.isArray(v)) return v.length ? [v.map(flat).join(", ")] : [];
+  if (typeof v === "object") return Object.entries(v).map(([kk, vv]) =>
+    (labels[kk] || kk) + ": " + flat(vv));
+  return [String(v)];
+}
+
 function renderDrawer(r, history) {
   const body = $("#drawerBody");
   body.replaceChildren();
@@ -996,11 +1052,12 @@ function renderDrawer(r, history) {
           dl.append(el("dt", null, "הצעות חלופיות"), el("dd", null, altList(r.word, v)));
         continue;
       }
-      const txt = (v && typeof v === "object") ? JSON.stringify(v)
-        : typeof v === "boolean" ? (v ? "כן" : "לא")
-        : (k === "evidence_kind" || k === "reason") ? String(evLabel(v)) : String(v);
+      const lines = extraLines(k, v);
+      if (!lines.length) continue;
       const kl = ((S.meta && S.meta.extra_labels) || {})[k];
-      dl.append(el("dt", null, kl || ("פרטים: " + k)), el("dd", null, el("bdi", null, txt)));
+      dl.append(el("dt", null, kl || ("פרטים: " + k)),
+        el("dd", null, lines.length === 1 ? el("bdi", null, lines[0])
+          : lines.map((t) => el("div", null, el("bdi", null, t)))));
     }
   }
   fSec.append(dl);
