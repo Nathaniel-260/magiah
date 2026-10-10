@@ -3008,10 +3008,41 @@ def record_book_scan_source(outdir, result):
 
 def merge_book_scan(outdir, result):
     """Merge a single-book scan and record where it came from — the one
-    path both the web UI and the CLI use, so neither can forget the root."""
-    counts = import_book_scan(outdir, result)
+    path both the web UI and the CLI use, so neither can forget the root.
+
+    The rows and their source are two commits. The book's previous source
+    record is set aside first, so a crash between them leaves the new rows
+    with no source (the fixer refuses them: source_unknown) — never under
+    an earlier scan's root and fingerprint. A merge that fails puts it
+    back."""
+    scope = 'doc:%s' % result['doc'] if result.get('doc') else None
+    old = _take_source_root(outdir, scope) if scope else None
+    try:
+        counts = import_book_scan(outdir, result)
+    except BaseException:
+        if old is not None:
+            con = connect(outdir)
+            try:
+                record_source_root(con, scope, old['root'], old['stamp'],
+                                   old['file_sha'], old['file_size'])
+            finally:
+                con.close()
+        raise
     record_book_scan_source(outdir, result)
     return counts
+
+
+def _take_source_root(outdir, scope):
+    """Remove and return the source record of `scope` (None if none)."""
+    con = connect(outdir)
+    try:
+        rec = get_source_root(con, scope)
+        if rec is not None:
+            con.execute('DELETE FROM fixer_sources WHERE scope = ?', (scope,))
+            con.commit()
+        return rec
+    finally:
+        con.close()
 
 
 def get_file_edits(con, key=None, limit=50, include_undone=True):
