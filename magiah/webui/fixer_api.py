@@ -447,6 +447,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
             'snippet': row.get('snippet'),
             'occurrence': ref.get('occurrence', 0),
             'expected_count': ref.get('expected_count'),
+            'errtype': row.get('errtype'),
             'trusted': row.get('trusted', False)})
         if r.get('mode') in patcher.MODES:
             modes[fid] = r['mode']

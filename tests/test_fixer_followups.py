@@ -184,5 +184,54 @@ class TestSingleCopyNeedsItsNeighbours(TempCase):
         self.assertEqual(p.start, line.index(self.W))
 
 
+class TestCopiesTheScannerSkips(TempCase):
+    """A flagged word with a second copy the scanner passes over (after a
+    title, before a geresh, next to a bracket) has one finding; counting the
+    skipped copy refused it even in an unchanged file."""
+
+    W, FIX = 'לשמיס', 'לשמים'
+    PAD = ' '.join(['והלכה כדברי האומר שהתפלה במקום קרבן היא'] * 3)
+    CASES = ('אמר רבי {w} כעבד לפני {w} ולכן ',
+             "כעבד {w}' לפני רבו {w} ולכן ",
+             'כעבד {w}(?) לפני רבו {w} ולכן ')
+
+    def scanned(self, line):
+        """The findings the real scanner rule (core.locate_line) makes."""
+        from collections import Counter
+        from magiah import core
+        from magiah.config import Config
+        freq = Counter({t: 10 ** 6 for t in normalize.tokenize(line)})
+        freq[self.W] = 1
+        occ = core.locate_line(line, freq, Config(),
+                               {self.W: ('error', 'edit1_sub', self.FIX)})[0]
+        return [{'id': i + 1, 'lineno': 0, 'word': w, 'correction': self.FIX,
+                 'suggestion': self.FIX, 'errtype': 'edit1_sub',
+                 'snippet': snip, 'occurrence': i, 'expected_count': len(occ)}
+                for i, (w, _p, _n, snip) in enumerate(occ)]
+
+    def test_the_reported_copy_is_written(self):
+        for case in self.CASES:
+            line = case.format(w=self.W) + self.PAD
+            [f] = self.scanned(line)
+            reported = line.rindex(self.W)
+            for now in (line, line + ' סוף הדבר'):
+                with self.subTest(line=now[:30], edited=now != line):
+                    p = patcher.plan_edit(self.doc(now + '\n'), dict(f))
+                    self.assertEqual((p.start, p.confidence),
+                                     (reported, 'indexed'))
+
+    def test_the_proof_still_holds(self):
+        """The reported copy fixed by hand and the word typed again: still
+        one copy to count, but not the scanned one's window — refused."""
+        for case in self.CASES:
+            line = case.format(w=self.W) + self.PAD
+            [f] = self.scanned(line)
+            k = line.rindex(self.W)
+            now = line[:k] + self.FIX + line[k + len(self.W):] + ' ' + self.W
+            with self.subTest(line=now[:30]):
+                with self.assertRaises(patcher.PatchError):
+                    patcher.plan_edit(self.doc(now + '\n'), dict(f))
+
+
 if __name__ == '__main__':
     unittest.main()

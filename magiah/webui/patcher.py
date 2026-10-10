@@ -53,7 +53,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime
 
-from .. import book_source, normalize
+from .. import book_source, core, normalize
 from ..corpus_hybrid import DEFAULT_LIBRARY, parse_file_unit
 from . import hebrew
 
@@ -423,11 +423,17 @@ LEVEL_TOKENS = 'tokens'        # legacy: most snippet tokens are on the line
 class _LineInfo:
     """One line's clean text and token spans, computed once and shared by
     every finding that looks at the line."""
-    __slots__ = ('clean', 'spans', '_by_tok')
+    __slots__ = ('clean', 'spans', '_by_tok', '_at')
 
     def __init__(self, text):
         self.clean, self.spans = normalize.token_spans_full(text)
-        self._by_tok = None
+        self._by_tok = self._at = None
+
+    def index_at(self, clean_start):
+        """Index of the token starting at `clean_start`, or None."""
+        if self._at is None:
+            self._at = {sp[3]: i for i, sp in enumerate(self.spans)}
+        return self._at.get(clean_start)
 
     def by_tok(self):
         """token -> indexes of its spans, in order."""
@@ -786,6 +792,38 @@ def _as_scanned(line, lineno, own_edits):
     return ''.join(parts), undone
 
 
+def _scanner_skips(text, clean_text, occ, word, finding, doc=None):
+    """Would the scan have passed over this copy without a finding? The
+    same rules as core.locate_line, on the same clean text (a join of two
+    words, which needs the lexicon, is not modelled: such a copy is
+    counted, and a count that then disagrees refuses)."""
+    if len(word.split()) != 1:
+        return False                 # a split word is not reported per token
+    s, e = occ[2], occ[3]
+    if core._editorial_adjacent(clean_text, s, e):
+        return True
+    errtype = finding.get('errtype')
+    if (e < len(clean_text) and clean_text[e] == ')'
+            and errtype == 'edit1_ins'
+            and (finding.get('suggestion') or '') == word[:-1]
+            and word[-1] in core.NUMERAL_LETTERS):
+        depth = 0                    # a footnote marker unless '(' is open
+        for ch in clean_text[:e]:
+            if ch == '(':
+                depth += 1
+            elif ch == ')' and depth:
+                depth -= 1
+        if not depth:
+            return True
+    if errtype in ('missing_space', 'final_midword'):
+        return False
+    info = _line_info(doc, text)
+    k = info.index_at(s)
+    return k is not None and any(
+        0 <= k - j and info.spans[k - j][0] in core.NAME_TRIGGERS
+        for j in (1, 2))
+
+
 def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
     """Index in `spans` (the copies of `word` on the line now) of the copy
     the finding means, chosen by the scan's order — and proven, or refused.
@@ -814,6 +852,12 @@ def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
         refuse('ambiguous_occurrence')
     then, undone = rebuilt
     clean_then, occs = _occurrences(then, word, doc)
+    # the scan numbered only the copies it reports; one it skips (after a
+    # title, before a geresh, next to a bracket) has no finding and no
+    # number, so it must not be counted — the exact window below is still
+    # what proves the copy
+    occs = [o for o in occs if not _scanner_skips(then, clean_then, o, word,
+                                                 finding, doc)]
     if expected is not None and expected != len(occs):
         refuse('occurrence_count_changed')
     if not 0 <= occurrence < len(occs):
@@ -1341,6 +1385,7 @@ def anchor_rows(doc, rows, applied=None):
                 'snippet': r.get('snippet'),
                 'occurrence': r.get('occurrence'),
                 'expected_count': r.get('expected_count'),
+                'errtype': r.get('errtype'),
                 'trusted': r.get('trusted', False)},
                 check_vocalization=False, own_edits=own)
             r['anchor'] = {'ok': True, 'start': plan.start, 'end': plan.end,
