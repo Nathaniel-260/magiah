@@ -2107,9 +2107,15 @@ def _write_reports(con, dest_dir, extra_where, params, top):
             con.execute(f'SELECT 1 FROM {tbl} LIMIT 1')
         except sqlite3.OperationalError:
             continue
-        if 'evidence' in {r[1] for r in con.execute(
-                f'PRAGMA table_info({tbl})')}:
+        has_ev = 'evidence' in {r[1] for r in con.execute(
+            f'PRAGMA table_info({tbl})')}
+        if has_ev:
             sel, hdr = sel + ', evidence', hdr + ['evidence']
+        # the edition whose text holds the word: for a minority version the
+        # unit is the primary line, so the row must say which text to fix
+        editions = has_ev and tbl == 'tanach_errors_full'
+        if editions:
+            hdr = hdr + ['edition']
         path = os.path.join(dest_dir, fname)
         out = _open_report(path)
         if out is None:
@@ -2121,6 +2127,8 @@ def _write_reports(con, dest_dir, extra_where, params, top):
             for row in con.execute(
                     f'SELECT {sel} FROM {tbl} WHERE 1=1{extra_where}',
                     params):
+                if editions:
+                    row = (*row, tanach.word_editions_text(row[-1]))
                 wr.writerow(row)
                 n += 1
         print(f'[report] {n:,} rows -> {path}', flush=True)
