@@ -26,6 +26,21 @@ datas = [
 # review, etc.) survive freezing.
 hiddenimports = collect_submodules('magiah')
 
+# zstd decoder for schema-6 seforim.db (see magiah/textsource.py). It is
+# imported lazily inside a try, so a build environment without one would
+# freeze an exe that fails every scan on a modern Otzaria DB — refuse instead.
+try:
+    import compression.zstd  # noqa: F401  (Python 3.14+ stdlib)
+    hiddenimports += ['compression.zstd', '_zstd']
+except ImportError:
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            'magiah.spec: no zstd decoder in this Python — run '
+            '"pip install zstandard" (or build with Python 3.14+) first')
+    hiddenimports += collect_submodules('zstandard')
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],

@@ -47,11 +47,15 @@ from Actions → Release → Run workflow.
 > ותנו לנתונים להיווצר שם.
 
 1. פותחים שורת פקודה בתיקיית הפרויקט (זו שמכילה את `launcher.py` ו־`magiah.spec`).
-2. מוודאים ש־PyInstaller מותקן (פעם אחת בלבד):
+2. מוודאים ש־PyInstaller ו־zstandard מותקנים (פעם אחת בלבד):
 
    ```
-   python -X utf8 -m pip install pyinstaller
+   python -X utf8 -m pip install pyinstaller zstandard
    ```
+
+   `zstandard` נחוצה כדי שה־exe יוכל לקרוא מסדי אוצריא חדשים (דחוסים ב־zstd).
+   בפייתון 3.14 ומעלה המפענח מובנה, אבל ההתקנה לא מזיקה. בלעדיו הבנייה תיעצר
+   עם הודעה ברורה במקום לייצר exe שכל סריקה בו נכשלת.
 
 3. בונים — **לתיקייה זמנית**, כדי לא לגעת בנתונים שב־`dist\`:
 
@@ -111,11 +115,16 @@ if it is missing).
 
 1. Open a terminal in the project root (the folder with `launcher.py` and
    `magiah.spec`).
-2. Install PyInstaller once:
+2. Install PyInstaller and zstandard once:
 
    ```
-   python -X utf8 -m pip install pyinstaller
+   python -X utf8 -m pip install pyinstaller zstandard
    ```
+
+   `zstandard` lets the exe read modern (zstd-compressed) Otzaria databases.
+   Python 3.14+ has a built-in decoder, but installing it does no harm.
+   Without one the build stops with a clear message instead of producing an
+   exe whose every scan fails.
 
 3. Build **into a temporary folder** so nothing in `dist\` is touched:
 
