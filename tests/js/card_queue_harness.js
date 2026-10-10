@@ -6,7 +6,7 @@ const path = require("path");
 const { CardQueue, writeChanged } = require(path.join(__dirname, "..", "..", "magiah", "webui", "static", "cardqueue.js"));
 
 const [base, scenario] = process.argv.slice(2);
-let saves = 0;
+let saves = 0, conflicts = 0;
 
 async function get(p) {
   const r = await fetch(base + p);
@@ -25,10 +25,18 @@ async function post(p, body) {
 const io = {
   fetchPage: (cursor) => get("/api/findings?status=pending&sort=rank&dir=desc&page_size=50&cursor=" + encodeURIComponent(cursor)),
   countRemaining: async () => (await get("/api/findings?status=pending&page_size=1")).total,
-  save: async (row, status) => {
+  save: async (row, status, opts) => {
     saves++;
-    return post("/api/status", { ids: [row.id], status, expect_status: row.effective_status || "pending" });
+    const body = { ids: [row.id], status, expect_status: row.effective_status || "pending" };
+    if (opts && opts.scope) body.scope = opts.scope;
+    try {
+      return await post("/api/status", body);
+    } catch (e) {
+      if (e.status === 409) conflicts++;
+      throw e;
+    }
   },
+  fetchRows: (ids) => get("/api/findings?status=pending&page_size=500&ids=" + ids.join(",")),
 };
 
 async function drain(q, onHead) {
@@ -108,6 +116,35 @@ async function main() {
     const h = q.head();
     q.restore(Object.assign({}, h));
     out.copies = q.queue.filter(r => r.id === h.id).length;
+  } else if (scenario === "rule_settles") {
+    // "not an error everywhere" on the first card: the word's other cards
+    // leave the queue, and the rest of the session meets no conflict
+    await q.fill();
+    const word = q.head().word;
+    out.word_cards_before = q.queue.filter(r => r.word === word).length;
+    q.skip();                       // one of them waits in the skip pile
+    const head = q.head();
+    await q.act("not_error", { scope: head.word === word ? "word" : undefined });
+    out.word_cards_after = q.queue.concat(q.skipped).filter(r => r.word === word).length;
+    out.visited = (await drain(q, () => q.act("approved"))).size;
+  } else if (scenario === "rule_elsewhere") {
+    // another window sets a word rule; this queue still holds the word's
+    // cards and acts on one: a 409 that names the rule, and the card goes
+    await q.fill();
+    const head = q.head();
+    const other = q.queue.find(r => r.word === head.word && r.id !== head.id);
+    await post("/api/status", { ids: [other.id], status: "not_error", scope: "word" });
+    try {
+      await q.act("approved");
+      out.error = null;
+    } catch (e) {
+      out.error = e.status;
+      out.code = e.data.code;
+      out.cause = e.data.cause[String(head.id)];
+      out.message = e.data.error;
+    }
+    out.head_left = !q.queue.some(r => r.id === head.id);
+    out.visited = (await drain(q, () => q.act("approved"))).size;
   } else if (scenario === "noop_changed") {
     out.first = writeChanged(await post("/api/status", { ids: [1], status: "approved" }));
     out.second = writeChanged(await post("/api/status", { ids: [1], status: "approved" }));
@@ -115,6 +152,7 @@ async function main() {
     throw new Error("unknown scenario " + scenario);
   }
   out.saves = saves;
+  out.conflicts = conflicts;
   out.state = q.state();
   out.remaining = q.remaining;
   process.stdout.write(JSON.stringify(out));

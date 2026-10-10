@@ -5,8 +5,12 @@ import io
 import json
 import os
 import pickle
+import shutil
 import sqlite3
+import sys
 import tempfile
+import time
+import types
 import unittest
 from unittest import mock
 
@@ -18,10 +22,42 @@ from magiah.textsource import (OtzariaDB, ReadStats, TextSourceError, ro_uri,
                                iter_file_lines, split_lines)
 from magiah.webui import db as webui_db
 
+
+
+class _ZstandardFixtures:
+    """The slice of ``compression.zstd`` the fixtures use, on the
+    ``zstandard`` package — the decoder Python < 3.14 reads seforim.db with
+    (pyproject: ``zstandard; python_version < '3.14'``). Without it the
+    zstd fixtures could not be written there, and the reader's only backend
+    on those interpreters would go untested."""
+
+    def __init__(self, zs):
+        self._zs = zs
+
+    def train_dict(self, samples, size):
+        return self.ZstdDict(self._zs.train_dictionary(size, samples)
+                             .as_bytes())
+
+    def ZstdDict(self, content):
+        d = types.SimpleNamespace(dict_content=bytes(content))
+        d.compression_dict = self._zs.ZstdCompressionDict(d.dict_content)
+        return d
+
+    def compress(self, data, zstd_dict):
+        return self._zs.ZstdCompressor(
+            dict_data=zstd_dict.compression_dict).compress(data)
+
+
 try:
     from compression import zstd as _zstd
 except ImportError:                                  # Python < 3.14
-    _zstd = None
+    try:
+        import zstandard
+    except ImportError:          # neither backend: the reader cannot decode
+        _zstd = None             # either, so the zstd tests are skipped
+    else:
+        _zstd = _ZstandardFixtures(zstandard)
+NO_ZSTD = 'needs a zstd backend (compression.zstd, or zstandard before 3.14)'
 
 LINES = [
     (1, 1, 'בראשית ברא אלהים את השמים ואת הארץ'),
@@ -41,6 +77,17 @@ def _base_schema(con):
         CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);
         INSERT INTO schema_meta VALUES('db_schema_version', '6');
     ''')
+
+
+def make_library_dir(path):
+    """A library repo with one book: an empty one is refused as a source
+    (corpus_hybrid.LibraryCorpus.chunks), so a hybrid corpus needs one even
+    where only its database part is under test."""
+    os.makedirs(os.path.join(path, 'DictaToOtzaria'), exist_ok=True)
+    with open(os.path.join(path, 'DictaToOtzaria', 'ספר.txt'), 'w',
+              encoding='utf-8') as f:
+        f.write('שורה מקובץ\n')
+    return path
 
 
 def make_inline_db(path):
@@ -124,7 +171,7 @@ class InlineLayoutTest(unittest.TestCase):
             self.assertFalse(os.path.exists(p))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class Schema6Test(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -147,6 +194,14 @@ class Schema6Test(unittest.TestCase):
             got = {lid: t for lid, _, t in odb.iter_range(1, 5, st)}
         self.assertEqual(got, {i: t for i, _, t in LINES})
         self.assertEqual(st.decode_errors, 0)
+
+    def test_the_backend_this_interpreter_ships_with_is_tested(self):
+        # before 3.14 the decoder is `zstandard`: the fixtures are written
+        # with it there instead of skipping every zstd test
+        with OtzariaDB(self._db()) as odb:
+            self.assertEqual(odb.backend,
+                             'compression.zstd' if sys.version_info >= (3, 14)
+                             else 'zstandard')
 
     def test_text_row_in_compressed_db_passes_through(self):
         p = self._db(plain_id=3)
@@ -179,12 +234,12 @@ class Schema6Test(unittest.TestCase):
 
     def test_hybrid_db_part_reads_only_sefaria_books(self):
         p = self._db()
-        lib = os.path.join(self.dir, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.dir, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': p})
         units = []
         for ch in corpus.chunks(1):
-            units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
+            if ch[0] == 'db':
+                units.extend(u for u, _, _ in corpus.iter_texts_docs(ch))
         corpus.close()
         self.assertEqual(sorted(units), ['1', '2'])     # book 1 = Sefaria
 
@@ -278,6 +333,92 @@ class LineSplittingTest(unittest.TestCase):
                                       library_dir=lib)
             self.assertEqual(len(b), 1)
 
+    def _counting_walks(self):
+        calls = []
+        real = LibraryCorpus._files
+
+        def files(corpus, dirs=None):
+            calls.append(corpus.path)
+            return real(corpus, dirs)
+        return calls, mock.patch.object(LibraryCorpus, '_files', files)
+
+    def _write(self, *parts):
+        os.makedirs(os.path.dirname(os.path.join(*parts)), exist_ok=True)
+        with open(os.path.join(*parts), 'w', encoding='utf-8') as f:
+            f.write('שורה\n')
+
+    def _age(self, lib):
+        """Date every folder a minute back: a walk trusts only folders not
+        modified around the time it ran (book_source._walk_library)."""
+        past = time.time() - 60
+        for d, _, _ in os.walk(lib):
+            os.utime(d, (past, past))
+
+    def test_picker_walks_the_library_once_while_it_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            self._write(lib, 'MoreBooks', 'ב', 'ספר ב.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            with patch:
+                for q in ('', 'ספר', 'א', 'ב', 'ספר א'):
+                    book_source.list_library_books(lib, q)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                [b['key'] for b in book_source.list_library_books(lib, '')],
+                ['MoreBooks/א/ספר א.txt', 'MoreBooks/ב/ספר ב.txt'])
+
+    def test_picker_sees_every_kind_of_change(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'א', 'ספר א.txt')
+            calls, patch = self._counting_walks()
+
+            def after(change):
+                """A trusted walk, then `change`: the next query must see
+                it through the changed folder's modification time."""
+                self._age(lib)
+                book_source.list_library_books(lib, '')
+                n = len(calls)
+                change()
+                keys = [b['key'] for b in
+                        book_source.list_library_books(lib, '')]
+                self.assertEqual(len(calls), n + 1)
+                return keys
+            with patch:
+                # a book deep in a folder that already existed
+                self.assertIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'א', 'ספר ג.txt')))
+                # a new folder, and a new origin at the top
+                self.assertIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: self._write(lib, 'MoreBooks', 'חדש',
+                                        'ספר ד.txt')))
+                self.assertIn('OtherRepo/ספר ה.txt', after(
+                    lambda: self._write(lib, 'OtherRepo', 'ספר ה.txt')))
+                # removed, renamed, a whole folder removed
+                self.assertNotIn('MoreBooks/א/ספר ג.txt', after(
+                    lambda: os.remove(os.path.join(lib, 'MoreBooks', 'א',
+                                                   'ספר ג.txt'))))
+                self.assertEqual(after(lambda: os.rename(
+                    os.path.join(lib, 'OtherRepo', 'ספר ה.txt'),
+                    os.path.join(lib, 'OtherRepo', 'ספר ו.txt'))),
+                    ['MoreBooks/א/ספר א.txt', 'MoreBooks/חדש/ספר ד.txt',
+                     'OtherRepo/ספר ו.txt'])
+                self.assertNotIn('MoreBooks/חדש/ספר ד.txt', after(
+                    lambda: shutil.rmtree(os.path.join(lib, 'MoreBooks',
+                                                       'חדש'))))
+
+    def test_a_walk_racing_a_change_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as lib:
+            self._write(lib, 'MoreBooks', 'ספר א.txt')
+            self._age(lib)
+            calls, patch = self._counting_walks()
+            # every folder looks modified after the walk began
+            with patch, mock.patch.object(book_source.time, 'time_ns',
+                                          return_value=0):
+                book_source.list_library_books(lib, '')
+                book_source.list_library_books(lib, '')
+            self.assertEqual(len(calls), 2)
+
 
 BROKEN_FRAME = b'\x28\xb5\x2f\xfd' + b'\x00' * 9
 
@@ -306,7 +447,7 @@ def _coverage(out, stage):
         return json.load(f)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class PartialOutputTest(unittest.TestCase):
     """A stage that could not read its whole input must not replace its last
     good output, and nothing downstream may consume output whose latest
@@ -431,7 +572,7 @@ class PartialOutputTest(unittest.TestCase):
         self.assertIn('מיקום', err.getvalue())
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class MissingContentRowTest(unittest.TestCase):
     """A `line` row without its `line_content` row is unread, not absent."""
 
@@ -466,7 +607,7 @@ class MissingContentRowTest(unittest.TestCase):
             book_source.load_book('db', '2', db_path=self.db)
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class OpenFailureTest(unittest.TestCase):
     """A database that fails to open is released and reported in Hebrew."""
 
@@ -533,7 +674,7 @@ class OpenFailureTest(unittest.TestCase):
         self.assertFalse(os.path.exists(missing))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class ReadStatsCountedTest(unittest.TestCase):
     """Every pass that reads the corpus counts what it could not read."""
 
@@ -602,8 +743,7 @@ class ReadStatsCountedTest(unittest.TestCase):
     def test_hybrid_counts_skipped_version_lines(self):
         db = os.path.join(self.tmp.name, 'clean.db')
         make_schema6_db(db)
-        lib = os.path.join(self.tmp.name, 'lib')
-        os.makedirs(lib)
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
         corpus = HybridCorpus({'type': 'hybrid', 'path': lib, 'db': db})
         for ch in corpus.chunks(2):
             list(corpus.iter_texts_docs(ch))
@@ -698,7 +838,7 @@ def _plan(con, sql, args):
                       con.execute('EXPLAIN QUERY PLAN ' + sql, args))
 
 
-@unittest.skipIf(_zstd is None, 'needs compression.zstd (Python 3.14+)')
+@unittest.skipIf(_zstd is None, NO_ZSTD)
 class BookFilteredReadTest(unittest.TestCase):
     """Reads restricted to some books: the same rows, with a chunk's id range
     — not the list of the selected books' lines — driving the scan."""
@@ -715,8 +855,7 @@ class BookFilteredReadTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _hybrid(self):
-        lib = os.path.join(self.tmp.name, 'lib')
-        os.makedirs(lib, exist_ok=True)
+        lib = make_library_dir(os.path.join(self.tmp.name, 'lib'))
         return HybridCorpus({'type': 'hybrid', 'path': lib, 'db': self.db})
 
     def test_version_counts_match_the_in_subquery_form(self):

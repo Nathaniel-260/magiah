@@ -416,6 +416,29 @@ class UiScanTest(ResultStatusCase):
         self.assertEqual(self.ui_scan()['state'], 'done')
         self.assertFalse(meta_status(self.out)['result_status']['stale'])
 
+    def test_scan_of_a_library_without_books_fails_and_keeps_results(self):
+        self.assertEqual(self.ui_scan()['state'], 'done')
+        db.import_all(self.out)
+        at = meta_status(self.out)['result_status']['results_at']
+        report = os.path.join(self.out, core.REPORT_DB_F)
+        with open(report, 'rb') as f:
+            before = f.read()
+        # the folder is there, its books are not: a scan of nothing used to
+        # succeed with an empty report.db, and a refresh dropped everything
+        os.remove(os.path.join(self.repo, 'DictaToOtzaria', 'ספר.txt'))
+        status = self.ui_scan()
+        self.assertEqual(status['state'], 'failed')
+        self.assertTrue(any('לא נמצאו קובצי ספרים' in line
+                            for line in status['log_tail']))
+        self.assertFalse(any('Traceback' in line
+                             for line in status['log_tail']))
+        with open(report, 'rb') as f:
+            self.assertEqual(f.read(), before)
+        n = self.assert_stale('נכשלה', at)
+        self.assertIn('לא נמצאו קובצי ספרים', n['details'])
+        db.import_all(self.out)                 # a refresh keeps them all
+        self.assertEqual(meta_status(self.out)['total'], 1)
+
     def test_cancelled_scan(self):
         self.ui_scan()
         db.import_all(self.out)

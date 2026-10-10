@@ -6,6 +6,7 @@ The fixture is synthetic: the "verses" are everyday word sequences placed in
 a schema-6 style database (category tree, heRefs, book_version/version_line),
 so nothing here depends on real biblical text.
 """
+import contextlib
 import json
 import os
 import pickle
@@ -353,6 +354,41 @@ class IndexTest(_DBCase):
                          if r not in errs)
         self.assertEqual(reasons, ['intra_source', 'one_against_one',
                                    'plene', 'qere_ketiv'])
+
+    def test_edition_error_names_the_edition_holding_the_word(self):
+        # the row's unit is the primary line; the minority reading is in
+        # version 4 ("Third"), and the row must say so
+        rows, _ = self.idx.edition_errors()
+        (err,) = [json.loads(r[4]) for r in rows
+                  if json.loads(r[4])['evidence_kind']
+                  == 'tanach_edition_variant']
+        self.assertEqual(err['word_editions'], [
+            {'edition': 'Third', 'book_id': BIBLE, 'version_id': 4}])
+        self.assertEqual(self.t.word_editions_text(err), 'Third (גרסה 4)')
+        by = {json.loads(r[4])['reason']: (r[1], json.loads(r[4]))
+              for r in rows if json.loads(r[4])['evidence_kind']
+              == 'tanach_edition_unresolved'}
+        # one against one: 'לאת' is read by both renderings of source two
+        word, ev = by['one_against_one']
+        self.assertEqual(word, 'לאת')
+        self.assertEqual({e['version_id'] for e in ev['word_editions']},
+                         {2, 3})
+        # within one source: only the rendering that reads the word
+        word, ev = by['intra_source']
+        self.assertEqual(word, 'הנכונח')
+        self.assertEqual(self.t.word_editions_text(ev),
+                         'Second plain (גרסה 3)')
+        # every edition-error row names at least one edition
+        self.assertTrue(all(json.loads(r[4])['word_editions'] for r in rows))
+
+    def test_word_editions_text_of_a_primary_text_and_of_nothing(self):
+        self.assertEqual(self.t.word_editions_text(json.dumps(
+            {'word_editions': [{'edition': 'בראשית (Sefaria)',
+                                'book_id': 7, 'version_id': None}]})),
+            'בראשית (Sefaria) (טקסט ראשי, ספר 7)')
+        for nothing in (None, '', '{bad', '[]', '{}',
+                        {'word_editions': 'x'}):
+            self.assertEqual(self.t.word_editions_text(nothing), '')
 
     def test_unresolved_disagreements_are_reported_not_dropped(self):
         rows, _ = self.idx.edition_errors()
@@ -1088,6 +1124,63 @@ class EditionRankTest(unittest.TestCase):
                 "SELECT word, rank FROM findings WHERE family='tanach_error'"))
             con.close()
             self.assertEqual(rank, {'אדוס': 4.0, 'לאת': 0.0})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_exports_name_the_edition_to_correct(self):
+        import csv
+        from magiah.webui import db as uidb, export
+        d = tempfile.mkdtemp(prefix='magiah_tanach_exp_')
+        ev = {'evidence_kind': 'tanach_edition_variant',
+              'word_editions': [{'edition': 'Third', 'book_id': 1,
+                                 'version_id': 4}]}
+        try:
+            path = os.path.join(d, 'report.db')
+            make_legacy_report(path)
+            con = sqlite3.connect(path)
+            con.executescript('''
+                DROP TABLE tanach_errors_full;
+                CREATE TABLE tanach_errors_full(word, canonical, source, ref,
+                                                unit, snippet, origin,
+                                                evidence);''')
+            con.execute('INSERT INTO tanach_errors_full VALUES(?,?,?,?,?,?,?,?)',
+                        ('אדוס', 'אדום', 'בראשית', 'בראשית א, א', '9', 's',
+                         'Sefaria', json.dumps(ev, ensure_ascii=False)))
+            con.commit()
+            # the report CSV
+            con.row_factory = None
+            with open(os.devnull, 'w') as null, \
+                    contextlib.redirect_stdout(null):
+                core._write_reports(con, d, '', (), 0)
+            con.close()
+            with open(os.path.join(d, 'tanach_edition_errors.csv'),
+                      encoding='utf-8-sig') as f:
+                (row,) = list(csv.DictReader(f))
+            self.assertEqual(row['edition'], 'Third (גרסה 4)')
+            # the review UI's exports of an approved edition finding
+            uidb.import_all(d)
+            ucon = uidb.connect(d)
+            try:
+                (fid,) = [r[0] for r in ucon.execute(
+                    "SELECT id FROM findings WHERE family='tanach_error'")]
+                uidb.set_status(ucon, d, [fid], 'approved')
+                export.export_fixes(ucon, d)
+                with open(os.path.join(d, 'to_send',
+                                       'approved_fixes_all.csv'),
+                          encoding='utf-8-sig') as f:
+                    rows = list(csv.DictReader(f))
+                (fix,) = [r for r in rows if r['word'] == 'אדוס']
+                self.assertEqual(fix['edition'], 'Third (גרסה 4)')
+                self.assertEqual(fix['line_id'], '9')
+                xrows = list(export._all_rows(ucon, 'Sefaria'))
+                self.assertEqual(len(export.MAIN_HEADERS), len(xrows[0]))
+                (xrow,) = [r for r in xrows if r[3] == 'אדוס']
+                self.assertEqual(xrow[-1], 'Third (גרסה 4)')
+                # any other finding has an empty edition cell
+                self.assertTrue(all(r['edition'] == '' for r in rows
+                                    if r['word'] != 'אדוס'))
+            finally:
+                ucon.close()
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

@@ -592,15 +592,35 @@ class TestDriftedLines(TempCase):
 
     def test_genuine_drift_still_relocates_in_a_formulaic_book(self):
         """The strict identity test must not make drift useless: a real
-        insertion in a formulaic book still relocates correctly."""
+        insertion in a formulaic book still relocates correctly — on the
+        scan's own snippet window, which pins the sentence."""
         lines = self._formulaic(n10=self.VERSE_A)
         lines.insert(0, 'שורה שנוספה')
         d = self.doc('\n'.join(lines) + '\n')
         plan = patcher.plan_edit(d, {'id': 1, 'lineno': 10, 'word': 'נגעימ',
                                      'correction': 'נגעים',
-                                     'snippet': self.VERSE_A})
+                                     'snippet': scan_snippet(self.VERSE_A,
+                                                             'נגעימ')})
         self.assertEqual(plan.lineno, 11)
         self.assertTrue(plan.drifted)
+        self.assertEqual(plan.confidence, 'moved')
+
+    def test_shared_words_alone_never_relocate(self):
+        """A snippet that is not the scan's window (here the whole verse)
+        only shows that most words are shared, which a parallel verse does
+        too: the moved line is offered for a click, never written."""
+        lines = self._formulaic(n10=self.VERSE_A)
+        lines.insert(0, 'שורה שנוספה')
+        d = self.doc('\n'.join(lines) + '\n')
+        f = {'id': 1, 'lineno': 10, 'word': 'נגעימ', 'correction': 'נגעים',
+             'snippet': self.VERSE_A}
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'moved_unproven')
+        self.assertEqual(cm.exception.extra['candidate_lines'], [11])
+        a, b = normalize.phrase_spans(d.lines[11], 'נגעימ')[0][1:]
+        plan = patcher.plan_edit(d, f, explicit=(a, b))
+        self.assertEqual((plan.lineno, plan.confidence), (11, 'manual'))
 
     def test_an_unchanged_book_is_fixed_in_place(self):
         lines = self._formulaic(n10=self.VERSE_A)
@@ -1026,6 +1046,79 @@ class TestApi(TempCase):
             'key': dbb[0]['key'], 'fingerprint': 'x', 'items': [{'id': 9}]})
         self.assertEqual(code, 400)
         self.assertEqual(res2['code'], 'db_book')
+
+    # -- keys from a request are never trusted as paths ---------------------
+
+    def test_crafted_file_key_cannot_leave_the_library(self):
+        secret = write(os.path.join(self.tmp, 'outside.txt'), 'סוד\n')
+        for key in ('file:../outside.txt', 'file:..\\outside.txt',
+                    'file:ספר שני/../../outside.txt'):
+            with self.subTest(key=key):
+                code, res = self.call(
+                    '/api/fixer/doc?key=' + urllib.request.quote(key))
+                self.assertEqual(code, 400)
+                self.assertEqual(res['code'], 'outside_library')
+                self.assertNotIn('lines', res)
+        self.assertFalse(os.path.exists(secret + '.magiah.lock'))
+
+    def test_local_key_for_an_unscanned_file_is_refused(self):
+        """A local key is an absolute path; one the review DB has no finding
+        for must not open (or lock, or write) any file at all."""
+        other = write(os.path.join(self.tmp, 'אחר', 'לא נסרק.txt'),
+                      'אמר רבי יותבת\n')
+        before = raw(other)
+        key = 'local:' + other
+        code, res = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
+        self.assertEqual(code, 400)
+        self.assertEqual(res['code'], 'not_scanned')
+        self.assertNotIn('lines', res)
+        code, res = self.call('/api/fixer/apply', {
+            'key': key, 'fingerprint': patcher.fingerprint(other),
+            'items': [{'id': 1}]})
+        self.assertNotEqual(code, 200)
+        self.assertEqual(raw(other), before)
+        self.assertEqual(os.listdir(os.path.dirname(other)), ['לא נסרק.txt'])
+
+    def test_local_key_for_a_scanned_file_still_works(self):
+        book = write(os.path.join(self.tmp, 'מקומי', 'ספר בודד.txt'),
+                     self.text)
+        # as a book scan writes it (book_source._load_file_book): the real
+        # path, which on macOS is /private/var/... for a /var/... temp dir
+        unit = 'local:%s:1' % os.path.realpath(book)
+        con = db.connect(self.outdir)
+        con.execute(
+            'INSERT INTO findings(id, family, errtype, word, suggestion, '
+            'rank, verified, origin, source, ref, unit, doc, snippet) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (7, 'error', 'edit1_sub', 'יותבת', 'יושבת', 5.0, 1, 'o',
+             'ספר בודד', 'r', unit, None,
+             scan_snippet(self.text.splitlines()[1], 'יותבת')))
+        con.execute("INSERT INTO review VALUES(7,'approved',NULL,NULL,'t')")
+        con.commit()
+        con.close()
+        key = patcher.book_key_of(unit)
+        code, doc = self.call('/api/fixer/doc?key=' + urllib.request.quote(key))
+        self.assertEqual(code, 200, doc)
+        self.assertEqual([i['id'] for i in doc['items']], [7])
+        self.assertEqual(os.path.normcase(doc['book']['path']),
+                         os.path.normcase(os.path.realpath(book)))
+        code, res = self.call('/api/fixer/apply', {
+            'key': key, 'fingerprint': doc['fingerprint'],
+            'items': [{'id': 7}]})
+        self.assertEqual(code, 200, res)
+        self.assertIn('יושבת', text_of(book))
+
+    def test_contained_path_guard(self):
+        inside = patcher.contained_path(
+            os.path.join(self.lib, 'a', '.', 'b.txt'), self.lib)
+        self.assertEqual(inside, os.path.normpath(
+            os.path.join(os.path.abspath(self.lib), 'a', 'b.txt')))
+        for bad in (os.path.join(self.lib, '..', 'x.txt'), self.lib,
+                    self.lib + 'x' + os.sep + 'y.txt'):
+            with self.subTest(path=bad):
+                with self.assertRaises(patcher.PatchError) as cm:
+                    patcher.contained_path(bad, self.lib)
+                self.assertEqual(cm.exception.code, 'outside_library')
 
 
 if __name__ == '__main__':

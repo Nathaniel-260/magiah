@@ -13,12 +13,16 @@ import re
 from datetime import datetime
 
 from . import hebrew
+from ..tanach import word_editions_text
 from .db import EFF, EXT_JOIN, JOINS, UNIT_ORDER, WORD_DECIDER
 
 # the first 8 columns are the old byte format; consumers reading by name or
 # by position keep working, the decision's provenance is appended
 FIXES_HEADER = ['word', 'suggestion', 'errtype', 'book', 'ref', 'line_id',
-                'origin', 'snippet', 'approved_suggestion', 'decided_by']
+                'origin', 'snippet', 'approved_suggestion', 'decided_by',
+                'edition']
+# the header before `edition` (the Tanach edition holding the word) existed
+_OLD_FIXES_HEADER = FIXES_HEADER[:10]
 OCC_HEADER = ['word', 'suggestion', 'unit', 'doc', 'source', 'ref', 'origin',
               'scope', 'decided_by']
 REPL_HEADER = ['word', 'suggestion', 'decided_by', 'updated_at']
@@ -38,6 +42,12 @@ DECIDER = f'''CASE
 # the suggestion as it was when approved (a re-scan may have changed it)
 APPROVED_FIX = ("COALESCE(NULLIF(r.custom_suggestion, ''), "
                 "x.approved_suggestion, f.suggestion, '')")
+# the correction a row shows: what was approved while it stands approved,
+# else the current one (a stale approval keeps its old approved_suggestion
+# in review_ext, but the row now proposes something else and is pending)
+SHOWN_FIX = (f"CASE WHEN {EFF} IN ('approved', 'fixed') THEN {APPROVED_FIX} "
+             "ELSE COALESCE(NULLIF(r.custom_suggestion, ''), f.suggestion, "
+             "'') END")
 ACTOR_HEBREW = {'human': 'אדם', 'agent': 'סוכן', 'unknown': 'לא ידוע'}
 
 # Excel sheet names: max 31 chars, no : \ / ? * [ ]
@@ -77,7 +87,7 @@ def _own_old_file(path):
             head = next(csv.reader(f), None)
     except (OSError, UnicodeDecodeError):
         return False
-    return head in (FIXES_HEADER, FIXES_HEADER[:8])
+    return head in (FIXES_HEADER, _OLD_FIXES_HEADER, FIXES_HEADER[:8])
 
 
 def export_fixes(con, outdir):
@@ -103,12 +113,15 @@ def export_fixes(con, outdir):
                COALESCE(f.ref, ''), COALESCE(f.unit, ''),
                COALESCE(f.origin, ''), COALESCE(f.snippet, ''),
                {APPROVED_FIX},
-               {DECIDER}
+               {DECIDER}, f.extra
         FROM findings f {JOINS} {EXT_JOIN}
         WHERE {EFF} IN ('approved', 'fixed')
         ORDER BY COALESCE(f.origin, ''), f.source,
                  ''' + UNIT_ORDER.format(u='f.unit') + '''
         ''').fetchall()
+    # a Tanach edition finding names the edition to correct (its line id is
+    # the primary text's, shared by every edition of the verse)
+    fixes = [(*r[:-1], word_editions_text(r[-1])) for r in fixes]
     # every file this export is responsible for, written or not (a file
     # locked in Excel is still ours and must stay in the manifest)
     locked, written = [], set()
@@ -162,7 +175,12 @@ def export_fixes(con, outdir):
                COALESCE((SELECT f.source FROM findings f
                          WHERE f.doc = b.doc LIMIT 1),
                         CASE WHEN b.doc LIKE 'src:%'
-                             THEN substr(b.doc, 5) ELSE '' END),
+                             THEN substr(b.doc, 5)
+                             WHEN b.doc LIKE 'line:%'
+                             THEN (SELECT f.source FROM findings f
+                                   WHERE f.unit = substr(b.doc, 6)
+                                     AND COALESCE(f.doc, '') = '' LIMIT 1)
+                             ELSE '' END, ''),
                COALESCE(b.decided_by, 'unknown'), b.updated_at
         FROM book_rules b WHERE b.status = 'not_error'
         ORDER BY b.doc, b.word''').fetchall()
@@ -209,13 +227,13 @@ def export_fixes(con, outdir):
 
 MAIN_HEADERS = ['ספר', 'מראה מקום', 'סוג שגיאה', 'המילה במקור',
                 'הצעת תיקון', 'ציון', 'מאומת', 'סטטוס', 'הערה',
-                'קטע מהטקסט', 'מזהה שורה', 'הוחלט ע״י']
+                'קטע מהטקסט', 'מזהה שורה', 'הוחלט ע״י', 'מהדורה']
 
 _ROW_SQL = f'''
     SELECT f.source, f.ref, f.errtype, f.word,
-           {APPROVED_FIX},
+           {SHOWN_FIX},
            f.rank, f.verified, {EFF}, r.note, f.snippet, f.unit,
-           {DECIDER}
+           {DECIDER}, x.flag, f.extra
     FROM findings f {JOINS} {EXT_JOIN}
     WHERE f.origin = ?'''
 
@@ -227,9 +245,12 @@ def _fmt_row(r, with_errtype=True):
     out += [r[3] or '', r[4] or '',
             r[5] if r[5] is not None else '',
             'כן' if r[6] else '',
-            hebrew.status_hebrew(r[7]),
+            hebrew.status_hebrew(r[7]) + (
+                ' — ' + hebrew.MESSAGES['stale_mark']
+                if r[12] == 'stale_approval' and r[7] == 'pending' else ''),
             r[8] or '', r[9] or '', r[10] or '',
-            ACTOR_HEBREW.get(r[11], r[11] or '')]
+            ACTOR_HEBREW.get(r[11], r[11] or ''),
+            word_editions_text(r[13])]
     return out
 
 

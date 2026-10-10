@@ -171,9 +171,24 @@ def _resolve_book(con, outdir, key, rows):
     distinct root compared once: a book of thousands of rows is resolved on
     every page load, and comparing paths touches the disk (over a network
     share, slowly)."""
-    if not key.startswith('file:'):
-        kind, path = patcher.resolve_key(key)
+    if key.startswith('local:'):
+        # A local key names an absolute path, and the request is no
+        # authority on which files may be read or written: only a book that
+        # was actually scanned (the review DB holds findings for it) is
+        # accepted, and its path is taken from the DB's own unit, never
+        # from the key the request sent.
+        unit = db.find_book_unit(con, key)
+        if unit is None:
+            raise patcher.PatchError('not_scanned')
+        kind, path, _ln = patcher.resolve_unit(unit)
         return kind, path, None
+    if not key.startswith('file:'):
+        # neither a library file nor a scanned local one: refused exactly as
+        # patcher.resolve_key refuses it, without resolving anything
+        if ':' not in key:
+            raise patcher.PatchError(
+                'bad_unit', hebrew.FIXER_MESSAGES['bad_unit'].format(unit=key))
+        raise patcher.PatchError('db_book')
     configured = os.path.abspath(_library_dir(outdir) or DEFAULT_LIBRARY)
     by_scope = {}
     for row in rows:
@@ -194,8 +209,7 @@ def _resolve_book(con, outdir, key, rows):
     if len(roots) > 1 or not _same_root(root, configured):
         raise patcher.PatchError('source_mismatch', recorded=root,
                                  configured=configured)
-    kind, path = patcher.resolve_key(key, root)
-    return kind, path, root
+    return 'library', patcher.resolve_file_key(key, root), root
 
 
 def _conflicts(outdir, path):
@@ -249,10 +263,12 @@ def doc(con, outdir, q):
                                origin=q.get('origin'))
 
     if key.startswith('db:'):
-        # a book with no file: the worklist is still useful for export
+        # a book with no file (its units name no file, so no item matches
+        # the key): the page explains why nothing is listed or editable
         return {'book': {'key': key, 'editable': False, 'kind': 'db'},
                 'editable': False, 'items': items, 'lines': [],
-                'line_count': 0, 'message': hebrew.FIXER_MESSAGES['db_book']}
+                'line_count': 0,
+                'message': hebrew.FIXER_MESSAGES['db_book_view']}
 
     _kind, path, _root = _resolve_book(con, outdir, key, items)
     # never wait on a busy file just to draw a page; a writer settles it
@@ -320,20 +336,41 @@ def _write_journaled(outdir, rec, path, data_before, data_after):
     is provably untouched; otherwise it stays open for :func:`journal.recover`.
     """
     fp_before = patcher.fingerprint_bytes(data_before)
+    # A writer that stalled past the lock's stale age may have lost its lock
+    # to another one, who wrote: never replace the book over that write.
+    journal.assert_held(path)
+    if patcher.fingerprint_bytes(patcher.read_bytes(path)) != fp_before:
+        raise patcher.PatchError('file_changed')
     bpath, bsha = patcher.write_backup(outdir, path, data_before)
-    jid = journal.begin(outdir, dict(
-        rec, path=path, backup=bpath, backup_sha=bsha, fp_before=fp_before,
-        fp_after=patcher.fingerprint_bytes(data_after)))
+    try:
+        jid = journal.begin(outdir, dict(
+            rec, path=path, backup=bpath, backup_sha=bsha,
+            fp_before=fp_before,
+            fp_after=patcher.fingerprint_bytes(data_after)))
+    except BaseException:
+        _drop_backup(bpath)             # no intent names it: nothing wrote
+        raise
     try:
         patcher.atomic_write(path, data_after)
     except BaseException:
         try:
             if patcher.fingerprint(path) == fp_before:
                 journal.finish(outdir, jid, 'aborted')
+                # the book is provably untouched and the intent is closed:
+                # the backup backs up nothing (a locked or read-only book
+                # would otherwise leave one per attempt)
+                _drop_backup(bpath)
         except OSError:
             pass
         raise
     return jid, bpath, bsha
+
+
+def _drop_backup(bpath):
+    try:
+        os.remove(bpath)
+    except OSError:
+        traceback.print_exc()
 
 
 def _settle_or_refuse(con, outdir, path):
@@ -426,8 +463,10 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
     # inside its own correction and apply it twice.
     recorded = db.get_live_edit_entries(con, key)
     _mark_trusted(con, list(rows.values()), fdoc.fingerprint, len(data))
-    already = sorted(fid for fid in by_id if fid in recorded
-                     and patcher.entry_in_place(fdoc, recorded[fid]))
+    # located once, by content (lines may have moved since the write)
+    own = patcher._located(fdoc, list(recorded.values()))
+    where = {e.get('id'): at for e, at in own}
+    already = sorted(fid for fid in by_id if where.get(fid) is not None)
 
     findings, modes, explicit = [], {}, {}
     for fid, r in by_id.items():
@@ -447,6 +486,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
             'snippet': row.get('snippet'),
             'occurrence': ref.get('occurrence', 0),
             'expected_count': ref.get('expected_count'),
+            'errtype': row.get('errtype'),
             'trusted': row.get('trusted', False)})
         if r.get('mode') in patcher.MODES:
             modes[fid] = r['mode']
@@ -458,7 +498,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
 
     plans, failures = patcher.plan_all(fdoc, findings, default_mode,
                                        modes, explicit,
-                                       own_edits=list(recorded.values()))
+                                       own_edits=own)
     if failures:
         # nothing is written when anything is in doubt
         return {'ok': False, 'failed': failures,
@@ -501,7 +541,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
                    backup=bpath, fingerprint=fp_after)
     else:
         out['message'] = hebrew.FIXER_MESSAGES['already_applied'].format(
-            n=recorded[already[0]]['lineno'] + 1)
+            n=where[already[0]][0] + 1)
     if mark_fixed:
         try:
             # custom corrections are persisted per finding so the file and the
@@ -555,7 +595,10 @@ def undo_file(con, outdir, body):
             # changed since (or no usable backup): put back only the recorded
             # spans, each verified in place, so later changes survive
             fdoc = patcher.doc_from_bytes(path, data)
-            patcher.reverse_entries(fdoc, rec.get('detail') or [])
+            mine = rec.get('detail') or []
+            others = [e for e in db.get_live_edit_entries(
+                con, rec['book_key']).values() if e not in mine]
+            patcher.reverse_entries(fdoc, mine, others)
             restored = fdoc.encode()
         ids = rec['finding_ids']
         jid, _b, _s = _write_journaled(outdir, {

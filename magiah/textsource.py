@@ -30,6 +30,7 @@ witnesses by default — they are usually another digitisation of the same
 edition — and scanning them would double-count words in the lexicon. They are
 therefore excluded unless explicitly requested, and the exclusion is counted.
 """
+import contextlib
 import os
 import sqlite3
 import urllib.parse
@@ -37,6 +38,28 @@ import urllib.parse
 
 class TextSourceError(Exception):
     """The database cannot be read as an Otzaria text source (Hebrew)."""
+
+
+def db_error_message(path, err):
+    """Hebrew text for a database that failed while being read (`path`
+    may be '' when it is not known)."""
+    what = f'מסד הנתונים {path}' if path else 'מסד נתונים'
+    return (f'שגיאה בקריאת {what}: {err}\n'
+            'ייתכן שהקובץ פגום (למשל הורדה שנקטעה או תקלת דיסק) או תפוס '
+            'בתוכנה אחרת. יש לתקן או להוריד אותו מחדש ולהריץ שוב. '
+            'התוצרים הקודמים לא שונו.')
+
+
+@contextlib.contextmanager
+def db_read_errors(path):
+    """Turn a ``sqlite3.DatabaseError`` met while reading `path` ("database
+    disk image is malformed" from a damaged page, often only deep inside a
+    worker's chunk) into a TextSourceError with a Hebrew message — the
+    error the CLI and the UI report without a traceback."""
+    try:
+        yield
+    except sqlite3.DatabaseError as e:
+        raise TextSourceError(db_error_message(path, e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +84,12 @@ def _make_decoder(dict_bytes):
             'מסד הנתונים דחוס ב-zstd, ואין בסביבה מפענח zstd.\n'
             'יש להתקין את החבילה zstandard (pip install zstandard) '
             'או להשתמש ב-Python 3.14 ומעלה.')
-    dctx = _zs.ZstdDecompressor(dict_data=_zs.ZstdCompressionDict(dict_bytes))
+    # a full dictionary (magic number + entropy tables), as compression.zstd
+    # requires: under the default DICT_TYPE_AUTO, bytes that are no
+    # dictionary at all were taken as raw content, the database opened, and
+    # every row then failed to decode one by one instead of the open failing
+    dctx = _zs.ZstdDecompressor(dict_data=_zs.ZstdCompressionDict(
+        dict_bytes, dict_type=_zs.DICT_TYPE_FULLDICT))
 
     def decode(data):
         # frames carry their content size; max_output_size guards the rare
@@ -269,7 +297,9 @@ class OtzariaDB:
 
     # -- enumeration ---------------------------------------------------------
     def id_range(self):
-        return self.con.execute('SELECT MIN(id), MAX(id) FROM line').fetchone()
+        with db_read_errors(self.path):
+            return self.con.execute(
+                'SELECT MIN(id), MAX(id) FROM line').fetchone()
 
     def iter_range(self, lo, hi, stats, book_ids_sql=None, params=()):
         """Yield ``(line_id, book_id, text)`` for ``lo <= id < hi``.
@@ -286,10 +316,11 @@ class OtzariaDB:
             # through it, every chunk walked the lines of every selected book
             sql += f' AND +l.bookId IN ({book_ids_sql})'
             args.extend(params)
-        for lid, bid, raw, present in self.con.execute(sql, args):
-            text = self._decode_counted(lid, raw, stats, present)
-            if text is not None:
-                yield lid, bid, text
+        with db_read_errors(self.path):
+            for lid, bid, raw, present in self.con.execute(sql, args):
+                text = self._decode_counted(lid, raw, stats, present)
+                if text is not None:
+                    yield lid, bid, text
 
     def book_lines(self, book_id, stats=None):
         """``[(line_id, heRef, text)]`` of one book in reading order."""
@@ -302,10 +333,11 @@ class OtzariaDB:
             sql = ('SELECT l.id, l.heRef, l.content, 1 FROM line l '
                    'WHERE l.bookId = ? ORDER BY l.lineIndex, l.id')
         out = []
-        for lid, ref, raw, present in self.con.execute(sql, (book_id,)):
-            text = self._decode_counted(lid, raw, stats, present)
-            if text is not None:
-                out.append((lid, ref or '', text))
+        with db_read_errors(self.path):
+            for lid, ref, raw, present in self.con.execute(sql, (book_id,)):
+                text = self._decode_counted(lid, raw, stats, present)
+                if text is not None:
+                    out.append((lid, ref or '', text))
         return out
 
     def line_texts(self, line_ids, stats=None):
@@ -313,14 +345,15 @@ class OtzariaDB:
         stats = stats if stats is not None else ReadStats()
         out = {}
         ids = list(line_ids)
-        for i in range(0, len(ids), 500):
-            batch = ids[i:i + 500]
-            ph = ','.join('?' * len(batch))
-            for lid, _bid, raw, present in self.con.execute(
-                    self._text_sql + f' WHERE l.id IN ({ph})', batch):
-                text = self._decode_counted(lid, raw, stats, present)
-                if text is not None:
-                    out[lid] = text
+        with db_read_errors(self.path):
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i + 500]
+                ph = ','.join('?' * len(batch))
+                for lid, _bid, raw, present in self.con.execute(
+                        self._text_sql + f' WHERE l.id IN ({ph})', batch):
+                    text = self._decode_counted(lid, raw, stats, present)
+                    if text is not None:
+                        out[lid] = text
         return out
 
     def describe_lines(self, line_ids):
@@ -328,14 +361,15 @@ class OtzariaDB:
         the user which rows could not be read (an id alone says nothing)."""
         out = {}
         ids = list(line_ids)
-        for i in range(0, len(ids), 500):
-            batch = ids[i:i + 500]
-            ph = ','.join('?' * len(batch))
-            for lid, title, ref in self.con.execute(
-                    'SELECT l.id, b.title, l.heRef FROM line l '
-                    f'LEFT JOIN book b ON b.id = l.bookId WHERE l.id IN ({ph})',
-                    batch):
-                out[lid] = (title or '', ref or '')
+        with db_read_errors(self.path):
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i + 500]
+                ph = ','.join('?' * len(batch))
+                for lid, title, ref in self.con.execute(
+                        'SELECT l.id, b.title, l.heRef FROM line l '
+                        'LEFT JOIN book b ON b.id = l.bookId '
+                        f'WHERE l.id IN ({ph})', batch):
+                    out[lid] = (title or '', ref or '')
         return out
 
     def count_version_lines(self, lo=None, hi=None, book_ids_sql=None,
@@ -360,22 +394,24 @@ class OtzariaDB:
             conds.append(f'+l.bookId IN ({book_ids_sql})')
             args.extend(params)
         sql += ' WHERE ' + ' AND '.join(conds)
-        return self.con.execute(sql, args).fetchone()[0]
+        with db_read_errors(self.path):
+            return self.con.execute(sql, args).fetchone()[0]
 
     def iter_version_range(self, lo, hi, stats):
         """Yield ``(version_id, line_id, book_id, text)`` for version rows
         with their own reading, ``lo <= line_id < hi``."""
         if not self.has_versions:
             return
-        for vid, lid, bid, raw in self.con.execute(
-                'SELECT v.versionId, v.lineId, l.bookId, v.content '
-                'FROM version_line v JOIN line l ON l.id = v.lineId '
-                'WHERE v.lineId >= ? AND v.lineId < ? '
-                'AND v.content IS NOT NULL', (lo, hi)):
-            text = self._decode_counted(f'ver:{vid}:{lid}', raw, stats)
-            if text is not None:
-                stats.version_lines += 1
-                yield vid, lid, bid, text
+        with db_read_errors(self.path):
+            for vid, lid, bid, raw in self.con.execute(
+                    'SELECT v.versionId, v.lineId, l.bookId, v.content '
+                    'FROM version_line v JOIN line l ON l.id = v.lineId '
+                    'WHERE v.lineId >= ? AND v.lineId < ? '
+                    'AND v.content IS NOT NULL', (lo, hi)):
+                text = self._decode_counted(f'ver:{vid}:{lid}', raw, stats)
+                if text is not None:
+                    stats.version_lines += 1
+                    yield vid, lid, bid, text
 
     def identity(self):
         """What a run must record to be reproducible against this input."""

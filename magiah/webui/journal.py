@@ -27,6 +27,11 @@ server is threaded) plus a ``<book>.magiah.lock`` file created with O_EXCL,
 which also excludes a second server process. The holder refreshes the lock
 file's mtime; one untouched for ``STALE_LOCK_SECONDS`` is a leftover from a
 crash and is broken (renamed away first, so two breakers cannot both win).
+Its age is judged by this machine's clock and by the filesystem's own, so a
+share whose clock runs behind never makes a live lock look dead. The lock
+file carries its holder's token: a holder that stalled past the stale age
+checks it still owns the lock (and that the book is unchanged) right
+before it replaces the book, and never removes a lock that is not its own.
 """
 import json
 import os
@@ -52,7 +57,7 @@ COMPACT_BYTES = 256 * 1024
 TERMINAL = ('committed', 'aborted', 'conflict')
 
 _guard = threading.Lock()
-_locks = {}                      # _key(path) -> [RLock, depth, stop]
+_locks = {}              # _key(path) -> [RLock, depth, stop, lock token]
 
 
 def _key(path):
@@ -78,18 +83,48 @@ def _busy():
     return patcher.PatchError('file_busy', patcher._msg('file_busy'))
 
 
+def _server_now(folder):
+    """The current time by the clock of the filesystem holding `folder`: the
+    mtime of a file created there just now. A lock file's mtime is stamped
+    by that clock, and on a network share it may run minutes apart from
+    this machine's; None when nothing can be created there."""
+    probe = os.path.join(folder, '.magiah-clock.%s.tmp' % uuid.uuid4().hex)
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return None
+    try:
+        os.close(fd)
+        return os.path.getmtime(probe)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+
 def _break_if_stale(lf):
     """Remove a dead holder's lock file; True when it is gone. Any failure
-    just means 'still busy'."""
+    just means 'still busy'.
+
+    Stale means untouched for STALE_LOCK_SECONDS by BOTH clocks: this
+    machine's and the filesystem's own (see _server_now), so a share whose
+    clock runs behind ours never makes a live holder's lock look dead."""
+    folder = os.path.dirname(lf) or '.'
     try:
         if time.time() - os.path.getmtime(lf) <= STALE_LOCK_SECONDS:
+            return False
+        now = _server_now(folder)
+        if now is None or now - os.path.getmtime(lf) <= STALE_LOCK_SECONDS:
             return False
         aside = '%s.%s.stale' % (lf, uuid.uuid4().hex)
         os.rename(lf, aside)
     except OSError:
         return False
     try:
-        if time.time() - os.path.getmtime(aside) <= STALE_LOCK_SECONDS:
+        if now - os.path.getmtime(aside) <= STALE_LOCK_SECONDS:
             # a live holder re-created it between our check and the rename
             if not os.path.exists(lf):
                 os.rename(aside, lf)
@@ -100,11 +135,32 @@ def _break_if_stale(lf):
     return True
 
 
+def _folder_accepts_files(folder):
+    """Can a new file be created in `folder`? Asked only after the lock
+    file itself was refused while absent: on FAT and on some shares a lock
+    file being deleted by its holder is reported that way too, which is
+    contention, not a folder that refuses files."""
+    probe = os.path.join(folder, '.magiah-probe.%s.tmp' % uuid.uuid4().hex)
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
 def _acquire_lock_file(lf, deadline):
+    """Create the lock file; returns the token written into it (None when
+    the book's folder is gone and there is nothing to guard)."""
     folder = os.path.dirname(lf) or '.'
     if not os.path.isdir(folder):
-        return                        # the book's folder is gone: nothing to guard
+        return None
     denied = retried = False
+    token = uuid.uuid4().hex
     while True:
         try:
             fd = os.open(lf, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -113,21 +169,30 @@ def _acquire_lock_file(lf, deadline):
         except PermissionError:
             # Windows reports a lock file that is being deleted ("delete
             # pending") this way: busy, not fatal. With no lock file there at
-            # all, the folder itself refuses new files, and no amount of
-            # waiting helps: say so at once rather than "busy, try again".
+            # all, the folder itself may refuse new files, and no amount of
+            # waiting helps: say so at once rather than "busy, try again" —
+            # once a file of another name proves it (FAT reports a lock that
+            # is being deleted as refused and already gone).
             if not os.path.lexists(lf):
-                if denied:
+                if denied and not _folder_accepts_files(folder):
                     raise patcher.denied_folder(folder)
                 denied = True         # a pending delete may just have ended
+                if time.time() >= deadline:
+                    raise _busy()
                 time.sleep(0.05)
                 continue
+        except OSError as e:
+            if patcher.name_too_long(lf):
+                raise patcher.denied_long(lf) from e
+            raise
         else:
             try:
                 os.write(fd, json.dumps({'pid': os.getpid(),
-                                         'ts': time.time()}).encode('ascii'))
+                                         'ts': time.time(),
+                                         'token': token}).encode('ascii'))
             finally:
                 os.close(fd)
-            return
+            return token
         if _break_if_stale(lf) and not retried:
             # a dead holder's lock is gone: take it now, even past the
             # deadline — a page load has no time to wait at all, and would
@@ -137,6 +202,31 @@ def _acquire_lock_file(lf, deadline):
         if time.time() >= deadline:
             raise _busy()
         time.sleep(0.05)
+
+
+def _lock_token(lf):
+    try:
+        with open(lf, 'rb') as f:
+            return json.loads(f.read().decode('ascii')).get('token')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def assert_held(path):
+    """Refuse (``file_busy``) unless this thread's lock on `path` is still
+    the lock file on disk.
+
+    A holder that stalls past STALE_LOCK_SECONDS (a suspended laptop, a
+    frozen share) looks dead, and another writer may break its lock and
+    write. Checked right before a replace, this keeps the woken holder from
+    writing over that work; the writer re-checks the fingerprint too."""
+    entry = _locks.get(_key(path))
+    if entry is None or entry[1] <= 0:
+        raise _busy()
+    if entry[3] is None:
+        return                         # the folder was gone: nothing guarded
+    if _lock_token(path + LOCK_SUFFIX) != entry[3]:
+        raise _busy()
 
 
 def _keep_fresh(lf, stop):
@@ -152,7 +242,7 @@ def file_lock(path, timeout=LOCK_TIMEOUT):
     """Exclusive access to one book file; re-entrant within a thread."""
     k = _key(path)
     with _guard:
-        entry = _locks.setdefault(k, [threading.RLock(), 0, None])
+        entry = _locks.setdefault(k, [threading.RLock(), 0, None, None])
     deadline = time.time() + timeout
     got = (entry[0].acquire(blocking=False) if timeout <= 0
            else entry[0].acquire(timeout=timeout))
@@ -161,7 +251,7 @@ def file_lock(path, timeout=LOCK_TIMEOUT):
     lf = path + LOCK_SUFFIX
     try:
         if entry[1] == 0:
-            _acquire_lock_file(lf, deadline)
+            entry[3] = _acquire_lock_file(lf, deadline)
             entry[2] = threading.Event()
             threading.Thread(target=_keep_fresh, args=(lf, entry[2]),
                              daemon=True).start()
@@ -172,10 +262,14 @@ def file_lock(path, timeout=LOCK_TIMEOUT):
             entry[1] -= 1
             if entry[1] == 0:
                 entry[2].set()
-                try:
-                    os.remove(lf)
-                except OSError:
-                    pass
+                # never remove a lock file that is no longer ours: if ours
+                # was broken while we stalled, it is another writer's now
+                if entry[3] is not None and _lock_token(lf) == entry[3]:
+                    try:
+                        os.remove(lf)
+                    except OSError:
+                        pass
+                entry[3] = None
     finally:
         entry[0].release()
 
@@ -199,7 +293,14 @@ def _journal_locked(outdir):
 def _append(outdir, rec):
     line = (json.dumps(rec, ensure_ascii=False) + '\n').encode('utf-8')
     with _journal_locked(outdir) as p:
-        with open(p, 'ab') as f:
+        with open(p, 'ab+') as f:
+            # A crash mid-append leaves a torn last line with no newline.
+            # Appended straight after it, this record would share its line
+            # and be skipped as unreadable along with it: start a new line.
+            if f.seek(0, os.SEEK_END) > 0:
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b'\n':
+                    line = b'\n' + line
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
@@ -378,8 +479,15 @@ def recover(con, outdir, path=None, wait=True):
             with file_lock(p, timeout=LOCK_TIMEOUT if wait else 0):
                 try:
                     fp = patcher.fingerprint(p)
-                except OSError:
-                    fp = None
+                except FileNotFoundError:
+                    fp = None             # the book is gone: a conflict
+                except OSError as e:
+                    # locked for a moment (an editor or an antivirus has it
+                    # open) or the share hiccuped: the hash is unknown, not
+                    # different. Settle it on a later access; recorded now it
+                    # would be a permanent conflict about a book that may
+                    # well hold exactly the planned result.
+                    raise patcher.denied_file(p) from e
                 if fp is not None and _landed(order, i, last, fp):
                     extra['edit_id'] = complete(con, outdir, rec)
                     state = 'committed'

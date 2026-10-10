@@ -665,8 +665,9 @@ class TestGeresh(TempCase):
 class TestKetivQere(TempCase):
     """'(x) [word]' is the layout of the fixer's bracket mode AND of a plain
     ketiv/qere pair, and the text cannot tell them apart (a ketiv may even be
-    the very correction). History does: a record of the fixer's edit, or the
-    layout already being in the scan's snippet."""
+    the very correction, and a custom correction can be anything). History
+    tells some: a record of the fixer's edit, or the layout missing from the
+    scan's snippet. Without either, only a human click writes there."""
     LINE = 'ויצא (הנער) [הנערח] אל השדה ותקח את הכד'
 
     def bracketed(self, orig, word, corr, lineno=0):
@@ -678,9 +679,19 @@ class TestKetivQere(TempCase):
         patcher.apply_edits(d, [plan])
         return d, f, plan.to_dict()
 
-    def test_a_typo_in_the_qere_is_corrected(self):
+    def test_a_typo_in_the_qere_needs_a_click(self):
+        """No record explains the pair: it may be the fixer's own output
+        with a custom correction, scanned again in a new folder. Refused,
+        with the word offered; a click corrects it."""
         d = self.doc(self.LINE)
-        plan = patcher.plan_edit(d, finding(self.LINE, 'הנערח', 'הנערה'))
+        f = finding(self.LINE, 'הנערח', 'הנערה')
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.plan_edit(d, f)
+        self.assertEqual(cm.exception.code, 'bracket_unproven')
+        self.assertEqual(cm.exception.extra['located_line'], 0)
+        self.assertEqual(patcher.manual_lines(d, f), [0])
+        a, b = normalize.phrase_spans(self.LINE, 'הנערח')[0][1:]
+        plan = patcher.plan_edit(d, f, explicit=(a, b))
         patcher.apply_edits(d, [plan])
         self.assertEqual(d.lines[0],
                          'ויצא (הנער) [הנערה] אל השדה ותקח את הכד')
@@ -1081,8 +1092,15 @@ class TestIdempotency(FixerEnv):
         self.add(3, 'הנערח', 'הנערה', self.key + ':3',
                  scan_snippet(line, 'הנערח'))
         res, code = self.apply(self.key, [{'id': 3}])
+        self.assertEqual(code, 409, res)
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['bracket_unproven'])
+        a = line.index('הנערח')
+        res, code = self.apply(self.key, [{
+            'id': 3, 'explicit_start': a, 'explicit_end': a + 5,
+            'explicit_lineno': 3}])
         self.assertEqual(code, 200, res)
-        self.assertEqual(res['applied'][0]['confidence'], 'exact')
+        self.assertEqual(res['applied'][0]['confidence'], 'manual')
         self.assertEqual(raw(self.path).decode('utf-8').splitlines()[3],
                          'ויצא (הנער) [הנערה] אל השדה')
 
@@ -1282,8 +1300,14 @@ class TestBracketHistory(Env):
     def bracket_the_plain_line(self):
         ids = self.scan()
         self.assertEqual(sorted(ids), [1, 2])
-        # the book's own ketiv/qere: corrected like any word
+        # the book's own ketiv/qere: corrected where a human points
         res, code = self.apply(self.key, [{'id': ids[1]}])
+        self.assertEqual([f['code'] for f in res['failed']],
+                         ['bracket_unproven'])
+        a = self.KQ.index('הנערח')
+        res, code = self.apply(self.key, [{
+            'id': ids[1], 'explicit_start': a, 'explicit_end': a + 5,
+            'explicit_lineno': 1}])
         self.assertEqual(code, 200, res)
         self.assertEqual(self.lines()[1],
                          'ויצא (הנער) [הנערה] אל השדה ותקח את הכד')
@@ -1640,9 +1664,13 @@ class TestLockRobustness(FixerEnv):
     def _folder_refuses_new_files(self):
         from magiah.webui import journal
         real_open = journal.os.open
+        folder = os.path.normcase(os.path.abspath(self.lib))
 
         def denied(path, *a, **kw):
-            if path.endswith(journal.LOCK_SUFFIX):
+            # no new file of any name: a lock file alone being refused is
+            # one that is being deleted (test_fixer_followups)
+            if os.path.normcase(os.path.dirname(os.path.abspath(path))) \
+                    == folder:
                 raise PermissionError(13, 'Access is denied', path)
             return real_open(path, *a, **kw)
         journal.os.open = denied
