@@ -46,7 +46,7 @@ from fractions import Fraction
 from urllib.parse import urlsplit
 
 from .normalize import TOKEN_RE, clean
-from .textsource import OtzariaDB, ReadStats
+from .textsource import OtzariaDB, ReadStats, db_read_errors
 
 # --- thresholds --------------------------------------------------------------
 MIN_CONTEXT = 5            # aligned context tokens around the word
@@ -430,13 +430,21 @@ class TanachIndex:
         idx = cls()
         if stats is not None:
             idx.stats = stats
-        with OtzariaDB(db_path) as odb:
+        with OtzariaDB(db_path) as odb, db_read_errors(db_path):
             idx._build(odb)
         return idx
 
     def edition_label(self, eid):
         e = self.editions[eid]
         return e['version_title'] or f"{e['title']} ({e['source']})"
+
+    def edition_ref(self, eid):
+        """Where an edition's text lives in seforim.db: its label, the book
+        and - for an alternative version - the ``book_version`` id. The
+        primary text of a book has no version id (``version_id`` None)."""
+        e = self.editions[eid]
+        return {'edition': self.edition_label(eid), 'book_id': e['book_id'],
+                'version_id': e['version_id']}
 
     def _build(self, odb):
         con = odb.con
@@ -764,9 +772,10 @@ class TanachIndex:
         Location: `unit` is the PRIMARY text's line id, which is also the
         ``lineId`` of every version's row for that verse; `snippet` is the
         minority edition's own text. When the minority is a version, `word`
-        is in that version (named by `minority_editions` / `readings` in the
-        evidence), not in the primary line, so an exported fix row names the
-        right line but not the edition to correct. Unresolved rows carry no
+        is in that version, not in the primary line: `word_editions` in the
+        evidence names each edition whose text holds `word` (label, book id,
+        ``book_version`` id - None for a book's primary text), and the
+        exports carry it (:func:`word_editions_text`). Unresolved rows carry no
         canonical reading (empty suggestion): they inform, nobody is
         outvoted. Neither can be applied by the fixer, which does not edit
         database books."""
@@ -777,11 +786,16 @@ class TanachIndex:
             return ' '.join(t if t is not None else '_'
                             for t in verse.readings[g])
 
-        def unresolved(verse, pos, word, reason, readings, extra=None):
+        def holding(verse, by, word):
+            return [e for g in by.get(word, ()) for e in verse.members[g]]
+
+        def unresolved(verse, pos, word, reason, readings, holders,
+                       extra=None):
             st[reason] += 1
             d = {'evidence_kind': EDITION_UNRESOLVED, 'reason': reason,
                  'ref': verse.ref, 'verse_line': verse.line_id,
-                 'readings': readings}
+                 'readings': readings,
+                 'word_editions': [self.edition_ref(e) for e in holders]}
             d.update(extra or {})
             rows.append((str(verse.line_id), word, '',
                          ' '.join(verse.toks),
@@ -806,7 +820,7 @@ class TanachIndex:
                 other = next((t for t, _ in ranked if t != prim), ranked[1][0])
                 if pos in verse.kq:
                     unresolved(verse, pos, other, 'qere_ketiv',
-                               labels(verse, by))
+                               labels(verse, by), holding(verse, by, other))
                     continue
                 if len(maj_g) < MIN_INDEPENDENT or \
                         len(ranked[1][1]) == len(maj_g):
@@ -815,15 +829,17 @@ class TanachIndex:
                         else 'no_majority'
                     if any(plene_equal(maj, m) for m, _ in ranked[1:]):
                         st['unresolved_plene'] += 1
-                    unresolved(verse, pos, other, reason, labels(verse, by))
+                    unresolved(verse, pos, other, reason, labels(verse, by),
+                               holding(verse, by, other))
                     continue
                 for m, mg in ranked[1:]:
                     if plene_equal(m, maj):
-                        unresolved(verse, pos, m, 'plene', labels(verse, by))
+                        unresolved(verse, pos, m, 'plene', labels(verse, by),
+                                   holding(verse, by, m))
                         continue
                     if not within2(m, maj):
                         unresolved(verse, pos, m, 'unrelated',
-                                   labels(verse, by))
+                                   labels(verse, by), holding(verse, by, m))
                         continue
                     for g in mg:
                         st['reported'] += 1
@@ -835,6 +851,10 @@ class TanachIndex:
                         d['minority_source'] = g
                         d['minority_editions'] = [
                             self.edition_label(e) for e in verse.members[g]]
+                        # where `m` is to be corrected: the version (or
+                        # primary text) of each minority edition
+                        d['word_editions'] = [
+                            self.edition_ref(e) for e in verse.members[g]]
                         rows.append((str(verse.line_id), m, maj,
                                      snippet_of(verse, g),
                                      json.dumps(d, ensure_ascii=False)))
@@ -844,8 +864,30 @@ class TanachIndex:
             word = next((t for t in by if t != prim), next(iter(by)))
             unresolved(verse, pos, word, 'intra_source',
                        {t: [self.edition_label(e) for e in eids]
-                        for t, eids in by.items()}, {'source': g})
+                        for t, eids in by.items()}, by[word], {'source': g})
         return rows, dict(st)
+
+
+def word_editions_text(evidence):
+    """The editions an edition-error row's word stands in, for an export
+    cell: "<label> (גרסה <id>)" for a ``book_version``, "<label> (טקסט
+    ראשי, ספר <id>)" for a book's primary text; '' when the evidence (JSON
+    or dict) names none - any other finding."""
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence) if evidence else None
+        except ValueError:
+            return ''
+    if not isinstance(evidence, dict):
+        return ''
+    out = []
+    for e in evidence.get('word_editions') or ():
+        if not isinstance(e, dict):
+            continue
+        where = (f"גרסה {e['version_id']}" if e.get('version_id') is not None
+                 else f"טקסט ראשי, ספר {e.get('book_id', '')}")
+        out.append(f"{e.get('edition', '')} ({where})")
+    return '; '.join(out)
 
 
 def build_index(db_path, stats=None):

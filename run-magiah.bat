@@ -47,6 +47,19 @@ if not defined PYEXE (
     exit /b 1
 )
 
+rem --- (3b) before Python 3.14 the compressed seforim.db needs the
+rem  zstandard package: install it once if it is missing ----------------
+%PYEXE% -c "import sys; sys.exit(0) if sys.version_info >= (3, 14) else __import__('zstandard')" >nul 2>&1
+if errorlevel 1 (
+    echo מתקין את החבילה zstandard - נדרשת לקריאת מסד הספרים של אוצריא...
+    %PYEXE% -m pip install "zstandard>=0.22"
+    if errorlevel 1 (
+        echo אזהרה: החבילה zstandard לא הותקנה, ולכן לא ניתן יהיה לקרוא את מסד הספרים הדחוס.
+        echo אפשר להתקין אותה ידנית: %PYEXE% -m pip install zstandard
+    )
+    echo.
+)
+
 echo פותח את הממשק בדפדפן...
 echo תיקיית הנתונים: %MAGIAH_OUT%
 echo לסגירה: סגרו חלון זה.

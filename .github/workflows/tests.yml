@@ -48,6 +48,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      # the zstd decoder before 3.14 (pyproject's dependency): without it the
+      # seforim.db reader is untested there and its tests are skipped
+      - run: pip install "zstandard>=0.22; python_version < '3.14'"
       - run: python -X utf8 -m unittest discover -s tests -v
 
   package:

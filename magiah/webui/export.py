@@ -13,12 +13,16 @@ import re
 from datetime import datetime
 
 from . import hebrew
+from ..tanach import word_editions_text
 from .db import EFF, EXT_JOIN, JOINS, UNIT_ORDER, WORD_DECIDER
 
 # the first 8 columns are the old byte format; consumers reading by name or
 # by position keep working, the decision's provenance is appended
 FIXES_HEADER = ['word', 'suggestion', 'errtype', 'book', 'ref', 'line_id',
-                'origin', 'snippet', 'approved_suggestion', 'decided_by']
+                'origin', 'snippet', 'approved_suggestion', 'decided_by',
+                'edition']
+# the header before `edition` (the Tanach edition holding the word) existed
+_OLD_FIXES_HEADER = FIXES_HEADER[:10]
 OCC_HEADER = ['word', 'suggestion', 'unit', 'doc', 'source', 'ref', 'origin',
               'scope', 'decided_by']
 REPL_HEADER = ['word', 'suggestion', 'decided_by', 'updated_at']
@@ -83,7 +87,7 @@ def _own_old_file(path):
             head = next(csv.reader(f), None)
     except (OSError, UnicodeDecodeError):
         return False
-    return head in (FIXES_HEADER, FIXES_HEADER[:8])
+    return head in (FIXES_HEADER, _OLD_FIXES_HEADER, FIXES_HEADER[:8])
 
 
 def export_fixes(con, outdir):
@@ -109,12 +113,15 @@ def export_fixes(con, outdir):
                COALESCE(f.ref, ''), COALESCE(f.unit, ''),
                COALESCE(f.origin, ''), COALESCE(f.snippet, ''),
                {APPROVED_FIX},
-               {DECIDER}
+               {DECIDER}, f.extra
         FROM findings f {JOINS} {EXT_JOIN}
         WHERE {EFF} IN ('approved', 'fixed')
         ORDER BY COALESCE(f.origin, ''), f.source,
                  ''' + UNIT_ORDER.format(u='f.unit') + '''
         ''').fetchall()
+    # a Tanach edition finding names the edition to correct (its line id is
+    # the primary text's, shared by every edition of the verse)
+    fixes = [(*r[:-1], word_editions_text(r[-1])) for r in fixes]
     # every file this export is responsible for, written or not (a file
     # locked in Excel is still ours and must stay in the manifest)
     locked, written = [], set()
@@ -220,13 +227,13 @@ def export_fixes(con, outdir):
 
 MAIN_HEADERS = ['ספר', 'מראה מקום', 'סוג שגיאה', 'המילה במקור',
                 'הצעת תיקון', 'ציון', 'מאומת', 'סטטוס', 'הערה',
-                'קטע מהטקסט', 'מזהה שורה', 'הוחלט ע״י']
+                'קטע מהטקסט', 'מזהה שורה', 'הוחלט ע״י', 'מהדורה']
 
 _ROW_SQL = f'''
     SELECT f.source, f.ref, f.errtype, f.word,
            {SHOWN_FIX},
            f.rank, f.verified, {EFF}, r.note, f.snippet, f.unit,
-           {DECIDER}, x.flag
+           {DECIDER}, x.flag, f.extra
     FROM findings f {JOINS} {EXT_JOIN}
     WHERE f.origin = ?'''
 
@@ -242,7 +249,8 @@ def _fmt_row(r, with_errtype=True):
                 ' — ' + hebrew.MESSAGES['stale_mark']
                 if r[12] == 'stale_approval' and r[7] == 'pending' else ''),
             r[8] or '', r[9] or '', r[10] or '',
-            ACTOR_HEBREW.get(r[11], r[11] or '')]
+            ACTOR_HEBREW.get(r[11], r[11] or ''),
+            word_editions_text(r[13])]
     return out
 
 

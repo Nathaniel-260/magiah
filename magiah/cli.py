@@ -3,13 +3,14 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 from . import core, runstate
 from .config import Config
-from .corpus import OTZARIA_DB
+from .corpus import OTZARIA_DB, check_source
 from .corpus_hybrid import DEFAULT_LIBRARY
-from .textsource import TextSourceError
+from .textsource import TextSourceError, db_error_message
 
 RUN_CONFIG = 'run_config.json'
 # the stages each pipeline command runs, in order
@@ -124,7 +125,7 @@ def _run_book_cmd(args, spec, cfg, out_dir):
                 spec=spec, progress=lambda s: print(s, flush=True))
             counts = uidb.merge_book_scan(out_dir, result)
         except (book_scan.BookScanError, book_source.BookNotFound,
-                uidb.DecisionsLocked) as e:
+                uidb.DecisionsLocked, TextSourceError) as e:
             run.fail(str(e))
             print(str(e), file=sys.stderr, flush=True)
             return 1
@@ -235,6 +236,14 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
+    if args.command in ('lexicon', 'detect', 'locate', 'all'):
+        # a folder that is not there is refused before run_config.json is
+        # rewritten with it, and before any stage starts
+        try:
+            check_source(spec)
+        except TextSourceError as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
     _save_run_config(out_dir, spec, cfg, prev)
 
     if args.command == 'review':
@@ -265,6 +274,11 @@ def main(argv=None):
         # read (missing, not Otzaria's, no zstd decoder): print the Hebrew
         # guidance (no traceback — this is a user error, not a crash)
         print(str(e), file=sys.stderr, flush=True)
+        return 1
+    except sqlite3.DatabaseError as e:
+        # a database the readers do not wrap (report.db, ui_review.db, a
+        # query outside textsource) failed: still Hebrew, exit code 1
+        print(db_error_message('', e), file=sys.stderr, flush=True)
         return 1
 
 
