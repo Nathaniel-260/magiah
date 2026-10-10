@@ -165,6 +165,20 @@ def contained_path(path, root, code='outside_library'):
     return full
 
 
+def _library_file(rel, library_dir, unit):
+    """The book file a library-relative path names, contained in the
+    library (see :func:`contained_path`)."""
+    library_dir = library_dir or DEFAULT_LIBRARY
+    rel = book_source.canonical_rel(rel)
+    # '.', '..' and 'x.txt/..' all normalize to something that names a
+    # DIRECTORY (often the library root itself) rather than a book
+    if not rel or rel in ('.', '..') or rel.split('/')[-1] in ('.', '..'):
+        raise PatchError('bad_unit', _msg('bad_unit', unit=unit))
+    # a crafted '../..' relpath must never read or write outside the repo
+    return contained_path(os.path.join(library_dir, *rel.split('/')),
+                          library_dir)
+
+
 def resolve_unit(unit, library_dir=None):
     """``unit`` -> ``(kind, abspath, lineno0)``; kind is 'library' | 'local'.
 
@@ -172,19 +186,10 @@ def resolve_unit(unit, library_dir=None):
     units carry no file at all and raise ``db_book`` so the caller can offer
     export instead of editing.
     """
-    library_dir = library_dir or DEFAULT_LIBRARY
     parsed = parse_file_unit(unit)
     if parsed is not None:
         rel, lineno = parsed
-        rel = book_source.canonical_rel(rel)
-        # '.', '..' and 'x.txt/..' all normalize to something that names a
-        # DIRECTORY (often the library root itself) rather than a book
-        if not rel or rel in ('.', '..') or rel.split('/')[-1] in ('.', '..'):
-            raise PatchError('bad_unit', _msg('bad_unit', unit=unit))
-        # a crafted '../..' relpath must never read or write outside the repo
-        path = contained_path(os.path.join(library_dir, *rel.split('/')),
-                              library_dir)
-        return 'library', path, lineno
+        return 'library', _library_file(rel, library_dir, unit), lineno
     parsed = book_source.parse_local_unit(unit)
     if parsed is not None:
         path, lineno = parsed
@@ -232,6 +237,19 @@ def resolve_key(key, library_dir=None):
     # names-a-file checks as unit resolution — one place to get right
     _kind, path, _ln = resolve_unit('%s:%s:0' % (kind, rest), library_dir)
     return _kind, path
+
+
+def resolve_file_key(key, library_dir=None):
+    """A ``file:<rel>`` key -> the library book's absolute path.
+
+    For keys that arrive in a request: unlike :func:`resolve_key` it has no
+    way to yield a ``local:`` path, so the only path it can return is one
+    :func:`contained_path` accepted inside `library_dir`."""
+    parsed = (parse_file_unit(key + ':0')
+              if isinstance(key, str) and key.startswith('file:') else None)
+    if parsed is None:
+        raise PatchError('bad_unit', _msg('bad_unit', unit=key))
+    return _library_file(parsed[0], library_dir, key)
 
 
 # ---------------------------------------------------------------------------

@@ -1082,7 +1082,9 @@ class TestApi(TempCase):
     def test_local_key_for_a_scanned_file_still_works(self):
         book = write(os.path.join(self.tmp, 'מקומי', 'ספר בודד.txt'),
                      self.text)
-        unit = 'local:%s:1' % book
+        # as a book scan writes it (book_source._load_file_book): the real
+        # path, which on macOS is /private/var/... for a /var/... temp dir
+        unit = 'local:%s:1' % os.path.realpath(book)
         con = db.connect(self.outdir)
         con.execute(
             'INSERT INTO findings(id, family, errtype, word, suggestion, '

@@ -209,8 +209,7 @@ def _resolve_book(con, outdir, key, rows):
     if len(roots) > 1 or not _same_root(root, configured):
         raise patcher.PatchError('source_mismatch', recorded=root,
                                  configured=configured)
-    kind, path = patcher.resolve_key(key, root)
-    return kind, path, root
+    return 'library', patcher.resolve_file_key(key, root), root
 
 
 def _conflicts(outdir, path):
