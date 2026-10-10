@@ -426,8 +426,10 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
     # inside its own correction and apply it twice.
     recorded = db.get_live_edit_entries(con, key)
     _mark_trusted(con, list(rows.values()), fdoc.fingerprint, len(data))
-    already = sorted(fid for fid in by_id if fid in recorded
-                     and patcher.entry_in_place(fdoc, recorded[fid]))
+    # located once, by content (lines may have moved since the write)
+    own = patcher._located(fdoc, list(recorded.values()))
+    where = {e.get('id'): at for e, at in own}
+    already = sorted(fid for fid in by_id if where.get(fid) is not None)
 
     findings, modes, explicit = [], {}, {}
     for fid, r in by_id.items():
@@ -459,7 +461,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
 
     plans, failures = patcher.plan_all(fdoc, findings, default_mode,
                                        modes, explicit,
-                                       own_edits=list(recorded.values()))
+                                       own_edits=own)
     if failures:
         # nothing is written when anything is in doubt
         return {'ok': False, 'failed': failures,
@@ -502,7 +504,7 @@ def _apply_locked(con, outdir, body, key, path, root, fdoc, data, by_id,
                    backup=bpath, fingerprint=fp_after)
     else:
         out['message'] = hebrew.FIXER_MESSAGES['already_applied'].format(
-            n=recorded[already[0]]['lineno'] + 1)
+            n=where[already[0]][0] + 1)
     if mark_fixed:
         try:
             # custom corrections are persisted per finding so the file and the
@@ -556,7 +558,10 @@ def undo_file(con, outdir, body):
             # changed since (or no usable backup): put back only the recorded
             # spans, each verified in place, so later changes survive
             fdoc = patcher.doc_from_bytes(path, data)
-            patcher.reverse_entries(fdoc, rec.get('detail') or [])
+            mine = rec.get('detail') or []
+            others = [e for e in db.get_live_edit_entries(
+                con, rec['book_key']).values() if e not in mine]
+            patcher.reverse_entries(fdoc, mine, others)
             restored = fdoc.encode()
         ids = rec['finding_ids']
         jid, _b, _s = _write_journaled(outdir, {

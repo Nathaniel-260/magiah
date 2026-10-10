@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magiah import normalize                                    # noqa: E402
 from magiah.webui import patcher                                # noqa: E402
-from test_anchor_write import TempCase, finding, scan_snippet   # noqa: E402
+from test_anchor_write import (FixerEnv, TempCase, finding, raw,  # noqa: E402
+                               scan_snippet, write)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +232,67 @@ class TestCopiesTheScannerSkips(TempCase):
             with self.subTest(line=now[:30]):
                 with self.assertRaises(patcher.PatchError):
                     patcher.plan_edit(self.doc(now + '\n'), dict(f))
+
+
+# ---------------------------------------------------------------------------
+# recorded edits after lines moved
+# ---------------------------------------------------------------------------
+
+class TestRecordsFollowMovedLines(FixerEnv):
+    """Lines inserted above a fixer edit used to break its undo and the
+    "already applied" check: records were looked up by line number only."""
+
+    TOP = 'שורה חדשה בראש הספר\nועוד אחת\n'
+
+    def test_undo_and_already_applied_after_a_shift(self):
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        write(self.path, self.TOP + raw(self.path).decode('utf-8'))
+        d = self.open_doc(self.key)
+        [row] = [i for i in d['items'] if i['id'] == 1]
+        self.assertEqual(row['anchor']['code'], 'already_applied')
+        self.assertEqual(row['lineno'], 3)
+        # applying it again writes nothing
+        res2, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual((code, res2['already_applied']), (200, [1]), res2)
+        self.assertEqual(res2['applied'], [])
+        # and its undo puts back exactly its span, on the moved line
+        out, code = self.undo(res['edit_id'])
+        self.assertEqual(code, 200, out)
+        self.assertEqual(raw(self.path).decode('utf-8'),
+                         self.TOP + self.TEXT)
+
+    def test_a_twin_record_is_never_taken_for_another(self):
+        """Two identical lines fixed by two writes; one fix reverted by hand
+        and lines inserted above. Neither record can tell which remaining
+        copy is its own: the undo is refused rather than undo the twin."""
+        line = 'אמר רבי יותבת בן זומא'
+        d = self.doc('כותרת\n%s\n%s\n' % (line, line))
+        recs = []
+        for n in (1, 2):
+            f = dict(finding(line, 'יותבת', 'יושבת', lineno=n, fid=n),
+                     trusted=True)
+            p = patcher.plan_edit(d, f)
+            patcher.apply_edits(d, [p])
+            recs.append(p.to_dict())
+        d.lines[1:2] = ['חדשה', 'כותרת', line]     # hand edits, then shift
+        del d.lines[0]
+        self.assertEqual(patcher.locate_entries(d, recs), [None, None])
+        with self.assertRaises(patcher.PatchError) as cm:
+            patcher.reverse_entries(d, [recs[0]], [recs[1]])
+        self.assertEqual(cm.exception.code, 'file_changed_since_edit')
+
+    def test_a_unique_record_is_found_far_from_its_line(self):
+        line = 'אמר רבי יותבת בן זומא'
+        d = self.doc('כותרת\n%s\n' % line)
+        p = patcher.plan_edit(d, finding(line, 'יותבת', 'יושבת', lineno=1))
+        patcher.apply_edits(d, [p])
+        rec = p.to_dict()
+        d.lines[0:0] = ['מילוי %d' % i for i in range(500)]
+        self.assertEqual(patcher.locate_entries(d, [rec]),
+                         [(501, p.post_start)])
+        patcher.reverse_entries(d, [rec])
+        self.assertEqual(d.lines[501], line)
 
 
 if __name__ == '__main__':

@@ -45,6 +45,7 @@ on ``source``: ``source`` is only the filename stem, and in the real corpus the
 stem ``'פרק א'`` belongs to 35 different books. Writing by ``source`` would
 scatter edits across all of them.
 """
+import bisect
 import hashlib
 import json
 import os
@@ -745,7 +746,7 @@ def _bracket_origin(line, a, b, snippet, corrections, own_edits):
        in a new folder, then re-applied with yet another correction.)
     """
     text = line[a:b]
-    for e in own_edits or ():
+    for e, _at in own_edits or ():
         if e.get('new') == text and _locate_entry(line, e) == a:
             return 'record'
     paren = _bare(text[1:text.index(') [')])
@@ -759,7 +760,8 @@ def _bracket_origin(line, a, b, snippet, corrections, own_edits):
 
 def _as_scanned(line, lineno, own_edits):
     """The line with the fixer's own live edits on it undone: as the scan
-    saw it, as far as the fixer had a hand in it.
+    saw it, as far as the fixer had a hand in it. ``own_edits`` holds
+    ``(entry, (lineno, pos) or None)`` pairs (see :func:`_located`).
 
     Returns ``(text, undone)`` with each undone edit as ``(now_start,
     now_end, then_start, then_end)``. An edit no longer found where its
@@ -768,12 +770,9 @@ def _as_scanned(line, lineno, own_edits):
     point. None when two records overlap — nothing is proven then.
     """
     found = []
-    for e in own_edits or ():
-        if e.get('lineno') != lineno:
-            continue
-        pos = _locate_entry(line, e)
-        if pos is not None:
-            found.append((pos, pos + len(e.get('new') or ''),
+    for e, at in own_edits or ():
+        if at is not None and at[0] == lineno:
+            found.append((at[1], at[1] + len(e.get('new') or ''),
                           e.get('old') or ''))
     if not found:
         return line, []            # the very string: its spans are cached
@@ -912,6 +911,7 @@ def plan_edit(doc, finding, mode=MODE_REPLACE, explicit=None,
     lineno = finding.get('lineno')
     word = (finding.get('word') or '').strip()
     correction = (finding.get('correction') or '').strip()
+    own_edits = _located(doc, own_edits)
     if not correction:
         raise PatchError('no_correction', _msg('no_correction'), id=fid)
     if '\n' in correction or '\r' in correction:
@@ -1057,6 +1057,7 @@ def plan_all(doc, findings, default_mode=MODE_REPLACE, modes=None,
     modes = modes or {}
     explicit = explicit or {}
     plans, failures = [], []
+    own_edits = _located(doc, own_edits)
     for f in findings:
         fid = f.get('id')
         try:
@@ -1158,38 +1159,94 @@ def _locate_entry(line, e):
     return hits[0] + len(cl) if len(hits) == 1 else None
 
 
+def locate_entries(doc, entries):
+    """Where each recorded edit sits now: ``(lineno, pos)`` or None, in
+    the order of `entries`.
+
+    Its recorded line is only a hint: lines inserted or removed above an
+    edit since it was written move it. So an entry not found on its own
+    line (by its text and context, :func:`_locate_entry`) is looked for in
+    the whole book, and accepted only where its text with its context
+    occurs exactly once, at a place no other entry holds or also found.
+    A twin line with the same text is therefore a refusal, never a guess.
+    """
+    out, claimed, lost = [None] * len(entries), set(), []
+    for i, e in enumerate(entries):
+        n = e.get('lineno')
+        if isinstance(n, int) and 0 <= n < len(doc.lines):
+            pos = _locate_entry(doc.lines[n], e)
+            if pos is not None:
+                out[i] = (n, pos)
+                claimed.add(out[i])
+                continue
+        lost.append(i)
+    if not lost:
+        return out
+    joined = NL.join(doc.lines)
+    starts, at = [], 0
+    for line in doc.lines:
+        starts.append(at)
+        at += len(line) + 1
+    found = {}
+    for i in lost:
+        e = entries[i]
+        new, cl, cr = e.get('new') or '', e.get('ctx_l'), e.get('ctx_r')
+        if not new or cl is None or cr is None or e.get('post_start') is None:
+            continue
+        needle = cl + new + cr
+        if NL in needle:
+            continue
+        j = joined.find(needle)
+        if j < 0 or joined.find(needle, j + 1) >= 0:
+            continue
+        n = bisect.bisect_right(starts, j) - 1
+        found.setdefault((n, j - starts[n] + len(cl)), []).append(i)
+    for place, who in found.items():
+        # two records whose text and context are the same (the fixer's
+        # output on twin lines) cannot tell which place is whose
+        if len(who) == 1 and place not in claimed:
+            out[who[0]] = place
+    return out
+
+
+class _Located(list):
+    """``[(entry, (lineno, pos) or None), ...]``: recorded edits with where
+    each sits now, located once for every finding planned against a doc."""
+
+
+def _located(doc, own_edits):
+    if isinstance(own_edits, _Located):
+        return own_edits
+    entries = [e for e in own_edits or () if isinstance(e, dict)]
+    return _Located(zip(entries, locate_entries(doc, entries)))
+
+
 def entry_in_place(doc, e):
     """Is this recorded (live) edit still visibly applied in `doc`?"""
-    n = e.get('lineno')
-    if n is None or not 0 <= n < len(doc.lines):
-        return False
-    return _locate_entry(doc.lines[n], e) is not None
+    return locate_entries(doc, [e])[0] is not None
 
 
-def reverse_entries(doc, entries):
+def reverse_entries(doc, entries, others=()):
     """Put each recorded edit's original text back, touching nothing else.
 
     Every span must still hold exactly what was written, with the same
-    context on both sides; if any one does not, nothing is changed and
-    ``file_changed_since_edit`` is raised.
+    context on both sides, wherever its line has moved to
+    (:func:`locate_entries`; `others` are the book's other live records,
+    whose places are not up for grabs); if any one is not found, nothing
+    is changed and ``file_changed_since_edit`` is raised.
     """
     entries = _post_starts([dict(e) for e in entries])
+    others = [dict(e) for e in others or () if isinstance(e, dict)]
+    where = locate_entries(doc, entries + others)[:len(entries)]
     by_line = {}
-    for e in entries:
-        by_line.setdefault(e.get('lineno'), []).append(e)
-    new_lines = {}
-    for n, group in by_line.items():
-        if n is None or not 0 <= n < len(doc.lines):
+    for e, at in zip(entries, where):
+        if at is None:
             raise PatchError('file_changed_since_edit',
                              _msg('file_changed_since_edit'))
+        by_line.setdefault(at[0], []).append((at[1], e))
+    new_lines = {}
+    for n, located in by_line.items():
         line = doc.lines[n]
-        located = []
-        for e in group:
-            pos = _locate_entry(line, e)
-            if pos is None:
-                raise PatchError('file_changed_since_edit',
-                                 _msg('file_changed_since_edit'))
-            located.append((pos, e))
         located.sort(key=lambda x: x[0], reverse=True)
         for i in range(1, len(located)):
             if located[i][0] + len(located[i][1]['new']) > located[i - 1][0]:
@@ -1366,15 +1423,16 @@ def anchor_rows(doc, rows, applied=None):
     such instead of being re-anchored inside its own correction.
     """
     applied = applied or {}
-    own = list(applied.values())
+    own = _located(doc, list(applied.values()))
+    where = {id(e): at for e, at in own}
     for r in rows:
         e = applied.get(r.get('id'))
-        if e is not None and entry_in_place(doc, e):
+        at = where.get(id(e)) if e is not None else None
+        if at is not None:
             r['anchor'] = {'ok': False, 'code': 'already_applied',
-                           'message': _msg('already_applied',
-                                           n=e['lineno'] + 1),
+                           'message': _msg('already_applied', n=at[0] + 1),
                            'manual_lines': []}
-            r['lineno'] = e['lineno']
+            r['lineno'] = at[0]
             continue
         try:
             plan = plan_edit(doc, {
