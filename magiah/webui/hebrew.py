@@ -686,6 +686,13 @@ SCAN_MESSAGES = {
 # UI / API messages
 # ---------------------------------------------------------------------------
 
+# a rule that decides a finding, as a conflict message names it
+RULE_LABELS = {
+    'word': 'החלטה על המילה בכל מקום',
+    'book': 'החלטה על המילה בספר הזה',
+    'replacement': 'החלטה על הזוג מילה→הצעה בכל מקום שבו הוא מופיע',
+}
+
 MESSAGES = {
     'not_found': 'הנתיב המבוקש לא נמצא',
     'finding_not_found': 'הממצא המבוקש לא נמצא',
@@ -698,6 +705,9 @@ MESSAGES = {
                        'ברמת ספר או "בכל מקום" אפשר רק לסמן שהמילה תקינה',
     'status_conflict': 'הממצא כבר עודכן (לחיצה כפולה או חלון אחר) — '
                        'ההחלטה לא נשמרה שוב',
+    # the finding is decided by a rule set since (see RULE_LABELS)
+    'status_conflict_rule': 'הממצא כבר הוכרע ב{rule} (סטטוס: {status}), '
+                            'ולכן ההחלטה לא נשמרה. הכרטיס עודכן.',
     'db_missing': 'מסד הנתונים ui_review.db טרם נבנה — מריצים ייבוא...',
     'no_scan_console': (
         'עדיין אין סריקה בתיקייה הזו — הממשק נפתח במצב "אין סריקה". '
@@ -751,6 +761,14 @@ MESSAGES = {
                                'ולנסות שוב.',
     'legacy_accept_recheck': 'החלטה ישנה: אושר עם ההצעה "{sugg}", על סמך '
                              'ראיית תנ"ך בשיטה הישנה — יש לבדוק מחדש',
+    # an approval of an earlier version that recorded no suggestion, which
+    # a re-scan may have changed since
+    'unbound_approval_recheck': 'החלטה ישנה: אושר בגרסה קודמת, בלי שנשמר '
+                                'איזה תיקון אושר (ההצעה כעת: "{sugg}") — '
+                                'יש לבדוק מחדש',
+    # a stale approval: the finding was approved, then a re-scan changed
+    # its suggestion, so it is open again
+    'stale_mark': 'ההצעה השתנתה מאז שאושרה, יש לבדוק שוב',
     'import_done': 'הייבוא הושלם',
     'export_done': 'הייצוא הושלם',
 }

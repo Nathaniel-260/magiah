@@ -1349,25 +1349,51 @@ def _split_verify_chunk(chunk):
     return counts, _chunk_stats_end()
 
 
+# seconds to wait for a decisions.db lock; the review UI waits as long
+# (magiah.webui.db.DECISIONS_TIMEOUT)
+REVIEW_DECISIONS_TIMEOUT = 30.0
+
+
 def load_review_rejections(out_dir):
     """Words rejected in review with GLOBAL scope (decisions.db unit '*').
 
     A rejection of one occurrence, of one suggested replacement or of a
     book's own spelling is not a statement about the word elsewhere, so it
     must never become a corpus-wide whitelist entry.
+
+    A decisions.db that cannot be read (locked by the review UI or the old
+    review tool for longer than REVIEW_DECISIONS_TIMEOUT, or damaged) fails
+    the stage with a Hebrew StageError: read as "no rejections", every word
+    rejected everywhere would silently be flagged again.
     """
     dec_path = os.path.join(out_dir, 'decisions.db')
     if not os.path.exists(dec_path):
         return set()
-    dcon = sqlite3.connect(dec_path, timeout=30.0)
+    timeout = REVIEW_DECISIONS_TIMEOUT
     try:
-        return {r[0] for r in dcon.execute(
-            "SELECT DISTINCT word FROM decisions "
-            "WHERE verdict='reject' AND unit='*'")}
-    except sqlite3.OperationalError:
-        return set()
-    finally:
-        dcon.close()
+        dcon = sqlite3.connect(dec_path, timeout=timeout)
+        try:
+            dcon.execute(f'PRAGMA busy_timeout={int(timeout * 1000)}')
+            if not dcon.execute("SELECT 1 FROM sqlite_master WHERE "
+                                "type='table' AND name='decisions'"
+                                ).fetchone():
+                return set()           # created, never written: no decisions
+            return {r[0] for r in dcon.execute(
+                "SELECT DISTINCT word FROM decisions "
+                "WHERE verdict='reject' AND unit='*'")}
+        finally:
+            dcon.close()
+    except sqlite3.Error as e:
+        locked = 'locked' in str(e) or 'busy' in str(e)
+        raise StageError(
+            (f'לא ניתן לקרוא את {dec_path}: הקובץ נעול בידי תוכנה אחרת '
+             f'(למשל ממשק הסקירה או כלי הסקירה הישן) גם אחרי המתנה של '
+             f'{timeout:g} שניות.' if locked else
+             f'לא ניתן לקרוא את {dec_path}: {e}.')
+            + ' בלי הקובץ הזה מילים שסומנו "לא שגיאה בכל מקום" היו מסומנות '
+              'שוב כשגיאות, ולכן הסריקה הופסקה ושום דבר לא נכתב. '
+            + ('יש לסגור את התוכנה ולהריץ שוב.' if locked else
+               'יש לתקן או להעביר את הקובץ ולהריץ שוב.')) from e
 
 
 def detect(spec, cfg, out_dir):

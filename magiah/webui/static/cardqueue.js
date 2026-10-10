@@ -5,6 +5,8 @@
  *     is true on a final pass that should cover what is still open
  * io.countRemaining() -> number   open findings in the filter, per the SERVER
  * io.save(row, status, opts)      persists one decision (rejects on failure)
+ * io.fetchRows(ids, recheck) -> {rows}  (optional) those of `ids` still in
+ *     the filter, as the server has them now
  *
  * Paging is by server cursor, never by page number: a decision removes the
  * row from a status-filtered set, so OFFSET paging would silently skip rows.
@@ -13,6 +15,9 @@
  * server's count, not by the local queue being empty. */
 (function (root) {
   "use strict";
+
+  // a decision with one of these scopes decides other findings of the word
+  const RULE_SCOPES = new Set(["word", "book", "replacement"]);
 
   class CardQueue {
     constructor(io, opts) {
@@ -106,15 +111,66 @@
       const r = this.head();
       if (!r || this.inflight !== null) return { ignored: true };
       this.inflight = r.id;
+      opts = opts || {};
       try {
-        const res = await this.io.save(r, status, opts || {});
+        let res;
+        try {
+          res = await this.io.save(r, status, opts);
+        } catch (e) {
+          // the finding moved on (another window, a rule): show what is true
+          // now, or let the card go when it left the filter. A rule decided
+          // the word's other cards as well.
+          if (e && e.status === 409) {
+            const cause = e.data && e.data.cause && e.data.cause[String(r.id)];
+            await this.settle(RULE_SCOPES.has(cause) ? this.sameWord(r, true) : [r]);
+          }
+          throw e;
+        }
         const i = this.queue.indexOf(r);
         if (i >= 0) this.queue.splice(i, 1);
         this.done.add(r.id);
+        // a rule decides the word's other cards too; acting on one of them
+        // as if it were still open would only meet a conflict
+        if (RULE_SCOPES.has(opts.scope)) await this.settle(this.sameWord(r, false));
         return res;
       } finally {
         this.inflight = null;
       }
+    }
+
+    /* The waiting cards of `r`'s word (`r` itself first when `self`). */
+    sameWord(r, self) {
+      const others = this.queue.concat(this.skipped).filter(c => c !== r && c.word === r.word);
+      return self ? [r].concat(others) : others;
+    }
+
+    /* Ask the server how `rows` stand now under the queue's filter: a card
+     * no longer in it leaves the queue and the skip pile, the others take
+     * their current state. Never fails the caller (the cards then stay, and
+     * acting on one meets a conflict that names the rule). */
+    async settle(rows) {
+      if (!rows.length || !this.io.fetchRows) return 0;
+      const gen = this.gen;
+      let fresh;
+      try {
+        fresh = await this.io.fetchRows(rows.map(r => r.id), this.recheck);
+      } catch (e) {
+        return 0;
+      }
+      if (gen !== this.gen) return 0;
+      const list = Array.isArray(fresh) ? fresh : ((fresh && fresh.rows) || []);
+      const byId = new Map(list.map(f => [f.id, f]));
+      const gone = new Set();
+      for (const r of rows) {
+        const f = byId.get(r.id);
+        if (f) Object.assign(r, f);
+        else gone.add(r.id);
+      }
+      if (gone.size) {
+        this.queue = this.queue.filter(r => !gone.has(r.id));
+        this.skipped = this.skipped.filter(r => !gone.has(r.id));
+      }
+      return gone.size;
     }
 
     skip() {

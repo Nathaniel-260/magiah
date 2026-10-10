@@ -209,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/findings':
             filters = {k: q.get(k) for k in
                        ('origin', 'book', 'book_key', 'errtype', 'status',
-                        'verified', 'min_rank', 'q')}
+                        'verified', 'min_rank', 'q', 'ids')}
             if 'cursor' in q:
                 # keyset paging (card queue): stable under status changes
                 rows, total, nxt = db.query_findings_page(
@@ -340,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                     expect_status=body.get('expect_status'))
             except db.StatusConflict as e:
                 self._json({'error': str(e), 'code': 'status_conflict',
-                            'current': e.current}, 409)
+                            'current': e.current, 'cause': e.cause}, 409)
                 return
             self._json({'ok': True, **res})
         elif path == '/api/undo':

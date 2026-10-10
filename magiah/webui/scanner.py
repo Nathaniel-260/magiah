@@ -448,6 +448,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
     (runstate.BookRun) is finalized before the in-memory state."""
     from .. import book_scan
     from ..book_source import BookNotFound
+    from ..core import StageError
     from ..textsource import TextSourceError
     from . import db as uidb
 
@@ -500,7 +501,7 @@ def _run_book(outdir, source, key, cfg, db_path, library_dir, verify_ctx,
     except _Cancelled:
         rc = 1
     except (book_scan.BookScanError, BookNotFound, TextSourceError,
-            ValueError) as e:
+            StageError, ValueError) as e:
         rc, err = 1, str(e)
         emit(f'===== [book] שגיאה: {e}')
     except Exception as e:                          # noqa: BLE001
