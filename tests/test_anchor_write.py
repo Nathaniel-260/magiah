@@ -1664,9 +1664,13 @@ class TestLockRobustness(FixerEnv):
     def _folder_refuses_new_files(self):
         from magiah.webui import journal
         real_open = journal.os.open
+        folder = os.path.normcase(os.path.abspath(self.lib))
 
         def denied(path, *a, **kw):
-            if path.endswith(journal.LOCK_SUFFIX):
+            # no new file of any name: a lock file alone being refused is
+            # one that is being deleted (test_fixer_followups)
+            if os.path.normcase(os.path.dirname(os.path.abspath(path))) \
+                    == folder:
                 raise PermissionError(13, 'Access is denied', path)
             return real_open(path, *a, **kw)
         journal.os.open = denied

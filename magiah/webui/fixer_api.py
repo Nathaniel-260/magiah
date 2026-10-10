@@ -320,20 +320,41 @@ def _write_journaled(outdir, rec, path, data_before, data_after):
     is provably untouched; otherwise it stays open for :func:`journal.recover`.
     """
     fp_before = patcher.fingerprint_bytes(data_before)
+    # A writer that stalled past the lock's stale age may have lost its lock
+    # to another one, who wrote: never replace the book over that write.
+    journal.assert_held(path)
+    if patcher.fingerprint_bytes(patcher.read_bytes(path)) != fp_before:
+        raise patcher.PatchError('file_changed')
     bpath, bsha = patcher.write_backup(outdir, path, data_before)
-    jid = journal.begin(outdir, dict(
-        rec, path=path, backup=bpath, backup_sha=bsha, fp_before=fp_before,
-        fp_after=patcher.fingerprint_bytes(data_after)))
+    try:
+        jid = journal.begin(outdir, dict(
+            rec, path=path, backup=bpath, backup_sha=bsha,
+            fp_before=fp_before,
+            fp_after=patcher.fingerprint_bytes(data_after)))
+    except BaseException:
+        _drop_backup(bpath)             # no intent names it: nothing wrote
+        raise
     try:
         patcher.atomic_write(path, data_after)
     except BaseException:
         try:
             if patcher.fingerprint(path) == fp_before:
                 journal.finish(outdir, jid, 'aborted')
+                # the book is provably untouched and the intent is closed:
+                # the backup backs up nothing (a locked or read-only book
+                # would otherwise leave one per attempt)
+                _drop_backup(bpath)
         except OSError:
             pass
         raise
     return jid, bpath, bsha
+
+
+def _drop_backup(bpath):
+    try:
+        os.remove(bpath)
+    except OSError:
+        traceback.print_exc()
 
 
 def _settle_or_refuse(con, outdir, path):

@@ -4,15 +4,17 @@
 Every fixture is built under a temp dir; nothing here touches a real
 library. The shared fixtures come from test_anchor_write.
 """
+import json
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magiah import normalize                                    # noqa: E402
-from magiah.webui import patcher                                # noqa: E402
+from magiah.webui import journal, patcher                       # noqa: E402
 from test_anchor_write import (FixerEnv, TempCase, finding, raw,  # noqa: E402
                                scan_snippet, write)
 
@@ -375,6 +377,189 @@ class TestRecordsFollowMovedLines(FixerEnv):
                          [(501, p.post_start)])
         patcher.reverse_entries(d, [rec])
         self.assertEqual(d.lines[501], line)
+
+
+# ---------------------------------------------------------------------------
+# recovery, backups and the journal
+# ---------------------------------------------------------------------------
+
+class TestRecoveryDuringABriefLock(FixerEnv):
+    """A crashed write whose book is momentarily locked while recovery runs
+    is retried later, never recorded as a permanent conflict."""
+
+    def _crashed_write(self):
+        d = patcher.read_doc(self.path)
+        before = d.encode()
+        plans, failures = patcher.plan_all(d, [{
+            'id': 1, 'lineno': 1, 'word': 'יותבת', 'correction': 'יושבת',
+            'snippet': d.lines[1]}])
+        self.assertEqual(failures, [])
+        patcher.apply_edits(d, plans)
+        after = d.encode()
+        journal.begin(self.outdir, {
+            'kind': 'apply', 'path': self.path, 'book_key': self.key,
+            'mode': 'replace', 'finding_ids': [1], 'mark_fixed': True,
+            'detail': patcher.detail_json(plans), 'backup': '',
+            'fp_before': patcher.fingerprint_bytes(before),
+            'fp_after': patcher.fingerprint_bytes(after)})
+        write(self.path, after.decode('utf-8'))
+
+    def _recover(self, wait):
+        con = self.con()
+        try:
+            return journal.recover(con, self.outdir, wait=wait)
+        finally:
+            con.close()
+
+    def test_a_locked_book_leaves_the_intent_open(self):
+        self._crashed_write()
+        real = patcher.fingerprint
+
+        def locked(path):
+            raise PermissionError(13, 'The process cannot access the file')
+        patcher.fingerprint = locked
+        try:
+            out = self._recover(wait=False)
+            self.assertEqual([o['state'] for o in out], ['denied'])
+            # a writer is told why it cannot go on, in Hebrew
+            with self.assertRaises(patcher.AccessDenied) as cm:
+                self._recover(wait=True)
+            self.assertEqual(cm.exception.code, 'access_denied')
+        finally:
+            patcher.fingerprint = real
+        self.assertEqual(len(journal.pending(self.outdir)), 1)
+        self.assertEqual(journal.conflicts(self.outdir), [])
+        # the lock is gone: the write is settled as what it was
+        self.assertEqual([o['state'] for o in self._recover(wait=False)],
+                         ['committed'])
+        self.assertEqual(journal.conflicts(self.outdir), [])
+        self.assertEqual(self.status_of(1), 'fixed')
+
+
+class TestRefusedWriteLeavesNoBackup(FixerEnv):
+
+    def _backups(self):
+        bdir = os.path.join(self.outdir, patcher.FIXER_BACKUP_DIR)
+        if not os.path.isdir(bdir):
+            return []
+        return [n for n in os.listdir(bdir) if n.endswith('.bak')]
+
+    def test_a_locked_or_read_only_book_leaves_no_backup(self):
+        real = os.replace
+
+        def refuse(src, dst):
+            raise PermissionError(13, 'Access is denied')
+        os.replace = refuse
+        try:
+            for _ in range(3):
+                with self.assertRaises(patcher.AccessDenied):
+                    self.apply(self.key, [{'id': 1}])
+        finally:
+            os.replace = real
+        self.assertEqual(self._backups(), [])
+        self.assertEqual(journal.pending(self.outdir), [])
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+        # and a write that goes through still keeps its backup
+        res, code = self.apply(self.key, [{'id': 1}])
+        self.assertEqual(code, 200, res)
+        self.assertEqual(len(self._backups()), 1)
+
+
+class TestJournalTornLine(FixerEnv):
+
+    def test_a_torn_last_line_does_not_swallow_the_next_record(self):
+        jid = journal.begin(self.outdir, {'kind': 'apply', 'path': self.path})
+        p = journal.journal_path(self.outdir)
+        with open(p, 'ab') as f:
+            f.write(b'{"op": "committed", "jid": "torn')   # a crash mid-line
+        journal.finish(self.outdir, jid, 'committed')
+        ops = [(r['jid'], r['op']) for r in journal.read_records(self.outdir)]
+        self.assertEqual(ops, [(jid, 'intent'), (jid, 'committed')])
+        self.assertEqual(journal.pending(self.outdir), [])
+
+
+class TestLockOwnership(FixerEnv):
+
+    def test_a_share_clock_behind_ours_does_not_break_a_live_lock(self):
+        lf = write(self.path + journal.LOCK_SUFFIX, '{}')
+        stamp = time.time() - journal.STALE_LOCK_SECONDS - 60
+        os.utime(lf, (stamp, stamp))
+        real = journal._server_now
+        # the share's own clock says the holder touched it a moment ago
+        journal._server_now = lambda folder: stamp + 5
+        try:
+            with self.assertRaises(patcher.PatchError) as cm:
+                with journal.file_lock(self.path, timeout=0.2):
+                    pass
+        finally:
+            journal._server_now = real
+        self.assertEqual(cm.exception.code, 'file_busy')
+        self.assertTrue(os.path.exists(lf))
+        # by both clocks it is dead: broken as before
+        with journal.file_lock(self.path, timeout=1):
+            pass
+        self.assertFalse(os.path.exists(lf))
+
+    def test_a_holder_whose_lock_was_taken_does_not_write(self):
+        """A writer stalled past the stale age; another one broke its lock
+        and wrote. The woken writer must not replace the book."""
+        fp = self.open_doc(self.key)['fingerprint']
+        lf = self.path + journal.LOCK_SUFFIX
+        real = patcher.plan_all
+        thief = json.dumps({'pid': 1, 'token': 'another-writer'})
+
+        def stall(*a, **kw):
+            out = real(*a, **kw)
+            with open(lf, 'w') as f:
+                f.write(thief)
+            return out
+        patcher.plan_all = stall
+        try:
+            res, code = self.apply(self.key, [{'id': 1}], fingerprint=fp)
+        finally:
+            patcher.plan_all = real
+        self.assertEqual((code, res.get('code')), (409, 'file_busy'))
+        self.assertEqual(raw(self.path), self.TEXT.encode('utf-8'))
+        # and its release leaves the other writer's lock alone
+        with open(lf) as f:
+            self.assertEqual(f.read(), thief)
+        os.remove(lf)
+
+    def test_the_book_changed_under_a_stalled_holder(self):
+        fp = self.open_doc(self.key)['fingerprint']
+        real = patcher.plan_all
+
+        def stall(*a, **kw):
+            out = real(*a, **kw)
+            write(self.path, self.TEXT + 'שורה שנכתבה בינתיים\n')
+            return out
+        patcher.plan_all = stall
+        try:
+            res, code = self.apply(self.key, [{'id': 1}], fingerprint=fp)
+        finally:
+            patcher.plan_all = real
+        self.assertEqual((code, res.get('code')), (409, 'file_changed'))
+        self.assertNotIn('יושבת', raw(self.path).decode('utf-8'))
+        self.assertEqual(journal.pending(self.outdir), [])
+
+    def test_a_lock_being_deleted_on_fat_is_busy_not_unwritable(self):
+        """FAT reports a lock file that is being deleted as access denied
+        and already gone; the folder still takes other files."""
+        real_open = journal.os.open
+
+        def deleting(path, *a, **kw):
+            if path.endswith(journal.LOCK_SUFFIX):
+                raise PermissionError(13, 'Access is denied', path)
+            return real_open(path, *a, **kw)
+        journal.os.open = deleting
+        try:
+            with self.assertRaises(patcher.PatchError) as cm:
+                with journal.file_lock(self.path, timeout=0.3):
+                    pass
+        finally:
+            journal.os.open = real_open
+        self.assertEqual(cm.exception.code, 'file_busy')
+        self.assertEqual(sorted(os.listdir(self.lib)), ['ספר.txt'])
 
 
 if __name__ == '__main__':
