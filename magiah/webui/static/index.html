@@ -57,6 +57,8 @@
 
     <div class="f-group">
       <label class="chk-row"><input type="checkbox" id="fVerified"> מאומתים בלבד <span class="info-i" data-tip="הצג רק ממצאים ברמת ודאות גבוהה — מומלץ להתחיל מהם">ⓘ</span></label>
+      <label class="chk-row"><input type="checkbox" id="fHideIrr" checked> הסתר נתיבי «לא רלוונטי» <span class="info-i" data-tip="ספרים שנתיב הקובץ שלהם כולל «לא רלוונטי» (או «לא רלונטי») לא יוצגו — בטבלה, בכרטיסים ובמתקן">ⓘ</span></label>
+      <label class="chk-row"><input type="checkbox" id="fHideDb" checked> הסתר ספרים לייצוא בלבד <span class="info-i" data-tip="ספרים ממסד הנתונים שאינם קובץ טקסט — אפשר רק לייצא את התיקונים שלהם">ⓘ</span></label>
     </div>
 
     <div class="f-group">
@@ -126,6 +128,8 @@
           <select id="fixBook" size="1"><option value="">בחר ספר לתיקון…</option></select>
         </div>
         <label class="chk-row"><input type="checkbox" id="fixInclude"> כלול גם «דרוש בירור» ו«טרם נבדק»</label>
+        <label class="chk-row" title="ספרים שנתיב הקובץ שלהם כולל «לא רלוונטי» (או «לא רלונטי») לא יוצגו ברשימה"><input type="checkbox" id="fixHideIrrelevant" checked> הסתר נתיבי «לא רלוונטי»</label>
+        <label class="chk-row" title="ספרים ממסד הנתונים שאינם קובץ טקסט — אפשר רק לייצא את התיקונים שלהם"><input type="checkbox" id="fixHideExportOnly" checked> הסתר ספרים לייצוא בלבד</label>
         <select id="fixView" title="הצגת סוג מסוים בלבד — הסדר תמיד לפי מספר השורה בספר">
           <option value="">הכל</option>
         </select>

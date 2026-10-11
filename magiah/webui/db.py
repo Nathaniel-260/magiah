@@ -1839,10 +1839,33 @@ def get_meta(con, outdir=None):
                               if outdir else None)}
 
 
-def get_books(con, origin=None, q=None):
+# "not relevant" in a book's path, in both common spellings; LIKE's `_`
+# also covers a space, underscore or hyphen between the words
+_IRRELEVANT_SQL = ("NOT (COALESCE(f.unit, '') || '|' || COALESCE(f.doc, '') "
+                   "LIKE '%לא_רלוונטי%' OR COALESCE(f.unit, '') || '|' || "
+                   "COALESCE(f.doc, '') LIKE '%לא_רלונטי%')")
+# a finding inside a text file; anything else is a DB book (export only)
+_FILE_ONLY_SQL = "(f.unit LIKE 'file:%' OR f.unit LIKE 'local:%')"
+
+
+def _on(v):
+    return v not in (None, '', '0', False)
+
+
+def _hide_where(filters):
+    """The view-wide "hide" switches, shared by every findings query."""
+    where = []
+    if _on(filters.get('hide_irr')):
+        where.append(_IRRELEVANT_SQL)
+    if _on(filters.get('hide_db')):
+        where.append(_FILE_ONLY_SQL)
+    return where
+
+
+def get_books(con, origin=None, q=None, hide=None):
     """Books by stable key (doc). Two books with one title stay two
     entries; `source` is the title to display, `key` is what to filter on."""
-    where, params = [], []
+    where, params = _hide_where(hide or {}), []
     if origin:
         where.append('f.origin = ?')
         params.append(origin)
@@ -1874,7 +1897,7 @@ def _book_key_where(key):
 
 
 def _findings_where(filters):
-    where, params = [], []
+    where, params = _hide_where(filters), []
     if filters.get('origin'):
         where.append('f.origin = ?')
         params.append(filters['origin'])
