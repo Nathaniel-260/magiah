@@ -523,6 +523,8 @@ function repaintStatuses(ids) {
 }
 
 async function doUndo() {
+  if (S.undoBusy) return;
+  S.undoBusy = true;
   try {
     const resp = await api("/api/undo", { method: "POST" });
     const last = S.lastActions.pop();
@@ -557,6 +559,8 @@ async function doUndo() {
     if (S.view === "table") loadTable();
   } catch (e) {
     toast("הביטול נכשל: " + e.message, "err");
+  } finally {
+    S.undoBusy = false;
   }
 }
 
@@ -1141,6 +1145,17 @@ function resetCardQueue() {
 
 function currentCard() { return S.cq ? S.cq.head() : null; }
 
+/* Going back is just undo: the last decision is reverted on the server and
+ * its card returns to the head of the queue, ready to be decided again. Kept
+ * on the card itself, since the toolbar button is easy to miss mid-triage. */
+function cardBackBtn() {
+  const b = el("button", { class: "act-back", title: "ביטול ההחלטה האחרונה והחזרת הכרטיס שלה למסך (Ctrl+Z)" },
+    el("span", { class: "lbl" }, "↩ חזרה לקודם"), el("kbd", null, "Backspace"));
+  b.disabled = !S.lastActions.length;
+  b.addEventListener("click", () => doUndo());
+  return b;
+}
+
 function renderCard() {
   const box = $("#cardBox");
   const meta = $("#cardMeta");
@@ -1149,7 +1164,7 @@ function renderCard() {
   meta.replaceChildren(
     el("span", null, "בתור: " + fmtNum(q.queue.length) + (q.exhausted ? "" : "+")),
     q.skipped.length ? el("span", { title: "יוצגו שוב בסוף התור" }, "נדחו לאחר כך: " + fmtNum(q.skipped.length)) : null,
-    el("span", null, "קיצורים: י=אושר · נ=לא שגיאה · ד=לא בכל מקום · ת=תיקון · ע=התעלם · ב=בירור · ק=תוקן · רווח=דלג"));
+    el("span", null, "קיצורים: י=אושר · נ=לא שגיאה · ד=לא בכל מקום · ת=תיקון · ע=התעלם · ב=בירור · ק=תוקן · רווח=דלג · Backspace=חזרה לקודם"));
   box.replaceChildren();
   if (!r) {
     // "done" only on the server's word — never because the local list ran out
@@ -1160,6 +1175,7 @@ function renderCard() {
       : "טוען ממצאים…";
     box.append(el("div", { class: "card-done" },
       el("div", { class: "big" }, st === "done" ? "🎉" : st === "remaining" ? "⚠" : "⏳"), msg));
+    if (S.lastActions.length) box.append(el("div", { class: "card-actions primary-row" }, cardBackBtn()));
     return;
   }
   const info = errtypeInfo(r.errtype);
@@ -1202,7 +1218,8 @@ function renderCard() {
   box.append(el("div", { class: "card-actions primary-row" },
     mkBtn("✅ אושר — זו שגיאה", "י", () => cardAct("approved"), "act-approve"),
     mkBtn("❌ לא שגיאה", "נ", () => cardAct("not_error"), "act-reject"),
-    mkBtn("⏭ דלג", "רווח", () => cardSkip(), "act-skip")));
+    mkBtn("⏭ דלג", "רווח", () => cardSkip(), "act-skip"),
+    cardBackBtn()));
   box.append(el("div", { class: "card-actions second-row" },
     mkBtn("❌ לא שגיאה בכל מקום", "ד", () => cardAct("not_error", { scope: "word" })),
     // narrower than "everywhere": the word may still be wrong elsewhere
@@ -3266,6 +3283,7 @@ document.addEventListener("keydown", ev => {
     else if (keyIs(ev, "unsure")) { ev.preventDefault(); cardAct("unsure"); }
     else if (keyIs(ev, "fixedBook")) { ev.preventDefault(); cardAct("fixed"); }
     else if (ev.code === "Space" || ev.key === " ") { ev.preventDefault(); cardSkip(); }
+    else if (ev.key === "Backspace") { ev.preventDefault(); doUndo(); }
   } else if (S.view === "fixer") {
     const cur = currentFixRow();
     if ((ev.ctrlKey || ev.metaKey) && (ev.code === "KeyS" || ev.key === "s")) {
