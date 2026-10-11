@@ -217,12 +217,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/meta':
             self._json(db.get_meta(con, self.outdir))
         elif path == '/api/books':
-            books = db.get_books(con, q.get('origin'), q.get('q'))
+            books = db.get_books(con, q.get('origin'), q.get('q'),
+                                 hide={k: q.get(k)
+                                       for k in ('hide_irr', 'hide_db')})
             self._json({'books': books, 'rows': books, 'total': len(books)})
         elif path == '/api/findings':
             filters = {k: q.get(k) for k in
                        ('origin', 'book', 'book_key', 'errtype', 'status',
-                        'verified', 'min_rank', 'q', 'ids')}
+                        'verified', 'min_rank', 'q', 'ids',
+                        'hide_irr', 'hide_db')}
             if 'cursor' in q:
                 # keyset paging (card queue): stable under status changes
                 rows, total, nxt = db.query_findings_page(

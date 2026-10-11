@@ -281,6 +281,24 @@ class TestD3BookIdentity(Case):
         one = db.get_fixlist(self.con, book_key='2', statuses='pending')
         self.assertEqual([i['id'] for i in one['items']], [2])
 
+    def test_hide_irrelevant_paths_and_db_books(self):
+        self.add(1, 'בית', 'ביתו', 'file:א/ב.txt:3', doc='א/ב.txt')
+        self.add(2, 'בית', 'ביתו', 'file:לא רלוונטי/ג.txt:3',
+                 doc='לא רלוונטי/ג.txt')
+        self.add(3, 'בית', 'ביתו', 'file:x/לא_רלונטי/ד.txt:3',
+                 doc='x/לא_רלונטי/ד.txt')
+        self.add(4, 'בית', 'ביתו', '100', doc='1')          # a DB book
+
+        def ids(**f):
+            return sorted(r['id'] for r in db.query_findings(self.con, f)[0])
+        self.assertEqual(ids(), [1, 2, 3, 4])
+        self.assertEqual(ids(hide_irr='1'), [1, 4])
+        self.assertEqual(ids(hide_db='1'), [1, 2, 3])
+        self.assertEqual(ids(hide_irr='1', hide_db='1'), [1])
+        self.assertEqual(ids(hide_irr='0', hide_db=''), [1, 2, 3, 4])
+        books = db.get_books(self.con, hide={'hide_irr': '1', 'hide_db': '1'})
+        self.assertEqual([b['key'] for b in books], ['א/ב.txt'])
+
 
 # ---------------------------------------------------------------------------
 # D4 — undo restores the whole previous decision

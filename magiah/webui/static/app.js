@@ -105,6 +105,10 @@ const STATUS_ICONS = { pending: "⬜", approved: "✅", fixed: "🔧", not_error
 const S = {
   meta: null,
   view: "table",
+  // view-wide: hide books whose path says "לא רלוונטי", and DB books that
+  // can only be exported (remembered per browser, not in the URL)
+  hideIrr: true,
+  hideDb: true,
   filters: { origin: "", book: "", errtypes: [], statuses: [], verified: false, min_rank: 0, q: "", sort: "rank", dir: "desc" },
   page: 1,
   pageSize: 50,
@@ -234,6 +238,8 @@ function filterParams(overrides) {
   if (errtypes && errtypes.length) p.set("errtype", errtypes.join(","));
   if (sts && sts.length) p.set("status", sts.join(","));
   if (val("verified", f.verified)) p.set("verified", "1");
+  if (S.hideIrr) p.set("hide_irr", "1");
+  if (S.hideDb) p.set("hide_db", "1");
   const mr = val("min_rank", f.min_rank);
   if (mr) p.set("min_rank", String(mr));
   const q = val("q", f.q);
@@ -645,6 +651,8 @@ const loadBooks = debounce(async function () {
   const p = new URLSearchParams();
   if (S.filters.origin) p.set("origin", S.filters.origin);
   if (q) p.set("q", q);
+  if (S.hideIrr) p.set("hide_irr", "1");
+  if (S.hideDb) p.set("hide_db", "1");
   try {
     const resp = await api("/api/books?" + p);
     const books = Array.isArray(resp) ? resp : (resp.books || resp.rows || []);
@@ -1290,6 +1298,15 @@ async function loadFixerBooks() {
   renderFixBookOptions();
 }
 
+/* A book filed under a "not relevant" folder (both common spellings) is not
+ * work for the corrector; nor is a DB book, which can only be exported. */
+const IRRELEVANT_RE = /לא[\s_-]*רלו?ונטי/;
+function fixBookHidden(b) {
+  if (S.hideDb && !b.editable) return true;
+  if (S.hideIrr && IRRELEVANT_RE.test([b.path, b.key, b.folder].join("/"))) return true;
+  return false;
+}
+
 /* The picker is filtered in the browser: the whole list is already here, and
  * a corrector hunting for one book among hundreds should not wait for a round
  * trip on every keystroke. The book currently open always stays listed, so
@@ -1298,7 +1315,8 @@ function renderFixBookOptions() {
   const sel = $("#fixBook");
   if (!sel) return;
   const q = ($("#fixBookSearch") ? $("#fixBookSearch").value : "").trim();
-  const books = S.fixBooks || [];
+  const all = S.fixBooks || [];
+  const books = all.filter(b => !fixBookHidden(b));
   const hits = q
     ? books.filter(b => (b.title || "").indexOf(q) >= 0 ||
                         (b.folder || "").indexOf(q) >= 0)
@@ -1308,7 +1326,11 @@ function renderFixBookOptions() {
   // search result, which would be a lie
   const shown = hits.slice();
   if (q && S.fixKey && !shown.some(b => b.key === S.fixKey)) {
-    const open = books.find(b => b.key === S.fixKey);
+    const open = all.find(b => b.key === S.fixKey);
+    if (open) shown.push(open);
+  }
+  if (!q && S.fixKey && !shown.some(b => b.key === S.fixKey)) {
+    const open = all.find(b => b.key === S.fixKey);
     if (open) shown.push(open);
   }
   sel.replaceChildren(el("option", { value: "" },
@@ -3362,6 +3384,23 @@ function bindControls() {
   });
   for (const b of $$("#fixPickBar .fp-btn")) {
     b.addEventListener("click", () => fixPick(b.dataset.pick));
+  }
+  // the same two switches sit in the sidebar and in the fixer bar
+  for (const [prop, ids] of [["hideIrr", ["#fHideIrr", "#fixHideIrrelevant"]],
+                             ["hideDb", ["#fHideDb", "#fixHideExportOnly"]]]) {
+    try { const v = localStorage.getItem("magiah_" + prop); if (v !== null) S[prop] = v === "1"; } catch (e) {}
+    for (const id of ids) {
+      const box = $(id);
+      box.checked = S[prop];
+      box.addEventListener("change", () => {
+        S[prop] = box.checked;
+        for (const other of ids) $(other).checked = S[prop];
+        try { localStorage.setItem("magiah_" + prop, S[prop] ? "1" : "0"); } catch (e) {}
+        renderFixBookOptions();
+        loadBooks();
+        filtersChanged();
+      });
+    }
   }
   $("#fixBookSearch").addEventListener("input", debounce(renderFixBookOptions, 120));
   $("#fixBookSearch").addEventListener("keydown", ev => {
