@@ -764,6 +764,8 @@ section#view-cards.visible { display: flex; flex-direction: column; }
 .act-reject:hover { background: color-mix(in srgb, var(--red) 18%, transparent) !important; }
 .act-reject kbd { border-color: var(--red); color: var(--red); }
 .act-skip { color: var(--muted); }
+.act-back { color: var(--muted); }
+.act-back:disabled { opacity: .45; cursor: default; }
 
 /* secondary row — the occasional escapes */
 .card-actions.second-row button {
