@@ -89,7 +89,12 @@ common failure modes of naive edit-distance flagging:
 * **Foreign-language passages** — lines where too many words are uncommon
   (e.g. Judeo-Arabic in תפסיר רס"ג) are skipped entirely (`foreign_ratio`).
 * **Names** — a rare word right after שם/רב/רבי/הרב… is likely a proper name
-  and is suppressed.
+  and is suppressed. The lexicon stage also counts how often each word stands
+  in a name position (`names.pkl`); with `names_sugg` set (100 is a good
+  value; default 0 = off) "the name" is up to `name_window` (3) words, and a
+  word in it is still reported when the corpus never had it in a name
+  position and its suggestion is a name seen there at least `names_sugg`
+  times — a known name misspelled.
 * **Book-local conventions** — a "typo" repeated many times in the same book
   is probably that book's spelling convention; it is down-ranked, not flagged.
 * **Optional whitelist** (`--whitelist words.txt`, repeatable) — words listed
