@@ -152,10 +152,14 @@ def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
     return alts_out
 
 
-def _locate(book, freq, cfg, flagged, prof):
+def _locate(book, freq, cfg, flagged, prof, names=None):
+    # a file from outside the library is not part of the corpus the name
+    # list was counted from
+    in_corpus = book.kind != 'file'
     occ, joins, ocr = [], [], []
     for unit, ref, content in book.lines:
-        res = core.locate_line(content, freq, cfg, flagged, prof)
+        res = core.locate_line(content, freq, cfg, flagged, prof, names,
+                               in_corpus)
         if res is None:
             continue
         o, j, c = res
@@ -301,6 +305,7 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         book, freq, cfg, out_dir, progress=say)
     profiles, psource = core.load_ocr_profiles(out_dir)
     prof = profiles.get(book.doc)
+    names = core.load_names(out_dir) if cfg.names_sugg else None
     seqs = [parts for cs in split_cands.values() for parts, _ in cs]
     scope = 'corpus' if (verify_ctx and spec is not None) else 'book'
 
@@ -308,7 +313,7 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         # One corpus pass counts everything. Context pairs are taken from the
         # findings BEFORE split resolution: a confirmed split only replaces a
         # word's explanation, so the final pairs are a subset of these.
-        pre_occ, _, _ = _locate(book, freq, cfg, errors, None)
+        pre_occ, _, _ = _locate(book, freq, cfg, errors, None, names)
         ctx_pairs, need = _context_needs(pre_occ, errors)
         say('[book] אימות הקשר מול כל המאגר — זה השלב הארוך בסריקת ספר בודד')
         ctx_counts, lc, seq_counts = verify_context(
@@ -324,7 +329,7 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
 
     alts = _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope)
     say(f'[book] {len(errors):,} צורות חשודות')
-    occ, joins, ocr = _locate(book, freq, cfg, errors, prof)
+    occ, joins, ocr = _locate(book, freq, cfg, errors, prof, names)
 
     if scope == 'book':
         # the same two questions as the corpus pass, asked of this book

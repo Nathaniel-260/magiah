@@ -26,6 +26,13 @@ class Config:
     nonfinal_max: int = 20   # non-final letter at word end: up to this freq
     foreign_ratio: float = 0.35  # skip lines with this share of uncommon words
                                  # (Judeo-Arabic / badly garbled passages)
+    names_sugg: int = 0      # words after a title are a name and skipped;
+                             # with a name list (names.pkl), one is still
+                             # reported when the corpus never had it in a
+                             # name position and its suggestion is a name
+                             # seen this often (0: off — skip them all)
+    name_window: int = 3     # ... "the name" is this many words after the
+                             # title (without the list: always 2)
     ocr_pair_min: int = 8    # confirmed substitutions of one letter pair in a
                              # single book to establish an OCR profile
     ocr_rare_max: int = 5    # profiled books: scan words up to this frequency

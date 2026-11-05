@@ -33,6 +33,7 @@ from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
 LEXICON_F = 'lexicon.pkl'
+NAMES_F = 'names.pkl'
 FLAGGED_F = 'flagged.pkl'
 SPLITS_F = 'split_cands.pkl'
 REPORT_DB_F = 'report.db'
@@ -633,22 +634,25 @@ def _latest_coverage(out_dir, stage):
 
 def _count_chunk(chunk):
     _chunk_stats_begin()
-    c = Counter()
+    c, names = Counter(), Counter()
     for _, text in _W['corpus'].iter_texts(chunk):
-        c.update(tokenize(text))
-    return c, _chunk_stats_end()
+        toks = tokenize(text)
+        c.update(toks)
+        count_names(toks, names)
+    return c, names, _chunk_stats_end()
 
 
 def build_lexicon(spec, cfg, out_dir):
     t0 = time.time()
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
-    lex = Counter()
+    lex, names = Counter(), Counter()
     stats = ReadStats()
     with _pool(spec, cfg) as pool:
-        for i, (c, st) in enumerate(
+        for i, (c, nc, st) in enumerate(
                 pool.imap_unordered(_count_chunk, chunks), 1):
             lex.update(c)
+            names.update(nc)
             stats.add(ReadStats.from_dict(st))
             print(f'  [lexicon] chunk {i}/{len(chunks)}  types={len(lex):,}  '
                   f'({time.time()-t0:.0f}s)', flush=True)
@@ -662,8 +666,61 @@ def build_lexicon(spec, cfg, out_dir):
     _require_text('lexicon', stats)
     _replace_atomically(os.path.join(out_dir, LEXICON_F),
                         _dump_pickle(dict(lex)))
+    # the name list belongs to this very lexicon file (load_names)
+    _replace_atomically(os.path.join(out_dir, NAMES_F), _dump_pickle(
+        {'lexicon': _lexicon_stamp(out_dir), 'names': dict(names)}))
     _write_coverage(out_dir, _coverage_info('lexicon', stats, extra,
                                             policy=policy))
+
+
+# The name list: how often the corpus has each word in a name position — one
+# or two words after one of these. Built in the lexicon pass; used by the
+# name rule of locate_line when Config.names_sugg is set.
+NAME_LIST_BEFORE = frozenset((
+    'ר', 'רב', 'רבי', 'רבינו', 'הרב', 'הגאון', 'בן', 'בר', 'הר"ר', 'מו"ה',
+    'מוה"ר', 'מהר"ר', 'כמוהר"ר', 'מהור"ר', 'אבד"ק', 'בק"ק', 'דק"ק', 'מק"ק',
+    'בכפר', 'בעיר', 'במדינת', 'לעיר', 'העיר'))
+
+
+def _name_position(toks, k):
+    """Is token `k` one or two words after a NAME_LIST_BEFORE word?"""
+    return ((k >= 1 and toks[k - 1] in NAME_LIST_BEFORE)
+            or (k >= 2 and toks[k - 2] in NAME_LIST_BEFORE))
+
+
+def count_names(toks, counts):
+    """Add the words of one token list that stand in a name position."""
+    if NAME_LIST_BEFORE.isdisjoint(toks):
+        return
+    for k in range(1, len(toks)):
+        if _name_position(toks, k):
+            w = toks[k]
+            if len(w) >= 2 and not is_abbrev(w):
+                counts[w] += 1
+
+
+def _lexicon_stamp(out_dir):
+    try:
+        st = os.stat(os.path.join(out_dir, LEXICON_F))
+    except OSError:
+        return None
+    return [st.st_size, st.st_mtime_ns]
+
+
+def load_names(out_dir):
+    """The name list built with the current lexicon, or None — no list (a
+    lexicon from before the list, or a list left over from another
+    lexicon): the name rule then works as it always did."""
+    path = os.path.join(out_dir, NAMES_F)
+    try:
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError):
+        return None
+    if not isinstance(obj, dict) or obj.get('lexicon') is None \
+            or obj.get('lexicon') != _lexicon_stamp(out_dir):
+        return None
+    return obj.get('names')
 
 
 # ---------------------------------------------------------------------------
@@ -1666,7 +1723,22 @@ def ocr_score(fw, fs):
     return 2 + math.log10(fs / max(fw, 1))
 
 
-def locate_line(content, freq, cfg, flagged, prof=None):
+def name_slip(toks, k, w, sugg, names, cfg, in_corpus=True):
+    """Inside a name, is `w` still a finding? Only with a name list and
+    ``cfg.names_sugg``: the corpus never had `w` in a name position (this
+    occurrence aside, when the text is part of the corpus), and the
+    suggestion is a name seen there at least ``names_sugg`` times — a known
+    name that was misspelled."""
+    if names is None or not cfg.names_sugg:
+        return False
+    seen = names.get(w, 0)
+    if in_corpus and _name_position(toks, k):
+        seen -= 1
+    return seen <= 0 and names.get(sugg, 0) >= cfg.names_sugg
+
+
+def locate_line(content, freq, cfg, flagged, prof=None, names=None,
+                in_corpus=True):
     """All findings of one line; core.locate and the book scan both use it.
 
     Returns None for a skipped foreign/garbled line, else ``(occ, joins,
@@ -1675,6 +1747,9 @@ def locate_line(content, freq, cfg, flagged, prof=None):
     correction, corr_freq, snippet)]``. Snippets exist only for reported
     tokens and are bounded, so a multi-MB line stays linear in time and
     memory and is never truncated.
+
+    `names` — the name list (:func:`load_names`) or None; `in_corpus` — the
+    line is part of the corpus the list was counted from.
     """
     from .normalize import TOKEN_RE, clean
     text = clean(content)
@@ -1715,6 +1790,10 @@ def locate_line(content, freq, cfg, flagged, prof=None):
 
     # pass 2 — occurrences of flagged word types (+ OCR-profile layer)
     occ, ocr = [], []
+    # "the name": two words after a title; with a name list in use, up to
+    # name_window words
+    window = cfg.name_window if (names is not None and cfg.names_sugg) else 2
+    words = None
     paren = [0, 0]      # text scanned so far, '(' still open there
 
     def open_paren(pos):
@@ -1752,11 +1831,15 @@ def locate_line(content, freq, cfg, flagged, prof=None):
         prev = toks[k - 1].group() if k else ''
         nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
         # a rare word right after a title (ר' פלוני, מוה"ר ר' פלוני) is a
-        # person/place name, not a typo
-        if fr[1] not in ('missing_space', 'final_midword') \
-                and (prev in NAME_TRIGGERS
-                     or (k >= 2 and toks[k - 2].group() in NAME_TRIGGERS)):
-            continue
+        # person/place name, not a typo — unless the name list shows a
+        # known name misspelled (name_slip)
+        if fr[1] not in ('missing_space', 'final_midword') and any(
+                k >= d and toks[k - d].group() in NAME_TRIGGERS
+                for d in range(1, window + 1)):
+            if words is None:
+                words = [t.group() for t in toks]
+            if not name_slip(words, k, w, fr[2], names, cfg, in_corpus):
+                continue
         occ.append((w, prev, nxt, _snippet(text, s, e)))
     return occ, joins, ocr
 
@@ -1765,9 +1848,11 @@ def _locate_chunk(chunk):
     _chunk_stats_begin()
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
     profiles = _W.get('ocr_profiles') or {}
+    names = (_W.get('names') or {}).get('names')
     occ, joins, ocr = [], [], []
     for uid, doc, content in _W['corpus'].iter_texts_docs(chunk):
-        res = locate_line(content, freq, cfg, flagged, profiles.get(doc))
+        res = locate_line(content, freq, cfg, flagged, profiles.get(doc),
+                          names)
         if res is None:
             continue
         o, j, c = res
@@ -1840,6 +1925,13 @@ def locate(spec, cfg, out_dir):
     lstats = ReadStats()
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
+    if cfg.names_sugg:
+        if load_names(out_dir) is not None:
+            loads['names'] = os.path.join(out_dir, NAMES_F)
+            print('[locate] name list in use', flush=True)
+        else:
+            print(f'[locate] no {NAMES_F} for this lexicon - names are '
+                  f'skipped as before', flush=True)
     prof_path = os.path.join(out_dir, OCR_PROFILES_F)
     # the same rule as the book scan (load_ocr_profiles): only a file whose
     # hash calibration_meta.json vouches for
