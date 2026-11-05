@@ -113,6 +113,8 @@ def _run_book_cmd(args, spec, cfg, out_dir):
               file=sys.stderr, flush=True)
         return 1
     source = args.book_source or _guess_book_source(args.book)
+    if args.book_real_word:
+        cfg.real_word = 1
     from .webui import db as uidb
     # recorded apart from the pipeline's runs: a book scan never touches the
     # full scan's results, so it must neither raise nor clear their warning
@@ -166,6 +168,11 @@ def main(argv=None):
     bk.add_argument('--book-verify-ctx', action='store_true',
                     help='verify corrections against the whole corpus '
                          '(slower, matches a full scan more closely)')
+    bk.add_argument('--book-real-word', action='store_true',
+                    help='also look for one-letter slips that produced '
+                         'another existing word, judged by the neighbouring '
+                         'words; the corpus counts are made by a '
+                         '--book-verify-ctx scan and kept for later scans')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')
