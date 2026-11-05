@@ -30,6 +30,13 @@ class Config:
                              # single book to establish an OCR profile
     ocr_rare_max: int = 5    # profiled books: scan words up to this frequency
     ocr_ratio: int = 20      # ... requiring correction/word frequency ratio
+    real_word: int = 0       # book scan (1 = on): also judge common words by
+                             # their neighbours (magiah.realword)
+    real_word_odds: float = 5.49  # ... hint when log10 odds that the word
+                                  # is wrong reach this
+    real_word_rep: int = 3   # ... a word the book uses this often, and at
+                             # least as often as the suggestion, is its
+                             # own spelling
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
