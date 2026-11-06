@@ -41,6 +41,14 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         # oldest supported (pyproject requires-python) and newest
         python-version: ["3.9", "3.14"]
+        # ubuntu-latest (26.04) has no Python 3.9 build; keep 3.9 Linux
+        # coverage on the last Ubuntu image that ships it
+        exclude:
+          - os: ubuntu-latest
+            python-version: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.9"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
