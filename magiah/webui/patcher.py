@@ -848,7 +848,8 @@ def _scanner_skips(text, clean_text, occ, word, finding, doc=None):
     """Would the scan have passed over this copy without a finding? The
     same rules as core.locate_line, on the same clean text (a join of two
     words, which needs the lexicon, is not modelled: such a copy is
-    counted, and a count that then disagrees refuses)."""
+    counted, and a count that then disagrees refuses). The name rule is
+    :func:`_in_name`'s."""
     if len(word.split()) != 1:
         return False                 # a split word is not reported per token
     s, e = occ[2], occ[3]
@@ -867,13 +868,21 @@ def _scanner_skips(text, clean_text, occ, word, finding, doc=None):
                 depth -= 1
         if not depth:
             return True
-    if errtype in ('missing_space', 'final_midword'):
-        return False
+    return False
+
+
+def _in_name(text, occ, word, finding, doc=None):
+    """Does this copy stand where the scan's name rule skips a word
+    (core.name_position — the very rule, not a copy of it)?"""
+    if len(word.split()) != 1:
+        return False                 # a split word is not reported per token
     info = _line_info(doc, text)
-    k = info.index_at(s)
-    return k is not None and any(
-        0 <= k - j and info.spans[k - j][0] in core.NAME_TRIGGERS
-        for j in (1, 2))
+    k = info.index_at(occ[2])
+    if not k:
+        return False
+    lo = max(0, k - core.NAME_WINDOW)
+    return core.name_position([sp[0] for sp in info.spans[lo:k + 1]],
+                              k - lo, finding.get('errtype'))
 
 
 def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
@@ -910,6 +919,14 @@ def _scanned_copy(line, lineno, word, finding, spans, own_edits, doc=None):
     # what proves the copy
     occs = [o for o in occs if not _scanner_skips(then, clean_then, o, word,
                                                  finding, doc)]
+    # a copy in a name position is skipped — unless the scan used the name
+    # list and found the word a misspelled known name (core.name_slip). That
+    # verdict depends on the list and settings of the scan, not of now, and
+    # is the same for every such copy on the line; the finding's count
+    # tells which one the scan gave: with them or without them
+    plain = [o for o in occs if not _in_name(then, o, word, finding, doc)]
+    if len(plain) != len(occs) and expected != len(occs):
+        occs = plain
     if expected is not None and expected != len(occs):
         refuse('occurrence_count_changed')
     if not 0 <= occurrence < len(occs):

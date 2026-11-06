@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """The name list: a misspelled known name after a title is still reported."""
+import json
 import os
-import pickle
 import shutil
 import sqlite3
 import tempfile
@@ -10,6 +10,10 @@ from collections import Counter
 
 from magiah import book_scan, core
 from magiah.config import Config
+from magiah.normalize import tokenize
+from magiah.webui import patcher, scanner
+
+from test_anchor_write import TempCase
 
 
 def small_cfg(**kw):
@@ -28,11 +32,14 @@ def write_lib(root, books):
             f.write('\n'.join(lines) + '\n')
 
 
-# Invented words: אברהם is the name, אכרהם a one-letter slip of it.
+# Invented words: אברהם is the name, אכרהם a one-letter slip of it; הדכר a
+# slip of the common word הדבר.
 NAME, SLIP = 'אברהם', 'אכרהם'
-FLAGGED = {SLIP: (1, 'edit1_sub', NAME, 150, 4.0)}
-FREQ = {'אמר': 200, 'ר': 200, NAME: 150, 'הדבר': 200, 'יוסף': 200,
-        'בן': 200, SLIP: 1}
+TYPO, WORD = 'הדכר', 'הדבר'
+FLAGGED = {SLIP: (1, 'edit1_sub', NAME, 150, 4.0),
+           TYPO: (1, 'edit1_sub', WORD, 200, 4.0)}
+FREQ = {'אמר': 200, 'ר': 200, NAME: 150, WORD: 200, 'יוסף': 200,
+        'משה': 200, 'חיים': 200, 'בן': 200, SLIP: 1, TYPO: 1}
 
 
 def occ_words(line, names, cfg=None, in_corpus=True):
@@ -41,18 +48,34 @@ def occ_words(line, names, cfg=None, in_corpus=True):
     return [o[0] for o in res[0]]
 
 
+def names_of(lines):
+    c = Counter()
+    for ln in lines:
+        core.count_names(tokenize(ln), c)
+    return dict(c)
+
+
 class CountNames(unittest.TestCase):
 
-    def test_one_or_two_words_after_a_title(self):
+    def test_up_to_three_words_after_a_title(self):
         c = Counter()
-        core.count_names(['אמר', 'ר', 'יוסף', 'בן', 'שמעון', 'היום'], c)
-        self.assertEqual(c, Counter({'יוסף': 1, 'בן': 1, 'שמעון': 1,
-                                     'היום': 1}))
+        core.count_names(['אמר', 'ר', 'יוסף', 'משה', 'שמעון', 'היום'], c)
+        self.assertEqual(c, Counter({'יוסף': 1, 'משה': 1, 'שמעון': 1}))
 
     def test_no_title_no_names(self):
         c = Counter()
         core.count_names(['אמר', 'יוסף', 'היום'], c)
         self.assertEqual(c, Counter())
+
+    def test_ben_and_bar_are_not_titles(self):
+        # בן אדם, בר מצוה: not names
+        c = Counter()
+        core.count_names(['בן', 'אדם', 'בר', 'מצוה'], c)
+        self.assertEqual(c, Counter())
+
+    def test_the_list_titles_include_the_rule_titles(self):
+        self.assertTrue(core.NAME_TRIGGERS <= core.NAME_LIST_BEFORE)
+        self.assertGreaterEqual(core.NAME_COUNT_WINDOW, core.NAME_WINDOW)
 
     def test_abbreviations_and_single_letters_are_not_names(self):
         c = Counter()
@@ -63,29 +86,43 @@ class CountNames(unittest.TestCase):
 class NameSlip(unittest.TestCase):
 
     def test_without_a_list_or_the_option_nothing_changes(self):
-        self.assertFalse(core.name_slip(['ר', SLIP], 1, SLIP, NAME, None,
+        self.assertFalse(core.name_slip(['ר', SLIP], 1, NAME, None,
                                         small_cfg(names_sugg=100)))
-        self.assertFalse(core.name_slip(['ר', SLIP], 1, SLIP, NAME,
+        self.assertFalse(core.name_slip(['ר', SLIP], 1, NAME,
                                         {NAME: 500}, small_cfg()))
+
+    def test_negative_threshold_is_off(self):
+        self.assertFalse(core.names_on(small_cfg(names_sugg=-1)))
+        self.assertFalse(core.name_slip(['ר', TYPO], 1, WORD,
+                                        {NAME: 500}, small_cfg(names_sugg=-1)))
+        self.assertEqual(occ_words(f'אמר ר {TYPO}', {NAME: 500},
+                                   small_cfg(names_sugg=-1)), [])
 
     def test_unseen_word_with_a_known_name_as_suggestion(self):
         cfg = small_cfg(names_sugg=100)
-        self.assertTrue(core.name_slip(['ר', SLIP], 1, SLIP, NAME,
+        self.assertTrue(core.name_slip(['ר', SLIP], 1, NAME,
                                        {NAME: 100}, cfg))
-        self.assertFalse(core.name_slip(['ר', SLIP], 1, SLIP, NAME,
+        self.assertFalse(core.name_slip(['ר', SLIP], 1, NAME,
                                         {NAME: 99}, cfg))
 
     def test_this_occurrence_is_not_evidence_for_itself(self):
         cfg = small_cfg(names_sugg=100)
         names = {NAME: 500, SLIP: 1}
-        self.assertTrue(core.name_slip(['ר', SLIP], 1, SLIP, NAME, names,
-                                       cfg))
+        self.assertTrue(core.name_slip(['ר', SLIP], 1, NAME, names, cfg))
         # ...unless the text is not part of the corpus the list came from
-        self.assertFalse(core.name_slip(['ר', SLIP], 1, SLIP, NAME, names,
-                                        cfg, in_corpus=False))
+        self.assertFalse(core.name_slip(['ר', SLIP], 1, NAME, names, cfg,
+                                        in_corpus=False))
         # seen as a name somewhere else too: a name of its own
-        self.assertFalse(core.name_slip(['ר', SLIP], 1, SLIP, NAME,
+        self.assertFalse(core.name_slip(['ר', SLIP], 1, NAME,
                                         {NAME: 500, SLIP: 2}, cfg))
+
+    def test_counted_window_matches_the_subtraction(self):
+        # a 3rd-word name is counted, so a corpus line with it at 3rd place
+        # and the same word 2nd elsewhere: both counted, never "unseen"
+        names = names_of([f'אמר ר משה חיים {SLIP}', f'אמר ר {SLIP} הדבר']
+                         + [f'אמר ר {NAME} הדבר'] * 120)
+        self.assertEqual(names[SLIP], 2)
+        self.assertEqual(occ_words(f'אמר ר {SLIP} הדבר', names), [])
 
 
 class LocateLine(unittest.TestCase):
@@ -105,20 +142,35 @@ class LocateLine(unittest.TestCase):
     def test_rare_name_like_a_rare_suggestion_is_skipped(self):
         self.assertEqual(occ_words(self.LINE, {NAME: 50}), [])
 
-    def test_the_third_word_belongs_to_the_name_with_a_list(self):
-        line = f'אמר ר יוסף בן {SLIP}'
-        # the old two-word name: the third word is checked as any word
-        self.assertEqual(occ_words(line, None), [SLIP])
-        # with the list: inside the name, and seen there elsewhere
-        self.assertEqual(occ_words(line, {NAME: 500, SLIP: 5}), [])
-        self.assertEqual(occ_words(line, {NAME: 500}, cfg=small_cfg(
-            names_sugg=100, name_window=2)), [SLIP])
+    def test_the_option_never_hides_a_finding(self):
+        # the name is two words after the title, with or without the list:
+        # a typo of a common word in third place is reported either way
+        line = f'אמר ר יוסף משה {TYPO}'
+        self.assertEqual(occ_words(line, None, cfg=small_cfg()), [TYPO])
+        self.assertEqual(occ_words(line, {NAME: 500}), [TYPO])
+        line = f'אמר ר יוסף {TYPO}'
+        self.assertEqual(occ_words(line, {NAME: 500}, cfg=small_cfg()), [])
+        self.assertEqual(occ_words(line, {NAME: 500}), [])
 
     def test_split_rules_ignore_names_as_before(self):
         flagged = {SLIP: (1, 'missing_space', 'אכר הם', 0, 3.0)}
         res = core.locate_line(self.LINE, FREQ, small_cfg(names_sugg=100),
                                flagged, None, {SLIP: 9})
         self.assertEqual([o[0] for o in res[0]], [SLIP])
+
+
+class WebuiValidation(unittest.TestCase):
+
+    def test_negative_names_sugg_is_refused(self):
+        d = tempfile.mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                scanner._merge_config(d, {'names_sugg': '-1'})
+            self.assertEqual(
+                scanner._merge_config(d, {'names_sugg': '100'}).names_sugg,
+                100)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 BOOK_A = 'Src/a.txt'
@@ -157,24 +209,45 @@ class Pipeline(unittest.TestCase):
         core.report(cfg, out)
         return out
 
-    def test_lexicon_stage_writes_the_list(self):
+    def lexicon(self, cfg=None):
         out = tempfile.mkdtemp(prefix='out_', dir=self.tmp)
-        core.build_lexicon(self.spec, small_cfg(), out)
-        names = core.load_names(out)
+        core.build_lexicon(self.spec, cfg or small_cfg(), out)
+        return out
+
+    def test_lexicon_stage_writes_the_list(self):
+        rec = core.load_names(self.lexicon())
+        names = rec['names']
         self.assertEqual(names[NAME], 120)
         self.assertEqual(names[SLIP], 1)
         self.assertEqual(names['הדבר'], 121)
+        self.assertEqual(sorted(rec['docs']), [BOOK_A, 'Src/b.txt'])
 
     def test_a_list_of_another_lexicon_is_not_used(self):
-        out = tempfile.mkdtemp(prefix='out_', dir=self.tmp)
+        out = self.lexicon()
+        old = os.path.join(self.tmp, 'old_names.pkl')
+        shutil.copy(os.path.join(out, core.NAMES_F), old)
         core.build_lexicon(self.spec, small_cfg(), out)
-        lp = os.path.join(out, core.LEXICON_F)
-        with open(lp, 'rb') as f:
-            lex = pickle.load(f)
-        lex['חדש'] = 1
-        with open(lp, 'wb') as f:
-            pickle.dump(lex, f)
+        self.assertIsNotNone(core.load_names(out))
+        shutil.copy(old, os.path.join(out, core.NAMES_F))
         self.assertIsNone(core.load_names(out))
+
+    def test_a_lexicon_without_an_id_has_no_list(self):
+        out = self.lexicon()
+        cov = os.path.join(out, core.COVERAGE_F.format(stage='lexicon'))
+        with open(cov, encoding='utf-8') as f:
+            rec = json.load(f)
+        del rec['lexicon_id']
+        with open(cov, 'w', encoding='utf-8') as f:
+            json.dump(rec, f)
+        self.assertIsNone(core.load_names(out))
+
+    def test_a_copied_results_folder_keeps_its_list(self):
+        out = self.lexicon()
+        dst = os.path.join(self.tmp, 'copied')
+        shutil.copytree(out, dst)
+        # a copy has fresh mtimes; the list still belongs to the lexicon
+        os.utime(os.path.join(dst, core.LEXICON_F), (1, 1))
+        self.assertIsNotNone(core.load_names(dst))
 
     def test_default_keeps_the_old_rule(self):
         out = self.run_full(small_cfg())
@@ -197,8 +270,7 @@ class Pipeline(unittest.TestCase):
 
     def test_file_outside_the_library_keeps_a_name_the_corpus_knows(self):
         cfg = small_cfg(names_sugg=100)
-        out = tempfile.mkdtemp(prefix='out_', dir=self.tmp)
-        core.build_lexicon(self.spec, cfg, out)
+        out = self.lexicon(cfg)
         path = os.path.join(self.tmp, 'new book.txt')
         with open(path, 'w', encoding='utf-8') as f:
             f.write(f'אמר ר {SLIP} הדבר\n')
@@ -207,6 +279,82 @@ class Pipeline(unittest.TestCase):
         # the corpus has SLIP once in a name position (in a.txt): a name
         self.assertEqual([r for r in res['findings'] if r['word'] == SLIP],
                          [])
+
+    def test_a_corpus_file_opened_by_path_is_in_the_corpus(self):
+        cfg = small_cfg(names_sugg=100)
+        out = self.lexicon(cfg)
+        res = book_scan.scan_book(out, 'file',
+                                  os.path.join(self.lib, 'Src', 'a.txt'),
+                                  cfg=cfg, library_dir=self.lib)
+        self.assertEqual([r['word'] for r in res['findings']
+                          if r['word'] == SLIP], [SLIP])
+
+    def test_a_book_of_another_library_is_not_in_the_corpus(self):
+        cfg = small_cfg(names_sugg=100)
+        out = self.lexicon(cfg)
+        lib2 = os.path.join(self.tmp, 'lib2')
+        write_lib(lib2, {BOOK_A: A_LINES})
+        lib_res = book_scan.scan_book(out, 'library', BOOK_A, cfg=cfg,
+                                      library_dir=lib2)
+        file_res = book_scan.scan_book(out, 'file',
+                                       os.path.join(lib2, 'Src', 'a.txt'),
+                                       cfg=cfg, library_dir=lib2)
+        for res in (lib_res, file_res):
+            self.assertEqual([r for r in res['findings']
+                              if r['word'] == SLIP], [])
+
+    def test_book_scan_says_when_the_list_is_missing(self):
+        cfg = small_cfg(names_sugg=100)
+        out = self.lexicon(cfg)
+        os.remove(os.path.join(out, core.NAMES_F))
+        said = []
+        book_scan.scan_book(out, 'library', BOOK_A, cfg=cfg,
+                            library_dir=self.lib, progress=said.append)
+        self.assertTrue(any(core.NAMES_F in s for s in said))
+
+
+PAD = ' '.join(['והלכה כדברי האומר שהתפלה במקום קרבן היא'] * 3)
+
+
+def scanned(line, w, fix, names, **kw):
+    """The findings of `line` as the review gives them to the fixer."""
+    freq = Counter({t: 10 ** 6 for t in tokenize(line)})
+    freq[w] = 1
+    occ = core.locate_line(line, freq, Config(**kw),
+                           {w: ('error', 'edit1_sub', fix)}, None, names)[0]
+    return [{'id': i + 1, 'lineno': 0, 'word': x, 'correction': fix,
+             'suggestion': fix, 'errtype': 'edit1_sub', 'snippet': snip,
+             'occurrence': i, 'expected_count': len(occ)}
+            for i, (x, _p, _n, snip) in enumerate(occ)]
+
+
+class FixerFollowsTheNameList(TempCase):
+    """The fixer's model of the scan skips the same copies the scan did."""
+
+    def test_a_name_slip_after_a_title_can_be_written(self):
+        line = f'אמר רבי {SLIP} כעבד לפני {SLIP} ולכן ' + PAD
+        fs = scanned(line, SLIP, NAME, {NAME: 500}, names_sugg=100)
+        self.assertEqual(len(fs), 2)
+        starts = []
+        for f in fs:
+            with self.subTest(occ=f['occurrence']):
+                p = patcher.plan_edit(self.doc(line + '\n'), dict(f))
+                starts.append(p.start)
+        self.assertEqual(starts, [line.index(SLIP), line.rindex(SLIP)])
+
+    def test_the_name_copy_is_still_skipped_without_the_list(self):
+        line = f'אמר רבי {SLIP} כעבד לפני {SLIP} ולכן ' + PAD
+        fs = scanned(line, SLIP, NAME, {NAME: 500})
+        self.assertEqual(len(fs), 1)
+        p = patcher.plan_edit(self.doc(line + '\n'), dict(fs[0]))
+        self.assertEqual(p.start, line.rindex(SLIP))
+
+    def test_a_third_word_copy_is_reported_and_written(self):
+        line = f'אמר רבי יוסף משה {TYPO} כעבד לפני {TYPO} ולכן ' + PAD
+        fs = scanned(line, TYPO, WORD, {NAME: 500}, names_sugg=100)
+        self.assertEqual(len(fs), 2)
+        p = patcher.plan_edit(self.doc(line + '\n'), dict(fs[1]))
+        self.assertEqual(p.start, line.rindex(TYPO))
 
 
 if __name__ == '__main__':
