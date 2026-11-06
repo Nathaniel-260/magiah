@@ -148,9 +148,9 @@ def _merge_config(outdir, overrides):
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 hebrew.SCAN_MESSAGES['bad_config_value'] + str(key))
-    if cfg.allow_unread < 0:
-        raise ValueError(
-            hebrew.SCAN_MESSAGES['bad_config_value'] + 'allow_unread')
+    for key in ('allow_unread', 'names_sugg'):
+        if getattr(cfg, key) < 0:
+            raise ValueError(hebrew.SCAN_MESSAGES['bad_config_value'] + key)
     return cfg
 
 
