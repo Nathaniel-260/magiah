@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from multiprocessing import Pool
 
 from .config import Config
-from . import realword, tanach
+from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
@@ -741,7 +741,7 @@ SPLIT_ALTS_F = 'split_alts.pkl'
 # kinds are deliberately distinct from corpus-wide ones.
 EVIDENCE_KINDS = ('tanach', 'context', 'context_book', 'book_local',
                   'split_observed', 'split_observed_book', 'structural',
-                  'ocr_profile', 'suspicion', 'none')
+                  'ocr_profile', 'suspicion', 'context_lm', 'none')
 STRUCTURAL_TYPES = ('nonfinal_end', 'final_midword', 'lost_quotes')
 
 
@@ -1809,7 +1809,10 @@ def _ctx_count_chunk(chunk):
     seq = _W.get('seq')
     rw = _W.get('rw')
     counts, local, seq_counts = Counter(), Counter(), {}
-    rw_counts = (Counter(), Counter()) if rw is not None else None
+    rw_counts = None
+    if rw is not None:
+        from .realword import count_ngrams
+        rw_counts = (Counter(), Counter())
     for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
         need = book_need.get(doc)
@@ -1821,8 +1824,8 @@ def _ctx_count_chunk(chunk):
         if seq is not None:
             seq.count(toks, seq_counts)
         if rw is not None and doc != rw['skip_doc']:
-            realword.count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
-                                  rw['first3'], *rw_counts)
+            count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
+                         rw['first3'], *rw_counts)
     return counts, local, seq_counts, rw_counts, _chunk_stats_end()
 
 

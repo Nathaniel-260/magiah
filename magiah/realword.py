@@ -18,13 +18,21 @@ small noisy-channel model (Mays, Damerau & Mercer, 1991):
 * **channel** — a fixed penalty for the substitution (:data:`CH_SUB`);
 * **context** — the bigram with the previous word and the bigram with the
   next one (Dirichlet smoothing toward the word's corpus frequency,
-  ``MU2``); when any candidate was seen between the same two words, the
+  ``MU2``; like the n-gram counts, the frequencies leave out the book's own
+  occurrences); when any candidate was seen between the same two words, the
   trigram counts take over (``MU3``, the bigram model as their prior);
 * the **hint** — the log10 odds that the word is wrong, against the best
-  candidate and the word itself, reach ``cfg.real_word_odds``.
+  candidate and the word itself, reach ``cfg.real_word_odds``. The default,
+  5.49, was tuned on OCR output from outside the corpus; a corpus of another
+  kind may want another value.
+
+Tokens another rule already explains on the same line (an extra-space join,
+an OCR-profile hit) and words in a name position (one or two words after a
+title, :data:`magiah.core.NAME_TRIGGERS`, as for the located findings) are
+not judged.
 
 A book's own convention is not an error: a word the book uses at least
-``cfg.real_word_rep`` times, and at least as often as the suggestion, gets no
+``cfg.real_word_rep`` times, and more often than the suggestion, gets no
 hint. The comparison matters — repeated OCR slips repeat too, and an
 absolute "seen 3 times in the book" skips most of them in a whole book.
 
@@ -36,7 +44,8 @@ rows of the scanned book itself. They are kept in ``real_word/`` in the
 output directory together with the set of n-grams that were asked for, so a
 later book-scope scan of the same book reuses them. A word whose neighbours
 were not counted — the book was edited since — is not judged (``stale``)
-until the next corpus-scope scan.
+until the next corpus-scope scan. The folder holds one file per book scanned
+this way and is never pruned; deleting it only costs a corpus-scope rescan.
 
 Off by default (``Config.real_word``). The findings use their own
 ``errtype`` (``real_word``); no existing finding changes.
@@ -49,6 +58,7 @@ import pickle
 from .normalize import CONFUSABLE, FROM_FINAL, TO_FINAL, TOKEN_RE, clean
 
 ERRTYPE = 'real_word'
+EVIDENCE = 'context_lm'    # a language-model judgement, not verification
 COUNTS_DIR = 'real_word'
 FORMAT = 1
 
@@ -83,13 +93,16 @@ def candidates(w, lex):
     return sorted(out)
 
 
-def judged(book, lex, flagged, editorial_adjacent, is_foreign_line):
+def judged(book, lex, flagged, editorial_adjacent, is_foreign_line,
+           covered=frozenset(), name_triggers=frozenset()):
     """Every word occurrence of `book` this module judges.
 
     Yields ``(unit, ref, text, match, prev, word, next, candidates)``. Lines
     the locate pass skips as foreign are skipped here too, and so are words
-    already explained by another rule (`flagged`) and words next to
-    editorial marks.
+    already explained by another rule (`flagged`, or ``(unit, word)`` in
+    `covered`: the tokens of an extra-space join or of an OCR-profile hit on
+    that line), words next to editorial marks, and words one or two words
+    after a title in `name_triggers` (a name, as in the locate pass).
     """
     memo = {}
     for unit, ref, content in book.lines:
@@ -99,7 +112,11 @@ def judged(book, lex, flagged, editorial_adjacent, is_foreign_line):
         if is_foreign_line(words, lex.freq, lex.cfg):
             continue
         for k, w in enumerate(words):
-            if w in flagged or not checked(w, lex):
+            if w in flagged or not checked(w, lex) \
+                    or (unit, w) in covered:
+                continue
+            if (k >= 1 and words[k - 1] in name_triggers) \
+                    or (k >= 2 and words[k - 2] in name_triggers):
                 continue
             cs = memo.get(w)
             if cs is None:
@@ -129,14 +146,19 @@ def needs(items):
 
 
 def count_ngrams(toks, n2, first2, n3, first3, c2, c3):
-    """Count the wanted bigrams and trigrams of one token list."""
+    """Count the wanted bigrams and trigrams of one token list.
+
+    Every wanted trigram starts with a wanted bigram (:func:`needs`), so a
+    trigram is only looked up where its first two words were wanted."""
     n = len(toks)
     for i in range(n - 1):
         t = toks[i]
-        if t in first2:
-            p = (t, toks[i + 1])
-            if p in n2:
-                c2[p] += 1
+        if t not in first2:
+            continue
+        p = (t, toks[i + 1])
+        if p not in n2:
+            continue
+        c2[p] += 1
         if t in first3 and i + 2 < n:
             q = (t, toks[i + 1], toks[i + 2])
             if q in n3:
@@ -221,8 +243,11 @@ def load_counts(out_dir, doc):
         return None, 'unreadable'
     if obj.get('lexicon') != lexicon_stamp(out_dir):
         return None, 'lexicon'
-    return Counts(obj['c2'], obj['c3'], obj['need2'], obj['need3'],
-                  obj.get('meta')), None
+    try:
+        return Counts(obj['c2'], obj['c3'], obj['need2'], obj['need3'],
+                      obj.get('meta')), None
+    except (KeyError, TypeError, ValueError):
+        return None, 'unreadable'
 
 
 # ---------------------------------------------------------------------------
@@ -234,23 +259,32 @@ def _lse(xs):
     return mx + math.log(sum(math.exp(x - mx) for x in xs))
 
 
-def posterior(lex, counts, prev, w, nxt, cands):
-    """``(words, log scores)``: `w` first, then `cands`; channel included."""
+def posterior(lex, counts, prev, w, nxt, cands, own=None):
+    """``(words, log scores)``: `w` first, then `cands`; channel included.
+
+    `own` -- the book's own word counts, left out of the corpus frequencies
+    as the n-gram counts leave out the book's rows (None: the book is not
+    part of the corpus). The total ``N`` keeps them; one book is a
+    negligible share of it."""
     xs = [w] + list(cands)
     freq, N = lex.freq, lex.N or 1
+    own = own or {}
+
+    def f(x):
+        return max(freq.get(x, 0) - own.get(x, 0), 0)
 
     def uni(x):
-        return (freq.get(x, 0) + 0.5) / N
+        return (f(x) + 0.5) / N
     lms = []
     for x in xs:
         if prev:
             s = math.log((counts.bi(prev, x) + MU2 * uni(x))
-                         / (freq.get(prev, 0) + MU2))
+                         / (f(prev) + MU2))
         else:
             s = math.log(uni(x))
         if nxt:
             s += math.log((counts.bi(x, nxt) + MU2 * uni(nxt))
-                          / (freq.get(x, 0) + MU2))
+                          / (f(x) + MU2))
         lms.append(s)
     if prev and nxt:
         cs = [counts.tri(prev, x, nxt) for x in xs]
@@ -262,20 +296,37 @@ def posterior(lex, counts, prev, w, nxt, cands):
     return xs, [s + (0.0 if i == 0 else CH_SUB) for i, s in enumerate(lms)]
 
 
-def judge(lex, counts, prev, w, nxt, cands, present, cfg):
+def check_config(cfg):
+    """The name of the first invalid real-word setting, or None."""
+    try:
+        if not math.isfinite(float(cfg.real_word_odds)):
+            return 'real_word_odds'
+    except (TypeError, ValueError):
+        return 'real_word_odds'
+    try:
+        if int(cfg.real_word_rep) < 1:
+            return 'real_word_rep'
+    except (TypeError, ValueError):
+        return 'real_word_rep'
+    return None
+
+
+def judge(lex, counts, prev, w, nxt, cands, present, cfg, own=None):
     """The verdict on one occurrence: a dict with ``state`` — ``'stale'``
     (its n-grams were not counted), ``'convention'`` (the book's own
-    spelling), ``'hint'`` or ``'ok'`` — plus ``sugg`` and ``odds`` (log10
-    odds that `w` is wrong) when it was judged."""
+    spelling: used at least ``real_word_rep`` times and more often than the
+    suggestion), ``'hint'`` or ``'ok'`` — plus ``sugg`` and ``odds`` (log10
+    odds that `w` is wrong) when it was judged. `own`: see
+    :func:`posterior`."""
     if not counts.covers(prev, nxt, [w] + cands):
         return {'state': 'stale'}
-    xs, sc = posterior(lex, counts, prev, w, nxt, cands)
+    xs, sc = posterior(lex, counts, prev, w, nxt, cands, own)
     j = max(range(1, len(xs)), key=lambda i: sc[i])
     odds = (_lse(sc[1:]) - sc[0]) / _LN10
     out = {'sugg': xs[j], 'odds': odds, 'state': 'ok'}
     if odds >= cfg.real_word_odds:
         rep = present.get(w, 0)
-        if rep >= cfg.real_word_rep and present.get(xs[j], 0) < rep:
+        if rep >= max(1, cfg.real_word_rep) and present.get(xs[j], 0) < rep:
             out['state'] = 'convention'
         else:
             out['state'] = 'hint'
