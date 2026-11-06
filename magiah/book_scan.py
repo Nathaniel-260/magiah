@@ -55,7 +55,7 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core
+from . import core, realword
 from .book_source import load_book
 from .config import Config
 from .corpus import OTZARIA_DB
@@ -185,9 +185,16 @@ def _context_needs(occ, errors):
 # ---------------------------------------------------------------------------
 
 def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None,
-                   stats=None):
+                   stats=None, rw_need=None):
     """Count the wanted pairs, book-local words and split sequences over the
     whole corpus, in ONE pass with the full pipeline's worker.
+
+    Returns ``(ctx_counts, local_counts, seq_counts, rw_counts)``.
+
+    `rw_need` -- ``(bigrams, trigrams, doc)`` for the real-word check
+    (:mod:`magiah.realword`): counted in the same pass, without the rows of
+    `doc`, into ``rw_counts = (bigram counts, trigram counts)``; None (the
+    check is off) leaves ``rw_counts`` None.
 
     A pass that missed more rows than ``cfg.allow_unread`` is refused; what
     it read is added to `stats`, so a caller can mark a result partial.
@@ -196,27 +203,39 @@ def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None,
     like `seqs`.
     """
     ctx_counts, local_counts, seq_counts = Counter(), Counter(), Counter()
+    rw_counts = (Counter(), Counter()) if rw_need is not None else None
     read = ReadStats()
-    if not ctx_pairs and not book_need and not seqs:
-        return ctx_counts, local_counts, seq_counts
+
+    def result():
+        return ctx_counts, local_counts, seq_counts, rw_counts
+    if not ctx_pairs and not book_need and not seqs \
+            and not (rw_need and (rw_need[0] or rw_need[1])):
+        return result()
     corpus = core.make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
     tmp = tempfile.mkdtemp(prefix='magiah_bookctx_')
     paths = {'ctx_pairs': os.path.join(tmp, 'ctx_pairs.pkl'),
              'book_need': os.path.join(tmp, 'book_need.pkl'),
              'split_cands': os.path.join(tmp, 'split_cands.pkl')}
+    objs = [('ctx_pairs', set(ctx_pairs)), ('book_need', book_need),
+            ('split_cands', [('', p) for p in seqs])]
+    if rw_need is not None:
+        paths['rw'] = os.path.join(tmp, 'rw.pkl')
+        objs.append(('rw', {'n2': set(rw_need[0]), 'n3': set(rw_need[1]),
+                            'skip_doc': rw_need[2]}))
     try:
-        for key, obj in (('ctx_pairs', set(ctx_pairs)),
-                         ('book_need', book_need),
-                         ('split_cands', [('', p) for p in seqs])):
+        for key, obj in objs:
             with open(paths[key], 'wb') as f:
                 pickle.dump(obj, f, protocol=4)
         with core._pool(spec, cfg, paths) as pool:
-            for i, (c, lc, sc, st) in enumerate(
+            for i, (c, lc, sc, rc, st) in enumerate(
                     pool.imap_unordered(core._ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
                 seq_counts.update(sc)
+                if rc is not None:
+                    rw_counts[0].update(rc[0])
+                    rw_counts[1].update(rc[1])
                 read.add(ReadStats.from_dict(st))
                 if progress:
                     progress(f'  [context] chunk {i}/{len(chunks)}')
@@ -244,7 +263,7 @@ def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None,
         raise BookScanError('\n'.join(msg))
     if stats is not None:
         stats.add(read)
-    return ctx_counts, local_counts, seq_counts
+    return result()
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +318,11 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     ctx_stats = ReadStats()
     lex, errors, split_cands, present, lsource = detect_in_book(
         book, freq, cfg, out_dir, progress=say)
+    rw_found = None
+    if cfg.real_word:
+        bad = realword.check_config(cfg)
+        if bad:
+            raise BookScanError('ערך לא תקין בהגדרה ' + bad)
     profiles, psource = core.load_ocr_profiles(out_dir)
     prof = profiles.get(book.doc)
     seqs = [parts for cs in split_cands.values() for parts, _ in cs]
@@ -308,12 +332,24 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         # One corpus pass counts everything. Context pairs are taken from the
         # findings BEFORE split resolution: a confirmed split only replaces a
         # word's explanation, so the final pairs are a subset of these.
-        pre_occ, _, _ = _locate(book, freq, cfg, errors, None)
+        pre_occ, pre_joins, _ = _locate(book, freq, cfg, errors, None)
         ctx_pairs, need = _context_needs(pre_occ, errors)
+        rw_need = None
+        if cfg.real_word:
+            # a superset of what is judged below (the OCR-profile hits are
+            # not known yet): extra n-grams only cost their count
+            n2, n3 = realword.needs(_real_word_items(
+                book, lex, errors, _covered(pre_joins, ())))
+            rw_need = (n2, n3, book.doc)
         say('[book] אימות הקשר מול כל המאגר — זה השלב הארוך בסריקת ספר בודד')
-        ctx_counts, lc, seq_counts = verify_context(
+        ctx_counts, lc, seq_counts, rw_counts = verify_context(
             spec, cfg, ctx_pairs, {book.doc: need}, seqs, progress=say,
-            stats=ctx_stats)
+            stats=ctx_stats, rw_need=rw_need)
+        if rw_need is not None:
+            rw_found = realword.Counts(
+                rw_counts[0], rw_counts[1], rw_need[0], rw_need[1],
+                {'corpus': spec, 'built': time.strftime('%Y-%m-%d %H:%M')})
+            realword.save_counts(out_dir, book.doc, rw_found)
         local_counts = Counter({w: c for (d, w), c in lc.items()
                                 if d == book.doc})
     else:
@@ -365,6 +401,13 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             'ref': ref, 'unit': unit, 'snippet': snip,
         })
 
+    real_word = None
+    if cfg.real_word:
+        real_word = _real_word_rows(book, lex, errors, present, rw_found,
+                                    cfg, out_dir, base, say,
+                                    _covered(joins, ocr))
+        rows.extend(real_word.pop('rows'))
+
     space_rows = [{
         'part1': p1, 'part2': p2, 'joined': j, 'join_freq': jf,
         'origin': book.origin, 'source': book.title, 'ref': ref,
@@ -396,7 +439,7 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         f'{len(space_rows):,} רווחים מיותרים  ({time.time() - t0:.1f} שניות)')
     if coverage:
         say(book_coverage_warning(book.title, coverage))
-    return {
+    out = {
         'doc': book.doc, 'title': book.title, 'origin': book.origin,
         'kind': book.kind, 'path': book.path, 'lines': len(book),
         # the bytes the rows above were read from (context verification can
@@ -410,6 +453,81 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         'coverage': coverage,
         'seconds': round(time.time() - t0, 1),
     }
+    if real_word is not None:       # off: the result is as it always was
+        out['real_word'] = real_word
+    return out
+
+
+# ---------------------------------------------------------------------------
+# optional: real-word errors judged by the neighbouring words
+# ---------------------------------------------------------------------------
+
+def _covered(joins, ocr):
+    """``(unit, word)`` of the tokens an extra-space join or an OCR-profile
+    hit already reports (rows of :func:`_locate`)."""
+    out = {(unit, w) for unit, _, p1, p2, *_ in joins for w in (p1, p2)}
+    out.update((unit, w) for unit, _, w, *_ in ocr)
+    return out
+
+
+def _real_word_items(book, lex, errors, covered):
+    return realword.judged(book, lex, errors, core._editorial_adjacent,
+                           core.is_foreign_line, covered,
+                           core.NAME_TRIGGERS)
+
+
+def _real_word_rows(book, lex, errors, present, counts, cfg, out_dir, base,
+                    say, covered):
+    """Findings of :mod:`magiah.realword` and a summary of the check.
+
+    `counts` are the ones this scan's corpus pass made; without them, the
+    counts saved by an earlier corpus-scope scan of the book are used.
+
+    The rows carry evidence ``context_lm`` with ``ctx_hits`` and
+    ``sugg_local`` 0: a language-model judgement is not the corroboration
+    those columns stand for, so the review never counts it as verified nor
+    ranks it up for them. The score carries the odds.
+    """
+    out = {'counts': 'this_scan' if counts is not None else 'saved',
+           'checked': 0, 'hints': 0, 'convention': 0, 'stale': 0,
+           'rows': []}
+    if counts is None:
+        counts, why = realword.load_counts(out_dir, book.doc)
+        if counts is None:
+            out['counts'] = why
+            say('[book] בדיקת מילים קיימות לפי ההקשר דורשת ספירה מול המאגר '
+                'כולו — יש לסרוק את הספר פעם אחת עם «אימות הקשר מול כל '
+                'המאגר» (בשורת הפקודה: ‎--book-verify-ctx‎)'
+                + (' (הספירה הקודמת נעשתה מול מילון אחר)'
+                   if why == 'lexicon' else ''))
+            return out
+    # the lexicon counted the book too, unless it is a file from outside
+    own = present if book.kind != 'file' else None
+    for unit, ref, text, m, prev, w, nxt, cs in _real_word_items(
+            book, lex, errors, covered):
+        v = realword.judge(lex, counts, prev, w, nxt, cs, present, cfg, own)
+        if v['state'] == 'stale':
+            out['stale'] += 1
+            continue
+        out['checked'] += 1
+        if v['state'] == 'convention':
+            out['convention'] += 1
+        if v['state'] != 'hint':
+            continue
+        out['hints'] += 1
+        sugg = v['sugg']
+        out['rows'].append({
+            **base, 'word': w, 'errtype': realword.ERRTYPE,
+            'suggestion': sugg, 'score': realword.score(v['odds']),
+            'ctx_hits': 0, 'sugg_local': 0, 'book_repeat': 0,
+            'evidence': realword.EVIDENCE, 'ref': ref, 'unit': unit,
+            'snippet': core._snippet(text, m.start(), m.end()),
+        })
+    say(f'[book] מילים קיימות לפי ההקשר: נבדקו {out["checked"]:,}, '
+        f'רמזים {out["hints"]:,}'
+        + (f', לא נבדקו (הטקסט השתנה מאז הספירה) {out["stale"]:,}'
+           if out['stale'] else ''))
+    return out
 
 
 def book_coverage_warning(title, coverage):
