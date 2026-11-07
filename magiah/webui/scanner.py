@@ -21,6 +21,7 @@ from .. import runstate
 from ..config import Config
 from ..corpus import OTZARIA_DB
 from ..corpus_hybrid import DEFAULT_LIBRARY
+from ..realword import check_config
 from . import hebrew
 
 STAGE_ORDER = ['lexicon', 'calibrate', 'detect', 'locate', 'report']
@@ -151,6 +152,9 @@ def _merge_config(outdir, overrides):
     for key in ('allow_unread', 'names_sugg'):
         if getattr(cfg, key) < 0:
             raise ValueError(hebrew.SCAN_MESSAGES['bad_config_value'] + key)
+    bad = check_config(cfg)
+    if bad:
+        raise ValueError(hebrew.SCAN_MESSAGES['bad_config_value'] + bad)
     return cfg
 
 

@@ -106,6 +106,10 @@ def _init(spec, cfg_dict, loads):
         _W['seq'] = SeqCounter(parts for _, parts in _W.pop('split_cands'))
     if 'ctx_pairs' in _W:
         _W['ctx_first'] = {a for a, _ in _W['ctx_pairs']}
+    if 'rw' in _W:
+        rw = _W['rw']
+        rw['first2'] = {a for a, _ in rw['n2']}
+        rw['first3'] = {a for a, _, _ in rw['n3']}
 
 
 def _pool(spec, cfg, loads=None):
@@ -863,7 +867,7 @@ SPLIT_ALTS_F = 'split_alts.pkl'
 # kinds are deliberately distinct from corpus-wide ones.
 EVIDENCE_KINDS = ('tanach', 'context', 'context_book', 'book_local',
                   'split_observed', 'split_observed_book', 'structural',
-                  'ocr_profile', 'suspicion', 'none')
+                  'ocr_profile', 'suspicion', 'context_lm', 'none')
 STRUCTURAL_TYPES = ('nonfinal_end', 'final_midword', 'lost_quotes')
 
 
@@ -1788,6 +1792,18 @@ def ocr_score(fw, fs):
     return 2 + math.log10(fs / max(fw, 1))
 
 
+def is_foreign_line(words, freq, cfg):
+    """Foreign-language / heavily garbled line: too many uncommon words for
+    point-fixes to mean anything. 1-2 letter tokens dilute the ratio."""
+    n_real = uncommon = 0
+    for t in words:
+        if len(t) >= 3:
+            n_real += 1
+            if freq.get(t, 0) < cfg.common_min:
+                uncommon += 1
+    return n_real >= 5 and uncommon > cfg.foreign_ratio * n_real
+
+
 def names_on(cfg):
     """Is the name list in use (``Config.names_sugg`` a positive count)?"""
     try:
@@ -1835,16 +1851,7 @@ def locate_line(content, freq, cfg, flagged, prof=None, names=None,
     from .normalize import TOKEN_RE, clean
     text = clean(content)
     toks = list(TOKEN_RE.finditer(text))
-    # foreign-language / heavily garbled lines: too many uncommon words for
-    # point-fixes to mean anything. 1-2 letter tokens dilute the ratio.
-    n_real = uncommon = 0
-    for m in toks:
-        t = m.group()
-        if len(t) >= 3:
-            n_real += 1
-            if freq.get(t, 0) < cfg.common_min:
-                uncommon += 1
-    if n_real >= 5 and uncommon > cfg.foreign_ratio * n_real:
+    if is_foreign_line([m.group() for m in toks], freq, cfg):
         return None
 
     # pass 1 — extra space: adjacent pair whose concatenation is a frequent
@@ -1955,12 +1962,20 @@ def _ctx_count_chunk(chunk):
     * ctx: how often does (neighbor, correction) occur as an adjacent pair?
     * local: how often does each proposed correction occur in the same book
       as the flagged word?
-    * seq (book scan only): spaced occurrences of split candidates."""
+    * seq (book scan only): spaced occurrences of split candidates.
+    * rw (book scan with ``Config.real_word`` only): the bigrams and trigrams
+      the real-word check needs, counted outside the scanned book itself.
+      Returned as ``(bigram counts, trigram counts)``, or None."""
     _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
     seq = _W.get('seq')
+    rw = _W.get('rw')
     counts, local, seq_counts = Counter(), Counter(), {}
+    rw_counts = None
+    if rw is not None:
+        from .realword import count_ngrams
+        rw_counts = (Counter(), Counter())
     for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
         need = book_need.get(doc)
@@ -1971,7 +1986,10 @@ def _ctx_count_chunk(chunk):
         count_pairs(toks, pairs, first, counts)
         if seq is not None:
             seq.count(toks, seq_counts)
-    return counts, local, seq_counts, _chunk_stats_end()
+        if rw is not None and doc != rw['skip_doc']:
+            count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
+                         rw['first3'], *rw_counts)
+    return counts, local, seq_counts, rw_counts, _chunk_stats_end()
 
 
 def write_scan_meta(con, spec):
@@ -2094,7 +2112,7 @@ def locate(spec, cfg, out_dir):
         cstats = passes['context'] = ReadStats()
         with _pool(spec, cfg, {'ctx_pairs': ctx_path,
                                'book_need': need_path}) as pool:
-            for i, (c, lc, _sc, st) in enumerate(
+            for i, (c, lc, _sc, _rw, st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)

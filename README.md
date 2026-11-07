@@ -256,6 +256,25 @@ full scan gives for this book. Without it, verification is book-local and is
 labelled so (`ctx_scope`/`split_scope` = `book`, evidence `context_book` /
 `split_observed_book`).
 
+`--book-real-word` (off by default) also looks for **real-word errors**: a
+one-letter slip that produced another existing word, which no rarity rule can
+see. Each common word of the book is weighed against its confusable
+one-letter neighbours by how often each occurs between the same two words in
+the corpus (bigrams and trigrams, a fixed substitution penalty), and is
+reported as `real_word` only when the log10 odds against it reach
+`real_word_odds` (5.49 — tuned on OCR output from outside this corpus, so
+treat it as a starting point). A word the book uses at least `real_word_rep`
+(3) times, and more often than the suggestion, is taken as the book's own
+spelling. Tokens already reported as an extra space or an OCR-profile hit,
+and words one or two words after a title (a name position), are not judged.
+The findings carry evidence `context_lm` and are never counted as verified.
+The counts come from the `--book-verify-ctx` pass (same pass, the
+book's own rows excluded) and are kept in `real_word/` for later book-scope
+scans of the same book; a word whose neighbours changed since then is not
+judged until the next corpus-scope scan. `real_word/` holds one file per book
+scanned this way and is never pruned; deleting it only means the next
+book-scope scan needs a `--book-verify-ctx` rescan first.
+
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
