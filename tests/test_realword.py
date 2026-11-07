@@ -324,7 +324,7 @@ class Judged(unittest.TestCase):
     def words(self, lines, covered=frozenset()):
         return [(u, w) for u, _, _, _, _, w, _, _ in realword.judged(
             _Book(lines), self.lex, {}, core._editorial_adjacent,
-            core.is_foreign_line, covered, core.NAME_TRIGGERS)
+            core.is_foreign_line, covered, core.name_position)
             if w == 'ספד']
 
     def test_name_position_after_a_title_is_skipped(self):

@@ -56,7 +56,7 @@ import time
 from collections import Counter
 
 from . import core, realword
-from .book_source import load_book
+from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
 from .normalize import tokenize
@@ -152,10 +152,44 @@ def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
     return alts_out
 
 
-def _locate(book, freq, cfg, flagged, prof):
+def _in_name_corpus(book, rec, db_path=None):
+    """Was `book` one of the documents the name list `rec` was counted from?
+
+    Decided from the list's own record of its corpus (the spec and the
+    documents of the lexicon run), not from how the book was opened: a
+    library book of another library, or a DB book of another seforim.db, is
+    not in it, while a file opened by path inside the corpus library is. In
+    doubt — a results folder moved to another machine, a path that does not
+    match — the answer is no: the scan then never takes this book's own
+    occurrence away from the count, and so reports no more than it would
+    for a new book."""
+    if not rec:
+        return False
+    docs, spec = rec.get('docs') or (), rec.get('spec') or {}
+    if book.kind == 'db':
+        db = core.spec_db(spec)
+        return (db is not None
+                and core._norm_path(db) == core._norm_path(
+                    db_path or OTZARIA_DB)
+                and book.doc in docs)
+    root = spec.get('path') if spec.get('type') in (
+        'library', 'hybrid', 'textdir') else None
+    if not (root and book.path):
+        return False
+    rel = _rel_within(book.path, root)
+    if rel is None:
+        # one side may go through a symlink (macOS /var -> /private/var)
+        rel = _rel_within(os.path.realpath(book.path), os.path.realpath(root))
+    if rel is None:
+        return False
+    return rel in docs or rel.replace('/', os.sep) in docs
+
+
+def _locate(book, freq, cfg, flagged, prof, names=None, in_corpus=False):
     occ, joins, ocr = [], [], []
     for unit, ref, content in book.lines:
-        res = core.locate_line(content, freq, cfg, flagged, prof)
+        res = core.locate_line(content, freq, cfg, flagged, prof, names,
+                               in_corpus)
         if res is None:
             continue
         o, j, c = res
@@ -325,6 +359,17 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             raise BookScanError('ערך לא תקין בהגדרה ' + bad)
     profiles, psource = core.load_ocr_profiles(out_dir)
     prof = profiles.get(book.doc)
+    names, in_corpus = None, False
+    if core.names_on(cfg):
+        rec = core.load_names(out_dir)
+        if rec is None:
+            say(f'[book] אין רשימת שמות ({core.NAMES_F}) של המילון הנוכחי — '
+                f'כל השמות מדולגים כרגיל (names_sugg לא פועל). כדי להשתמש '
+                f'בה יש לבנות את המילון מחדש')
+        else:
+            names = rec['names']
+            in_corpus = _in_name_corpus(book, rec, db_path)
+            say('[book] רשימת השמות בשימוש (names_sugg)')
     seqs = [parts for cs in split_cands.values() for parts, _ in cs]
     scope = 'corpus' if (verify_ctx and spec is not None) else 'book'
 
@@ -332,7 +377,8 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         # One corpus pass counts everything. Context pairs are taken from the
         # findings BEFORE split resolution: a confirmed split only replaces a
         # word's explanation, so the final pairs are a subset of these.
-        pre_occ, pre_joins, _ = _locate(book, freq, cfg, errors, None)
+        pre_occ, pre_joins, _ = _locate(book, freq, cfg, errors, None, names,
+                                        in_corpus)
         ctx_pairs, need = _context_needs(pre_occ, errors)
         rw_need = None
         if cfg.real_word:
@@ -360,7 +406,8 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
 
     alts = _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope)
     say(f'[book] {len(errors):,} צורות חשודות')
-    occ, joins, ocr = _locate(book, freq, cfg, errors, prof)
+    occ, joins, ocr = _locate(book, freq, cfg, errors, prof, names,
+                              in_corpus)
 
     if scope == 'book':
         # the same two questions as the corpus pass, asked of this book
@@ -473,7 +520,7 @@ def _covered(joins, ocr):
 def _real_word_items(book, lex, errors, covered):
     return realword.judged(book, lex, errors, core._editorial_adjacent,
                            core.is_foreign_line, covered,
-                           core.NAME_TRIGGERS)
+                           core.name_position)
 
 
 def _real_word_rows(book, lex, errors, present, counts, cfg, out_dir, base,

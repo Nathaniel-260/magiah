@@ -27,8 +27,8 @@ small noisy-channel model (Mays, Damerau & Mercer, 1991):
   kind may want another value.
 
 Tokens another rule already explains on the same line (an extra-space join,
-an OCR-profile hit) and words in a name position (one or two words after a
-title, :data:`magiah.core.NAME_TRIGGERS`, as for the located findings) are
+an OCR-profile hit) and words in a name position (after a title, by
+:func:`magiah.core.name_position`, the rule of the located findings) are
 not judged.
 
 A book's own convention is not an error: a word the book uses at least
@@ -94,15 +94,15 @@ def candidates(w, lex):
 
 
 def judged(book, lex, flagged, editorial_adjacent, is_foreign_line,
-           covered=frozenset(), name_triggers=frozenset()):
+           covered=frozenset(), in_name=None):
     """Every word occurrence of `book` this module judges.
 
     Yields ``(unit, ref, text, match, prev, word, next, candidates)``. Lines
     the locate pass skips as foreign are skipped here too, and so are words
     already explained by another rule (`flagged`, or ``(unit, word)`` in
     `covered`: the tokens of an extra-space join or of an OCR-profile hit on
-    that line), words next to editorial marks, and words one or two words
-    after a title in `name_triggers` (a name, as in the locate pass).
+    that line), words next to editorial marks, and words for which
+    ``in_name(words, k)`` is true (a name, as in the locate pass).
     """
     memo = {}
     for unit, ref, content in book.lines:
@@ -115,8 +115,7 @@ def judged(book, lex, flagged, editorial_adjacent, is_foreign_line,
             if w in flagged or not checked(w, lex) \
                     or (unit, w) in covered:
                 continue
-            if (k >= 1 and words[k - 1] in name_triggers) \
-                    or (k >= 2 and words[k - 2] in name_triggers):
+            if in_name is not None and in_name(words, k):
                 continue
             cs = memo.get(w)
             if cs is None:
