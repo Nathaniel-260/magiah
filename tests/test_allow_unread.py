@@ -27,9 +27,11 @@ from test_tanach import BIBLE, make_bible_db
 from test_textsource import (NO_ZSTD, _corrupt_row, _coverage, _otzaria_spec,
                              _zstd, make_schema6_db)
 
-# the keys a complete lexicon record had before --allow-unread existed
+# the keys a complete lexicon record had before --allow-unread existed (and
+# the build's id, which ties the name list to it)
 COMPLETE_LEXICON_KEYS = {'stage', 'complete', 'unread', *ReadStats.FIELDS,
-                         'error_samples', 'tokens', 'types', 'chunks'}
+                         'error_samples', 'tokens', 'types', 'chunks',
+                         'lexicon_id'}
 
 
 def _quiet():

@@ -33,6 +33,7 @@ from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
 
 LEXICON_F = 'lexicon.pkl'
+NAMES_F = 'names.pkl'
 FLAGGED_F = 'flagged.pkl'
 SPLITS_F = 'split_cands.pkl'
 REPORT_DB_F = 'report.db'
@@ -99,6 +100,8 @@ def _init(spec, cfg_dict, loads):
     for key, path in loads.items():
         with open(path, 'rb') as f:
             _W[key] = pickle.load(f)
+    if 'names' in _W:
+        _W['names_docs'] = names_docs(_W['names'], spec)
     if 'split_cands' in _W:
         _W['seq'] = SeqCounter(parts for _, parts in _W.pop('split_cands'))
     if 'ctx_pairs' in _W:
@@ -633,37 +636,160 @@ def _latest_coverage(out_dir, stage):
 
 def _count_chunk(chunk):
     _chunk_stats_begin()
-    c = Counter()
-    for _, text in _W['corpus'].iter_texts(chunk):
-        c.update(tokenize(text))
-    return c, _chunk_stats_end()
+    c, names, docs = Counter(), Counter(), set()
+    for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
+        toks = tokenize(text)
+        c.update(toks)
+        count_names(toks, names)
+        docs.add(doc)
+    return c, names, docs, _chunk_stats_end()
 
 
 def build_lexicon(spec, cfg, out_dir):
     t0 = time.time()
     corpus = make_corpus(spec)
     chunks = corpus.chunks(cfg.n_chunks)
-    lex = Counter()
+    lex, names, docs = Counter(), Counter(), set()
     stats = ReadStats()
     with _pool(spec, cfg) as pool:
-        for i, (c, st) in enumerate(
+        for i, (c, nc, dc, st) in enumerate(
                 pool.imap_unordered(_count_chunk, chunks), 1):
             lex.update(c)
+            names.update(nc)
+            docs.update(dc)
             stats.add(ReadStats.from_dict(st))
             print(f'  [lexicon] chunk {i}/{len(chunks)}  types={len(lex):,}  '
                   f'({time.time()-t0:.0f}s)', flush=True)
     print(f'[lexicon] tokens={sum(lex.values()):,}  types={len(lex):,}  '
           f'time={time.time()-t0:.0f}s', flush=True)
+    lexicon_id = _new_lexicon_id()
     extra = {'tokens': sum(lex.values()), 'types': len(lex),
-             'chunks': len(chunks)}
+             'chunks': len(chunks), 'lexicon_id': lexicon_id}
     policy = _policy(spec, cfg, out_dir)
     # coverage first: a partial lexicon must not replace the last good one
     _fail_if_partial('lexicon', stats, out_dir, extra, policy=policy)
     _require_text('lexicon', stats)
+    # the old name list must never pass for this lexicon's (load_names)
+    try:
+        os.remove(os.path.join(out_dir, NAMES_F))
+    except OSError:
+        pass                    # none — or its lexicon_id refuses it anyway
     _replace_atomically(os.path.join(out_dir, LEXICON_F),
                         _dump_pickle(dict(lex)))
+    _replace_atomically(os.path.join(out_dir, NAMES_F), _dump_pickle(
+        {'format': NAMES_FORMAT, 'lexicon_id': lexicon_id, 'spec': spec,
+         'docs': sorted(docs), 'names': dict(names)}))
     _write_coverage(out_dir, _coverage_info('lexicon', stats, extra,
                                             policy=policy))
+
+
+# Titles: a rare word right after one (ר' פלוני, מוה"ר ר' פלוני, בעיר
+# פלונית) is a person/place name, not a typo — see name_position.
+NAME_TRIGGERS = frozenset((
+    'ר', 'רב', 'רבי', 'הרב', 'הגאון', 'מו"ה', 'מוה"ר', 'מהר"ר', 'כמוהר"ר',
+    'מהור"ר', 'אבד"ק', 'בק"ק', 'דק"ק', 'מק"ק', 'בכפר', 'בעיר', 'במדינת',
+    'לעיר', 'העיר'))
+# "The name" the rule skips: this many words after a title. Fixed — the
+# name list (below) only ever REPORTS a word inside it, never hides one.
+NAME_WINDOW = 2
+
+# The name list (names.pkl): how often the corpus has each word in a name
+# position — up to NAME_COUNT_WINDOW words after one of these. Built in the
+# lexicon pass; read by name_slip when Config.names_sugg is set. It counts a
+# little wider than the rule skips: a word seen as the third word of a name
+# is a name part too, and must not be taken for a slip when it stands
+# second. בן/בר are not titles here: בן אדם, בר מצוה would count as names.
+NAME_LIST_BEFORE = NAME_TRIGGERS | frozenset(('רבינו', 'הר"ר'))
+NAME_COUNT_WINDOW = 3
+NAMES_FORMAT = 1           # bump when the counting rule changes
+
+
+def name_position(words, k, errtype=None):
+    """Does the name rule skip token `k` of `words` (strings)? A word up to
+    NAME_WINDOW words after a title — unless the finding is a split rule
+    (missing space / final letter mid-word), which names do not excuse.
+
+    The one rule of :func:`locate_line` and of the fixer's model of the
+    scan (webui.patcher); a reported word in such a position is a
+    :func:`name_slip`."""
+    if errtype in ('missing_space', 'final_midword'):
+        return False
+    return any(k >= d and words[k - d] in NAME_TRIGGERS
+               for d in range(1, NAME_WINDOW + 1))
+
+
+def _counted_name(words, k):
+    """Is token `k` of `words` counted in the name list?"""
+    w = words[k]
+    return (len(w) >= 2 and not is_abbrev(w)
+            and any(k >= d and words[k - d] in NAME_LIST_BEFORE
+                    for d in range(1, NAME_COUNT_WINDOW + 1)))
+
+
+def count_names(toks, counts):
+    """Add the words of one token list that stand in a name position."""
+    if NAME_LIST_BEFORE.isdisjoint(toks):
+        return
+    for k in range(1, len(toks)):
+        if _counted_name(toks, k):
+            counts[toks[k]] += 1
+
+
+def _new_lexicon_id():
+    """The id of one lexicon build: kept in its coverage record and in the
+    name list built with it, so the list goes with that very lexicon —
+    also in a copy of the results folder."""
+    return os.urandom(8).hex()
+
+
+def _lexicon_id(out_dir):
+    path = os.path.join(out_dir, COVERAGE_F.format(stage='lexicon'))
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f).get('lexicon_id')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def load_names(out_dir):
+    """The name list built with the current lexicon, or None — no list (a
+    lexicon from before the list, or a list left over from another
+    lexicon): the name rule then works as it always did.
+
+    A dict: ``names`` (word -> times in a name position), ``docs`` (the
+    documents counted) and ``spec`` (the corpus they came from)."""
+    path = os.path.join(out_dir, NAMES_F)
+    try:
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError,
+            ImportError, IndexError, TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or obj.get('format') != NAMES_FORMAT \
+            or not obj.get('lexicon_id') \
+            or obj.get('lexicon_id') != _lexicon_id(out_dir) \
+            or not isinstance(obj.get('names'), dict):
+        return None
+    return obj
+
+
+def _norm_path(p):
+    return os.path.normcase(os.path.abspath(p)) if p else None
+
+
+def _corpus_key(spec):
+    spec = spec or {}
+    return (spec.get('type'), _norm_path(spec.get('path')),
+            _norm_path(spec_db(spec)), spec.get('table'), spec.get('preset'))
+
+
+def names_docs(rec, spec):
+    """The documents of `spec` the name list `rec` counted: all its
+    documents when `spec` is the corpus it was built from, else none (a
+    document of another corpus never stood in that count)."""
+    if not rec or _corpus_key(rec.get('spec')) != _corpus_key(spec):
+        return frozenset()
+    return frozenset(rec.get('docs') or ())
 
 
 # ---------------------------------------------------------------------------
@@ -1617,11 +1743,7 @@ def _tanach_check(db_path, all_occ, flagged, lstats, out_dir, passes,
     return kept, tan_info, matches, edition_rows, evidence_rows
 
 
-# stage-3 helper: a rare word right after a title is a person/place name
-NAME_TRIGGERS = frozenset((
-    'ר', 'רב', 'רבי', 'הרב', 'הגאון', 'מו"ה', 'מוה"ר', 'מהר"ר', 'כמוהר"ר',
-    'מהור"ר', 'אבד"ק', 'בק"ק', 'דק"ק', 'מק"ק', 'בכפר', 'בעיר', 'במדינת',
-    'לעיר', 'העיר'))
+# stage-3 helper: NAME_TRIGGERS / name_position — see the name list
 
 # ---------------------------------------------------------------------------
 # stage 3: locate occurrences + extra-space + context verification
@@ -1666,7 +1788,36 @@ def ocr_score(fw, fs):
     return 2 + math.log10(fs / max(fw, 1))
 
 
-def locate_line(content, freq, cfg, flagged, prof=None):
+def names_on(cfg):
+    """Is the name list in use (``Config.names_sugg`` a positive count)?"""
+    try:
+        return int(cfg.names_sugg or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def name_slip(words, k, sugg, names, cfg, in_corpus=True):
+    """Is word `k` of `words`, in a name position (:func:`name_position`),
+    still a finding? Only with a name list and ``cfg.names_sugg``: the
+    corpus never had it in a name position (this occurrence aside, when the
+    text is part of the corpus), and the suggestion `sugg` is a name seen
+    there at least ``names_sugg`` times — a known name that was misspelled.
+
+    Every word the rule skips is one the list counted (NAME_TRIGGERS and
+    NAME_WINDOW are within NAME_LIST_BEFORE and NAME_COUNT_WINDOW), so all
+    copies of a word in name positions on one line get the same verdict —
+    the fixer relies on it (webui.patcher._scanner_skips)."""
+    if names is None or not names_on(cfg):
+        return False
+    w = words[k]
+    seen = names.get(w, 0)
+    if in_corpus and _counted_name(words, k):
+        seen -= 1
+    return seen <= 0 and names.get(sugg, 0) >= int(cfg.names_sugg)
+
+
+def locate_line(content, freq, cfg, flagged, prof=None, names=None,
+                in_corpus=True):
     """All findings of one line; core.locate and the book scan both use it.
 
     Returns None for a skipped foreign/garbled line, else ``(occ, joins,
@@ -1675,6 +1826,11 @@ def locate_line(content, freq, cfg, flagged, prof=None):
     correction, corr_freq, snippet)]``. Snippets exist only for reported
     tokens and are bounded, so a multi-MB line stays linear in time and
     memory and is never truncated.
+
+    `names` — the counts of the name list (:func:`load_names`) or None;
+    `in_corpus` — the line is part of the corpus the list was counted from.
+    Neither changes what is skipped without ``cfg.names_sugg``; with it, a
+    word is only ever reported more, never less (:func:`name_slip`).
     """
     from .normalize import TOKEN_RE, clean
     text = clean(content)
@@ -1715,6 +1871,7 @@ def locate_line(content, freq, cfg, flagged, prof=None):
 
     # pass 2 — occurrences of flagged word types (+ OCR-profile layer)
     occ, ocr = [], []
+    words = None        # the line's token strings, built when first needed
     paren = [0, 0]      # text scanned so far, '(' still open there
 
     def open_paren(pos):
@@ -1752,11 +1909,14 @@ def locate_line(content, freq, cfg, flagged, prof=None):
         prev = toks[k - 1].group() if k else ''
         nxt = toks[k + 1].group() if k + 1 < len(toks) else ''
         # a rare word right after a title (ר' פלוני, מוה"ר ר' פלוני) is a
-        # person/place name, not a typo
-        if fr[1] not in ('missing_space', 'final_midword') \
-                and (prev in NAME_TRIGGERS
-                     or (k >= 2 and toks[k - 2].group() in NAME_TRIGGERS)):
-            continue
+        # person/place name, not a typo — unless the name list shows a
+        # known name misspelled (name_slip)
+        if k and fr[1] not in ('missing_space', 'final_midword'):
+            if words is None:
+                words = [t.group() for t in toks]
+            if name_position(words, k, fr[1]) and not name_slip(
+                    words, k, fr[2], names, cfg, in_corpus):
+                continue
         occ.append((w, prev, nxt, _snippet(text, s, e)))
     return occ, joins, ocr
 
@@ -1765,9 +1925,12 @@ def _locate_chunk(chunk):
     _chunk_stats_begin()
     freq, flagged, cfg = _W['lexicon'], _W['flagged'], _W['cfg']
     profiles = _W.get('ocr_profiles') or {}
+    names = (_W.get('names') or {}).get('names')
+    docs = _W.get('names_docs') or frozenset()
     occ, joins, ocr = [], [], []
     for uid, doc, content in _W['corpus'].iter_texts_docs(chunk):
-        res = locate_line(content, freq, cfg, flagged, profiles.get(doc))
+        res = locate_line(content, freq, cfg, flagged, profiles.get(doc),
+                          names, doc in docs)
         if res is None:
             continue
         o, j, c = res
@@ -1840,6 +2003,18 @@ def locate(spec, cfg, out_dir):
     lstats = ReadStats()
     loads = {'lexicon': os.path.join(out_dir, LEXICON_F),
              'flagged': os.path.join(out_dir, FLAGGED_F)}
+    if names_on(cfg):
+        rec = load_names(out_dir)
+        if rec is not None:
+            loads['names'] = os.path.join(out_dir, NAMES_F)
+            print('[locate] רשימת השמות בשימוש (names_sugg)', flush=True)
+            if not names_docs(rec, spec):
+                print('[locate] רשימת השמות נבנתה ממאגר אחר מזה הנסרק '
+                      'עכשיו', flush=True)
+        else:
+            print(f'[locate] אין רשימת שמות ({NAMES_F}) של המילון הנוכחי — '
+                  f'כל השמות מדולגים כרגיל. כדי להשתמש בה יש לבנות את '
+                  f'המילון מחדש', flush=True)
     prof_path = os.path.join(out_dir, OCR_PROFILES_F)
     # the same rule as the book scan (load_ocr_profiles): only a file whose
     # hash calibration_meta.json vouches for
