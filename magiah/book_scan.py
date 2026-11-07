@@ -174,7 +174,12 @@ def _in_name_corpus(book, rec, db_path=None):
                 and book.doc in docs)
     root = spec.get('path') if spec.get('type') in (
         'library', 'hybrid', 'textdir') else None
-    rel = _rel_within(book.path, root) if (root and book.path) else None
+    if not (root and book.path):
+        return False
+    rel = _rel_within(book.path, root)
+    if rel is None:
+        # one side may go through a symlink (macOS /var -> /private/var)
+        rel = _rel_within(os.path.realpath(book.path), os.path.realpath(root))
     if rel is None:
         return False
     return rel in docs or rel.replace('/', os.sep) in docs
