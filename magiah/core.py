@@ -2267,6 +2267,36 @@ RANK_SQL = '''score
 VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 
 
+def _num(r, k):
+    v = r.get(k)
+    return 0 if v is None else v
+
+
+# RANK_SQL, term by term, in Python: what `magiah.eval` ablates (drops one
+# term and measures the ranking without it). tests/ keep the two equal.
+RANK_TERMS = {
+    'ctx': lambda r: ((1.5 if _num(r, 'ctx_hits') > 0 else -1.0)
+                      if str(r.get('errtype') or '').startswith('edit1')
+                      else 0.0),
+    'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
+                             0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
+    'book_repeat': lambda r: -3.0 if _num(r, 'book_repeat') == 1 else 0.0,
+    'tanach': lambda r: 4.0 if _num(r, 'tanach') == 3 else 0.0,
+}
+
+
+def rank_terms(r):
+    """``{term: value}`` of RANK_SQL for one row dict (base: ``score``)."""
+    out = {'score': float(_num(r, 'score'))}
+    out.update((k, f(r)) for k, f in RANK_TERMS.items())
+    return out
+
+
+def rank_value(r, drop=()):
+    """RANK_SQL of one row dict, without the terms named in `drop`."""
+    return sum(v for k, v in rank_terms(r).items() if k not in drop)
+
+
 def _open_report(path):
     try:
         return open(path, 'w', newline='', encoding='utf-8-sig')
