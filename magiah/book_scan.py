@@ -55,7 +55,7 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core, realword
+from . import core, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
@@ -429,7 +429,14 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             hits = (ctx_counts.get((prev, sugg), 0)
                     + ctx_counts.get((sugg, nxt), 0))
         local = local_counts.get(sugg, 0) if errtype in LOCAL_TYPES else 0
+        # measured against chance only corpus-wide, as the full pipeline
+        # does; a book's own pair counts have no corpus expectation
+        cexp, cassoc = (rankstats.ctx_stats(freq, lex.N, prev, sugg, nxt,
+                                            hits)
+                        if scope == 'corpus' and core.uses_context(errtype)
+                        else (None, None))
         rows.append({
+            'ctx_exp': cexp, 'ctx_assoc': cassoc,
             **base, 'word': w, 'errtype': errtype, 'suggestion': sugg,
             'score': score, 'ctx_hits': hits, 'sugg_local': local,
             'book_repeat': core.book_repeat_flag(

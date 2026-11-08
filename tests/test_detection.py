@@ -114,10 +114,11 @@ class FullVsBookParity(PipelineFixture):
     """T1: same evidence scope -> same findings."""
 
     KEYS = ('word', 'errtype', 'suggestion', 'ctx_hits', 'sugg_local',
-            'book_repeat', 'unit', 'snippet', 'evidence')
+            'book_repeat', 'unit', 'snippet', 'evidence', 'ctx_exp',
+            'ctx_assoc')
 
     def _norm(self, rows):
-        return sorted(tuple(r[k] for k in self.KEYS)
+        return sorted(tuple(r.get(k) for k in self.KEYS)
                       + (round(r['score'], 6),) for r in rows)
 
     def test_book_scan_in_corpus_scope_equals_full_pipeline(self):

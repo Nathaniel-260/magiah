@@ -28,6 +28,7 @@ from multiprocessing import Pool
 from .config import Config
 from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
+from .rankstats import OCC_STAT_COLS, ctx_stats
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
@@ -1992,6 +1993,15 @@ def _ctx_count_chunk(chunk):
     return counts, local, seq_counts, rw_counts, _chunk_stats_end()
 
 
+# the columns of report.db's `occurrences`, in insert order; after
+# occ_score come the rank signals of magiah.rankstats (NULL: not measured)
+OCC_COLS = ('word', 'unit', 'doc', 'ctx_hits', 'sugg_local', 'book_repeat',
+            'tanach', 'tanach_sugg', 'snippet', 'evidence', 'occ_sugg',
+            'occ_score') + OCC_STAT_COLS
+_OCC_INSERT = (f'INSERT INTO occurrences({", ".join(OCC_COLS)}) '
+               f'VALUES({",".join("?" * len(OCC_COLS))})')
+
+
 def write_scan_meta(con, spec):
     """Record in report.db which corpus produced it, so the fixer can write
     each finding into the library it was found in, not the current setting."""
@@ -2122,6 +2132,17 @@ def locate(spec, cfg, out_dir):
                           f'({time.time()-t0:.0f}s)', flush=True)
         _fail_if_partial('locate', lstats, out_dir, passes=passes,
                          policy=policy)
+    # the corpus frequencies the chance expectation of each context pair
+    # needs (ctx_expected): the neighbours' and the corrections'
+    ctx_freq, ctx_N = {}, 0
+    if ctx_pairs:
+        with open(loads['lexicon'], 'rb') as f:
+            lexicon = pickle.load(f)
+        ctx_N = sum(lexicon.values())
+        for a, b in ctx_pairs:
+            ctx_freq[a] = lexicon.get(a, 0)
+            ctx_freq[b] = lexicon.get(b, 0)
+        del lexicon
 
     # --- write the report database ---------------------------------------
     # built under a temp name and moved into place only once complete, so a
@@ -2133,16 +2154,18 @@ def locate(spec, cfg, out_dir):
     con = sqlite3.connect(tmp_path)
     # occurrences.occ_sugg/occ_score: an occurrence-level suggestion (OCR
     # profiles differ per book) that overrides the word-level one in enrich;
-    # evidence: what actually supports the finding (see evidence_kind)
+    # evidence: what actually supports the finding (see evidence_kind);
+    # the rank signals of magiah.rankstats follow (REAL, NULL: not measured)
+    stat_cols = ''.join(f', {c} REAL' for c in OCC_STAT_COLS)
     try:
-        con.executescript('''
+        con.executescript(f'''
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
         CREATE TABLE occurrences(word TEXT, unit TEXT, doc TEXT, ctx_hits INT,
                                  sugg_local INT, book_repeat INT, tanach INT,
                                  tanach_sugg TEXT, snippet TEXT,
                                  evidence TEXT, occ_sugg TEXT,
-                                 occ_score REAL);
+                                 occ_score REAL{stat_cols});
         CREATE TABLE space_errors(unit TEXT, part1 TEXT, part2 TEXT,
                                   joined TEXT, join_freq INT, snippet TEXT);
         CREATE TABLE tanach_matches(word TEXT, unit TEXT, doc TEXT,
@@ -2159,19 +2182,19 @@ def locate(spec, cfg, out_dir):
         rows = []
         for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
             fr = flagged[w]
-            hits = 0
+            hits, cstat = 0, (None, None)
             if uses_context(fr[1]):
                 sugg = fr[2]
                 hits = (ctx_counts.get((prev, sugg), 0)
                         + ctx_counts.get((sugg, nxt), 0))
+                cstat = ctx_stats(ctx_freq, ctx_N, prev, sugg, nxt, hits)
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
             rows.append((w, uid, doc, hits, local,
                          1 if w in repeat_words else 0, tan, tsugg, snip,
-                         ev, None, None))
-        con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                        rows)
+                         ev, None, None, *cstat))
+        con.executemany(_OCC_INSERT, rows)
         # OCR-profile findings: word-level entry + occurrence rows carrying their
         # own book's suggestion (the word-level one is only the first seen)
         for w, fw, sugg, fs, uid, doc, snip in all_ocr:
@@ -2179,11 +2202,10 @@ def locate(spec, cfg, out_dir):
                 score = ocr_score(fw, fs)
                 con.execute('INSERT OR IGNORE INTO errors VALUES(?,?,?,?,?,?)',
                             (w, fw, 'ocr_profile', sugg, fs, score))
-                con.execute('INSERT INTO occurrences '
-                            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                con.execute(_OCC_INSERT,
                             (w, uid, doc, 0, 0, 0, 0, '', snip,
                              evidence_kind('ocr_profile', sugg, fs, 0, 0, 0),
-                             sugg, score))
+                             sugg, score) + (None,) * (len(OCC_COLS) - 12))
         if all_ocr:
             print(f'[locate] ocr-profile findings: {len(all_ocr):,}', flush=True)
         alts_path = os.path.join(out_dir, SPLIT_ALTS_F)
@@ -2252,9 +2274,20 @@ def locate(spec, cfg, out_dir):
 # by >= 2 independent sources, differs from the word AND equals the detector's
 # suggestion). tanach = 4 (the verse reads otherwise than the detector) and
 # tanach = 2 (rows of the old trigram heuristic) earn nothing.
+#
+# ctx_assoc (log10 of the context hits against chance, ctx_association)
+# grades the context signal: hits far above chance earn up to +2.0, hits at
+# chance +0.5; no hits where chance expected several cost up to -1.0, no
+# hits where chance expected next to none cost (almost) nothing. A row
+# without ctx_assoc (an older report.db, a book-scope scan) keeps the flat
+# +1.5 / -1.0.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
-                  CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                  CASE WHEN ctx_assoc IS NULL THEN
+                         CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                       WHEN ctx_hits > 0 THEN
+                         0.5 + 0.5 * MIN(3.0, MAX(0.0, ctx_assoc))
+                       ELSE MAX(-1.0, MIN(0.0, ctx_assoc)) END
                 ELSE 0 END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
@@ -2262,9 +2295,27 @@ RANK_SQL = '''score
               + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
-# proposed correction and the word is not an in-book spelling convention.
+# proposed correction and the word is not an in-book spelling convention;
+# context hits count only above chance (where chance was measured).
 # The column `evidence` names WHICH support was found (and its scope).
-VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
+VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
+                'COALESCE(ctx_assoc, 1) > 0) OR sugg_local >= 3)')
+
+# columns RANK_SQL / VERIFIED_SQL read that a table may lack (an older
+# report.db, a hand-made one): read as NULL, i.e. "not measured"
+OPTIONAL_RANK_COLS = ('ctx_assoc',)
+
+
+def rank_source(con, table, schema=''):
+    """`table`, or a sub-select of it that adds the OPTIONAL_RANK_COLS it
+    lacks as NULL, so RANK_SQL can be evaluated over it."""
+    pre = f'{schema}.' if schema else ''
+    have = {r[1] for r in con.execute(f'PRAGMA {pre}table_info({table})')}
+    missing = [c for c in OPTIONAL_RANK_COLS if c not in have]
+    if not missing:
+        return pre + table
+    pad = ', '.join(f'NULL AS {c}' for c in missing)
+    return f'(SELECT *, {pad} FROM {pre}{table})'
 
 
 def _num(r, k):
@@ -2274,10 +2325,19 @@ def _num(r, k):
 
 # RANK_SQL, term by term, in Python: what `magiah.eval` ablates (drops one
 # term and measures the ranking without it). tests/ keep the two equal.
+def _ctx_term(r):
+    if not str(r.get('errtype') or '').startswith('edit1'):
+        return 0.0
+    a = r.get('ctx_assoc')
+    if a is None:
+        return 1.5 if _num(r, 'ctx_hits') > 0 else -1.0
+    if _num(r, 'ctx_hits') > 0:
+        return 0.5 + 0.5 * min(3.0, max(0.0, a))
+    return max(-1.0, min(0.0, a))
+
+
 RANK_TERMS = {
-    'ctx': lambda r: ((1.5 if _num(r, 'ctx_hits') > 0 else -1.0)
-                      if str(r.get('errtype') or '').startswith('edit1')
-                      else 0.0),
+    'ctx': _ctx_term,
     'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
                              0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
     'book_repeat': lambda r: -3.0 if _num(r, 'book_repeat') == 1 else 0.0,
@@ -2317,11 +2377,15 @@ def _write_reports(con, dest_dir, extra_where, params, top):
     ev = 'evidence' if 'evidence' in have else "''"      # older report.db
     tan_col = ("COALESCE(tanach_reading, '')" if 'tanach_reading' in have
                else "''")
+    src = rank_source(con, 'occurrences_full')
+    # the chance-normalised signals go last: readers address columns by name
     cols = ('word, suggestion, {tan}, ROUND({rank}, 2), ctx_hits, '
-            'sugg_local, {ev}, source, ref, unit, snippet').format(
-                rank=RANK_SQL, tan=tan_col, ev=ev)
+            'sugg_local, {ev}, source, ref, unit, snippet, {stats}').format(
+                rank=RANK_SQL, tan=tan_col, ev=ev,
+                stats=', '.join(OPTIONAL_RANK_COLS))
     header = ['word', 'suggestion', 'tanach_reading', 'rank', 'ctx_hits',
-              'sugg_local', 'evidence', 'source', 'ref', 'unit', 'snippet']
+              'sugg_local', 'evidence', 'source', 'ref', 'unit', 'snippet',
+              *OPTIONAL_RANK_COLS]
     for t in types:
         variants = [(f'errors_{t}.csv', f'errtype = ?{extra_where}')]
         if t.startswith('edit1'):
@@ -2339,7 +2403,7 @@ def _write_reports(con, dest_dir, extra_where, params, top):
                 wr.writerow(header)
                 n = 0
                 for row in con.execute(f'''
-                        SELECT {cols} FROM occurrences_full WHERE {where}
+                        SELECT {cols} FROM {src} WHERE {where}
                         ORDER BY {RANK_SQL} DESC {limit}''', (t, *params)):
                     wr.writerow(row)
                     n += 1

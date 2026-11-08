@@ -33,6 +33,14 @@ class RankMirror(unittest.TestCase):
              book_repeat=1, tanach=3),
         dict(score=0.5, errtype='spelling_variant', ctx_hits=0,
              sugg_local=0, book_repeat=0, tanach=4),
+        dict(score=2.0, errtype='edit1_sub', ctx_hits=1, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=0.4),
+        dict(score=2.0, errtype='edit1_sub', ctx_hits=40, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=3.7),
+        dict(score=2.0, errtype='edit1_ins', ctx_hits=0, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=-0.01),
+        dict(score=2.0, errtype='edit1_ins', ctx_hits=0, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=-1.6),
     ]
 
     def _sql(self, case):
@@ -41,7 +49,8 @@ class RankMirror(unittest.TestCase):
         con.execute(f'CREATE TABLE t({", ".join(cols)})')
         con.execute(f'INSERT INTO t VALUES({",".join("?" * len(cols))})',
                     [case.get(c) for c in cols])
-        return con.execute(f'SELECT {core.RANK_SQL} FROM t').fetchone()[0]
+        return con.execute(f'SELECT {core.RANK_SQL} FROM '
+                           f'{core.rank_source(con, "t")}').fetchone()[0]
 
     def test_python_mirror_equals_sql(self):
         for case in self.CASES:
@@ -57,6 +66,81 @@ class RankMirror(unittest.TestCase):
         from magiah.webui import db as uidb
         self.assertEqual(uidb.RANK_SQL, core.RANK_SQL)
         self.assertEqual(uidb.VERIFIED_SQL, core.VERIFIED_SQL)
+
+
+class ContextAgainstChance(unittest.TestCase):
+    """(1) ctx_hits measured against the pairs chance would produce."""
+
+    FREQ = {'של': 50000, 'ספר': 4000, 'גדול': 3000, 'רבנו': 20, 'זצל': 10}
+    N = 1_000_000
+
+    def _sql(self, sql, **row):
+        con = sqlite3.connect(':memory:')
+        con.execute(f'CREATE TABLE t({", ".join(row)})')
+        con.execute(f'INSERT INTO t VALUES({",".join("?" * len(row))})',
+                    list(row.values()))
+        return con.execute(f'SELECT {sql} FROM '
+                           f'{core.rank_source(con, "t")}').fetchone()[0]
+
+    def test_expectation_is_per_side_product_over_n(self):
+        from magiah import rankstats as rs
+        e = rs.ctx_expected(self.FREQ, self.N, 'של', 'ספר', 'גדול')
+        self.assertAlmostEqual(e, 50000 * 4000 / self.N
+                               + 3000 * 4000 / self.N)
+        self.assertAlmostEqual(
+            rs.ctx_expected(self.FREQ, self.N, '', 'ספר', 'גדול'),
+            3000 * 4000 / self.N)
+        self.assertEqual(rs.ctx_stats(self.FREQ, self.N, '', 'ספר', '', 0),
+                         (None, None))
+
+    def test_association_separates_the_three_cases(self):
+        from magiah import rankstats as rs
+        rare = rs.ctx_expected(self.FREQ, self.N, 'רבנו', 'זצל', '')
+        self.assertLess(rare, 0.01)
+        # no hits, chance expected next to none: no information
+        self.assertGreater(rs.ctx_association(0, rare), -0.01)
+        # no hits where chance expected 200: real negative evidence
+        self.assertLess(rs.ctx_association(0, 200.0), -2)
+        # one hit where chance expected 200: below chance, not support
+        self.assertLess(rs.ctx_association(1, 200.0), 0)
+        # 3 hits where chance expected next to none: support
+        self.assertGreater(rs.ctx_association(3, rare), 0.8)
+
+    def test_penalty_only_when_absence_is_informative(self):
+        no_info = self._sql(core.RANK_SQL, score=2.0, errtype='edit1_sub',
+                            ctx_hits=0, sugg_local=0, book_repeat=0,
+                            tanach=0, ctx_assoc=-0.004)
+        expected = self._sql(core.RANK_SQL, score=2.0, errtype='edit1_sub',
+                             ctx_hits=0, sugg_local=0, book_repeat=0,
+                             tanach=0, ctx_assoc=-2.6)
+        self.assertAlmostEqual(no_info, 2.0 - 0.004)
+        self.assertAlmostEqual(expected, 1.0)
+
+    def test_bonus_grows_with_association(self):
+        r = [self._sql(core.RANK_SQL, score=0.0, errtype='edit1_sub',
+                       ctx_hits=h, sugg_local=0, book_repeat=0, tanach=0,
+                       ctx_assoc=a) for h, a in ((1, 0.0), (2, 1.0),
+                                                 (50, 2.0), (500, 5.0))]
+        self.assertEqual(r, sorted(r))
+        self.assertAlmostEqual(r[0], 0.5)
+        self.assertAlmostEqual(r[-1], 2.0)
+
+    def test_unmeasured_rows_keep_the_flat_rule(self):
+        for hits, want in ((3, 3.5), (0, 1.0)):
+            self.assertAlmostEqual(self._sql(
+                core.RANK_SQL, score=2.0, errtype='edit1_sub',
+                ctx_hits=hits, sugg_local=0, book_repeat=0, tanach=0), want)
+
+    def test_verified_needs_hits_above_chance(self):
+        base = dict(book_repeat=0, sugg_local=0, ctx_hits=2)
+        self.assertEqual(self._sql(core.VERIFIED_SQL, **base,
+                                   ctx_assoc=0.6), 1)
+        self.assertEqual(self._sql(core.VERIFIED_SQL, **base,
+                                   ctx_assoc=-0.3), 0)
+        self.assertEqual(self._sql(core.VERIFIED_SQL, **base), 1)  # legacy
+        self.assertEqual(self._sql(core.VERIFIED_SQL, book_repeat=0,
+                                   sugg_local=3, ctx_hits=1,
+                                   ctx_assoc=-0.3), 1)
 
 
 class Diagnostics(unittest.TestCase):

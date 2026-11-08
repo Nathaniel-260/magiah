@@ -386,9 +386,9 @@ def report_rows(out_dir):
     con = connect_ro(os.path.join(out_dir, core.REPORT_DB_F))
     con.row_factory = sqlite3.Row
     try:
+        src = core.rank_source(con, 'occurrences_full')
         rows = [dict(r) for r in con.execute(
-            f'SELECT *, {core.RANK_SQL} AS rank FROM occurrences_full '
-            f'ORDER BY rowid')]
+            f'SELECT *, {core.RANK_SQL} AS rank FROM {src}')]
     finally:
         con.close()
     return rows

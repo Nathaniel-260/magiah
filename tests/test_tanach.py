@@ -490,7 +490,8 @@ class LegacyTest(unittest.TestCase):
         con.executemany('INSERT INTO t VALUES(2.0, ?, 1, 0, 0, ?)',
                         [('edit1_sub', 0), ('edit1_sub', 2)])
         r0, r2 = [r[0] for r in con.execute(
-            f'SELECT {core.RANK_SQL} FROM t ORDER BY tanach')]
+            f'SELECT {core.RANK_SQL} FROM {core.rank_source(con, "t")} '
+            f'ORDER BY tanach')]
         self.assertEqual(r0, r2)
 
     def test_webui_flags_legacy_and_does_not_inherit_decisions(self):
