@@ -992,6 +992,29 @@ def _frequency_penalty(fw, cfg):
     return math.log10(fw / rm) if fw > rm else 0.0
 
 
+# Letter swaps typical of transliterating Greek/Latin (גמ"ל/קו"ף for gamma/
+# kappa, טי"ת/תי"ו for theta/tau, ו/י for the vowels, ס/צ for sigma)
+LOANWORD_PAIRS = frozenset(
+    p for a, b in (('ג', 'ק'), ('ט', 'ת'), ('ו', 'י'), ('ס', 'צ'))
+    for p in ((a, b), (b, a)))
+# endings of transliterated Greek/Latin words (-os/-us, -ion, -ike). Not
+# -in (טופסין): in the v0.6 scan results ~75% of the long -ין words with
+# these swaps were Hebrew/Aramaic plurals (שימעין/שומעין), i.e. real findings
+LOANWORD_ENDINGS = ('וס', 'יון', 'קי')
+
+
+def loanword_penalty(w, kind, ch_a, ch_b, cfg):
+    """Score demotion of an edit-1 correction that looks like a variant
+    transliteration of a Greek/Latin loanword (cfg.loanword), else 0. Only
+    lowers the rank: the correction is still chosen and reported."""
+    if (not cfg.loanword or kind != 'sub'
+            or (ch_a, ch_b) not in LOANWORD_PAIRS
+            or len(w) < cfg.loanword_min_len
+            or not w.endswith(LOANWORD_ENDINGS)):
+        return 0.0
+    return max(0.0, cfg.loanword_penalty)
+
+
 def evaluate_word(w, fw, lex, edit1_cands):
     """Every per-word rule for one word type.
 
@@ -1094,7 +1117,11 @@ def evaluate_word(w, fw, lex, edit1_cands):
             score += 1
         if score > best_score:
             best_c, best_score, best_kind, best_ch = c, score, kind, ch_a
+            best_sub = ch_b
     if best_c:
+        # chosen on the full score, then demoted: a loanword variant keeps
+        # its finding and suggestion, only ranks lower
+        best_score -= loanword_penalty(w, best_kind, best_ch, best_sub, cfg)
         # extra/missing ו or י is ktiv male/chaser variation: own class
         if best_kind in ('ins', 'del') and best_ch in 'וי':
             errtype = 'spelling_variant'
@@ -1291,6 +1318,68 @@ def book_repeat_flag(errtype, n_located, only_this_book):
     doc; book scope: the lexicon count is fully explained by this book."""
     return 1 if (errtype in LOCAL_TYPES and n_located >= 2
                  and only_this_book) else 0
+
+
+# Letter pairs that sound alike in some traditional pronunciations but do not
+# look alike, so a book swapping them is spelling, not OCR (אגמת / עגמת).
+# Visually confusable pairs (ד/ר, ה/ח, ו/י ... see CONFUSABLE) are never
+# here: a book that confuses those many times has an OCR fault, which is
+# what the per-book OCR profiles are for.
+PHONETIC_PAIRS = frozenset(
+    p for a, b in (('א', 'ע'), ('ס', 'ש'), ('כ', 'ק'), ('ך', 'ק'),
+                   ('ט', 'ת'))
+    for p in ((a, b), (b, a)))
+assert not PHONETIC_PAIRS & CONFUSABLE
+
+# book_repeat value of a finding whose letter swap is its book's convention
+# (1 stays "all occurrences of this word sit in one book")
+BOOK_SPELLING = 2
+
+
+def phonetic_pair(errtype, w, sugg):
+    """``'ab'`` (letter in the word, letter in the suggestion) when the
+    finding is a single substitution of a :data:`PHONETIC_PAIRS` pair."""
+    if errtype != 'edit1_sub' or not sugg:
+        return None
+    r = _dld1(w, sugg)
+    if r and r[0] == 'sub' and (r[1], r[2]) in PHONETIC_PAIRS:
+        return r[1] + r[2]
+    return None
+
+
+def book_spelling_pairs(items, min_words, profiles=None):
+    """``{doc: {pair}}``: phonetic letter swaps each book makes in at least
+    `min_words` DIFFERENT flagged words — the book's own spelling.
+
+    `items` are ``(doc, word, errtype, suggestion)`` (repeats are fine).
+    Directional: a book writing א for ע does not excuse ע for א. A pair the
+    book's OCR profile lists (`profiles`, learned from reviewed findings) is
+    a confirmed error there and never becomes a convention. A word swapping
+    a pair its book does NOT swap systematically is still an ordinary
+    finding (ישראל with ס in a book that otherwise writes ש).
+    """
+    if min_words <= 0:
+        return {}
+    profiles = profiles or {}
+    words = {}
+    for doc, w, errtype, sugg in items:
+        p = phonetic_pair(errtype, w, sugg)
+        if p and p not in (profiles.get(doc) or ()):
+            words.setdefault((doc, p), set()).add(w)
+    out = {}
+    for (doc, p), ws in words.items():
+        if len(ws) >= min_words:
+            out.setdefault(doc, set()).add(p)
+    return out
+
+
+def book_repeat_value(errtype, w, sugg, n_located, only_this_book, pairs):
+    """The ``book_repeat`` column: 1 (the word lives in one book), 2 (its
+    letter swap is the book's spelling, `pairs` from
+    :func:`book_spelling_pairs` for this doc) or 0."""
+    if book_repeat_flag(errtype, n_located, only_this_book):
+        return 1
+    return BOOK_SPELLING if phonetic_pair(errtype, w, sugg) in pairs else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2139,6 +2228,17 @@ def locate(spec, cfg, out_dir):
                     if book_repeat_flag(flagged[w][1], n, len(w_docs[w]) == 1)}
     print(f'[locate] same-book-repeat words suppressed: {len(repeat_words):,}',
           flush=True)
+    # a sound-alike letter swap that one book makes in many different words
+    # is that book's spelling (book_repeat = 2); a pair its reviewed OCR
+    # profile lists stays an error
+    spell_pairs = book_spelling_pairs(
+        ((doc, w, flagged[w][1], flagged[w][2])
+         for w, _, doc, _, _, _ in all_occ),
+        cfg.book_spelling_min, load_ocr_profiles(out_dir)[0])
+    print(f'[locate] books with a phonetic spelling convention: '
+          f'{len(spell_pairs):,} '
+          f'({sum(len(v) for v in spell_pairs.values()):,} letter pairs)',
+          flush=True)
 
     # context verification for edit-distance-1 suggestions (does the corrected
     # word occur next to the same neighbors elsewhere?) + book-local counts
@@ -2283,8 +2383,10 @@ def locate(spec, cfg, out_dir):
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
-            rows.append((w, uid, doc, hits, local,
-                         1 if w in repeat_words else 0, tan, tsugg, snip,
+            rep = book_repeat_value(fr[1], w, fr[2], w_count[w],
+                                    len(w_docs[w]) == 1,
+                                    spell_pairs.get(doc, ()))
+            rows.append((w, uid, doc, hits, local, rep, tan, tsugg, snip,
                          ev, None, None, *cstat, lr, *par))
         con.executemany(_OCC_INSERT, rows)
         # OCR-profile findings: word-level entry + occurrence rows carrying their
@@ -2361,7 +2463,9 @@ def locate(spec, cfg, out_dir):
 # * ctx_hits    — the correction was seen next to the same neighbors (edit1)
 # * sugg_local  — the correction is used inside the very same book
 # * book_repeat — all occurrences of the word sit in one book (idiosyncratic
-#                 spelling, not a typo) — strong demotion
+#                 spelling, not a typo) — strong demotion; book_repeat = 2:
+#                 the word's sound-alike letter swap is its book's spelling
+#                 convention (book_spelling_pairs) — a milder demotion
 # plus the Tanach signal: tanach = 3 (an aligned verse whose reading, backed
 # by >= 2 independent sources, differs from the word AND equals the detector's
 # suggestion). tanach = 4 (the verse reads otherwise than the detector) and
@@ -2396,7 +2500,8 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END
+              - CASE WHEN book_repeat = 2 THEN 2.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
 # proposed correction and the word is not an in-book spelling convention;
@@ -2448,7 +2553,8 @@ RANK_TERMS = {
                       else 0.75 * max(-2.0, min(2.0, r['par_vote']))),
     'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
                              0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
-    'book_repeat': lambda r: -3.0 if _num(r, 'book_repeat') == 1 else 0.0,
+    'book_repeat': lambda r: (-3.0 if _num(r, 'book_repeat') == 1 else
+                              -2.0 if _num(r, 'book_repeat') == 2 else 0.0),
     'tanach': lambda r: 4.0 if _num(r, 'tanach') == 3 else 0.0,
 }
 
