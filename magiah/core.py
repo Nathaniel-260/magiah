@@ -28,7 +28,7 @@ from multiprocessing import Pool
 from .config import Config
 from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
-from . import rankstats
+from . import rankmodel, rankstats
 from .rankstats import OCC_STAT_COLS, ctx_stats
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
@@ -863,6 +863,7 @@ LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
 CALIBRATION_META_F = 'calibration_meta.json'
 LEARNED_F = 'confusion_learned.json'
 OCR_PROFILES_F = 'ocr_profiles.pkl'
+RANK_MODEL_F = 'rank_model.json'     # magiah.rankmodel.MODEL_F
 SPLIT_ALTS_F = 'split_alts.pkl'
 
 # What actually supports a finding (report column `evidence`). Book-scope
@@ -1313,7 +1314,7 @@ def write_calibration_meta(out_dir, info):
     info = dict(info)
     info['hashes'] = {
         fn: _file_digest(os.path.join(out_dir, fn))
-        for fn in (LEARNED_F, OCR_PROFILES_F)} \
+        for fn in (LEARNED_F, OCR_PROFILES_F, RANK_MODEL_F)} \
         if info.get('source') in ('human_review', 'machine_unreviewed') \
         else {}
     with open(os.path.join(out_dir, CALIBRATION_META_F), 'w',
@@ -1479,6 +1480,7 @@ def calibrate(cfg, out_dir, from_machine=False):
               '--calibrate-from-machine to learn (labelled unreviewed) from '
               'the machine report. Earlier learned files are now disabled.',
               flush=True)
+        rankmodel.remove(out_dir)
         return write_calibration_meta(out_dir, {
             'source': 'none', 'rows': 0, 'reason': why,
             'created': time.strftime('%Y-%m-%d %H:%M:%S')})
@@ -1503,9 +1505,10 @@ def calibrate(cfg, out_dir, from_machine=False):
     profiles = {d: ps for d, ps in profiles.items() if ps}
     with open(os.path.join(out_dir, OCR_PROFILES_F), 'wb') as f:
         pickle.dump(profiles, f, protocol=4)
+    model_info = _calibrate_rank_model(cfg, out_dir, source)
     info = write_calibration_meta(out_dir, {
         'source': source, 'rows': len(conf_rows), 'pairs': len(pairs),
-        'profiles': len(profiles),
+        'profiles': len(profiles), 'rank_model': model_info,
         'created': time.strftime('%Y-%m-%d %H:%M:%S')})
     print(f'[calibrate] OCR profiles: {len(profiles)} books, '
           f'{sum(len(v) for v in profiles.values())} systematic pairs',
@@ -1515,6 +1518,32 @@ def calibrate(cfg, out_dir, from_machine=False):
               '(labelled machine_unreviewed in calibration_meta.json)',
               flush=True)
     return info
+
+
+def _calibrate_rank_model(cfg, out_dir, source):
+    """Fit the optional logistic ranking (magiah.rankmodel) on the human
+    labels, or remove an old one: a model is the product of the calibration
+    that vouches for it. Returns a summary for calibration_meta.json."""
+    if not cfg.rank_model:
+        rankmodel.remove(out_dir)
+        return {'state': 'off'}
+    if source != 'human_review':
+        rankmodel.remove(out_dir)
+        print('[calibrate] rank model: not fitted - it learns from human '
+              'review decisions only', flush=True)
+        return {'state': 'no_human_labels'}
+    from .eval import load_labels
+    rows = load_labels(out_dir)
+    model, info = rankmodel.train(rows, cfg.rank_model_min)
+    if model is None:
+        rankmodel.remove(out_dir)
+        print(f'[calibrate] rank model: not fitted ({info["reason"]}); the '
+              f'ranking stays the hand formula (RANK_SQL)', flush=True)
+        return {'state': 'fallback', **info}
+    rankmodel.save(out_dir, model, info)
+    print(f'[calibrate] rank model fitted on {info["labels"]:,} labels '
+          f'(held-out: {info.get("held_out")})', flush=True)
+    return {'state': 'fitted', **info}
 
 
 def _split_verify_chunk(chunk):
@@ -2445,9 +2474,14 @@ def _open_report(path):
         return None
 
 
-def _write_reports(con, dest_dir, extra_where, params, top):
+def _write_reports(con, dest_dir, extra_where, params, top, rank=None,
+                   model=None):
     """Write the full set of report CSVs into dest_dir, optionally filtered
-    (extra_where/params) to a single source repository."""
+    (extra_where/params) to a single source repository. `rank`: the ranking
+    expression (default RANK_SQL); with a calibrated `model`
+    (magiah.rankmodel) it is the model's log-odds and the ``prob`` column
+    holds its probability, else ``prob`` is empty."""
+    rank = rank or RANK_SQL
     limit = f'LIMIT {top}' if top else ''
     types = [r[0] for r in con.execute(
         'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
@@ -2459,12 +2493,12 @@ def _write_reports(con, dest_dir, extra_where, params, top):
     src = rank_source(con, 'occurrences_full')
     # the chance-normalised signals go last: readers address columns by name
     cols = ('word, suggestion, {tan}, ROUND({rank}, 2), ctx_hits, '
-            'sugg_local, {ev}, source, ref, unit, snippet, {stats}').format(
-                rank=RANK_SQL, tan=tan_col, ev=ev,
-                stats=', '.join(OPTIONAL_RANK_COLS))
+            'sugg_local, {ev}, source, ref, unit, snippet, {stats}, '
+            '{rank}').format(rank=rank, tan=tan_col, ev=ev,
+                             stats=', '.join(OPTIONAL_RANK_COLS))
     header = ['word', 'suggestion', 'tanach_reading', 'rank', 'ctx_hits',
               'sugg_local', 'evidence', 'source', 'ref', 'unit', 'snippet',
-              *OPTIONAL_RANK_COLS]
+              *OPTIONAL_RANK_COLS, 'prob']
     for t in types:
         variants = [(f'errors_{t}.csv', f'errtype = ?{extra_where}')]
         if t.startswith('edit1'):
@@ -2483,8 +2517,10 @@ def _write_reports(con, dest_dir, extra_where, params, top):
                 n = 0
                 for row in con.execute(f'''
                         SELECT {cols} FROM {src} WHERE {where}
-                        ORDER BY {RANK_SQL} DESC {limit}''', (t, *params)):
-                    wr.writerow(row)
+                        ORDER BY {rank} DESC {limit}''', (t, *params)):
+                    p = (round(rankmodel._sigmoid(row[-1]), 4)
+                         if model is not None else '')
+                    wr.writerow((*row[:-1], p))
                     n += 1
             print(f'[report] {n:,} rows -> {path}', flush=True)
     # Tanach review files (Otzaria corpora)
@@ -2553,7 +2589,11 @@ def report(cfg, out_dir, top=0):
         print(f'[report] אזהרה: הדוחות מבוססים על סריקה חלקית — {rows:,} '
               f'שורות מהקלט לא נקראו (אושר במפורש ב-‎--allow-unread‎). '
               f'פרטים: {path}', flush=True)
-    _write_reports(con, out_dir, '', (), top)
+    rank, model = rankmodel.rank_sql(out_dir, RANK_SQL)
+    print('[report] ranking: ' + (
+        f'calibrated model ({RANK_MODEL_F}), rank = log-odds, prob = its '
+        f'probability' if model else 'hand formula (RANK_SQL)'), flush=True)
+    _write_reports(con, out_dir, '', (), top, rank, model)
     # a separate folder per source repository (Sefaria, Dicta, wikisource...)
     try:
         origins = [r[0] for r in con.execute(
@@ -2566,5 +2606,5 @@ def report(cfg, out_dir, top=0):
         d = os.path.join(out_dir, 'by_source', safe)
         os.makedirs(d, exist_ok=True)
         print(f'[report] ===== {org} =====', flush=True)
-        _write_reports(con, d, ' AND origin = ?', (org,), top)
+        _write_reports(con, d, ' AND origin = ?', (org,), top, rank, model)
     con.close()

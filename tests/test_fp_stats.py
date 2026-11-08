@@ -295,6 +295,156 @@ class ParallelPassages(unittest.TestCase):
                             for r in measured))
 
 
+class RankModel(unittest.TestCase):
+    """(4) the optional calibrated logistic ranking."""
+
+    def setUp(self):
+        self.out = tempfile.mkdtemp(prefix='magiah_model_')
+
+    def tearDown(self):
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def _label(self, n_docs=30):
+        """Human decisions: real errors are the context-verified findings
+        (with some noise), across `n_docs` books."""
+        from magiah.webui import db as uidb
+        con = uidb.connect(self.out)
+        i = 0
+        for d in range(n_docs):
+            for k in range(4):
+                i += 1
+                real = k < 2
+                hits = 3 if (real or k == 3 and d % 5 == 0) else 0
+                status = 'approved' if real else 'not_error'
+                con.execute(
+                    'INSERT INTO findings(id, family, errtype, word, '
+                    'suggestion, score, rank, ctx_hits, sugg_local, '
+                    'book_repeat, tanach, doc, unit, verified) VALUES'
+                    "(?, 'error', 'edit1_sub', ?, ?, ?, 0, ?, 0, 0, 0, ?, "
+                    '?, 0)', (i, f'בות{i}', 'בית', 2.0 + (k % 2) * 0.1,
+                              hits, f'd{d}', str(i)))
+                con.execute('INSERT INTO review(finding_id, status, '
+                            "updated_at) VALUES(?, ?, 'x')", (i, status))
+        con.commit()
+        con.close()
+        return i
+
+    def _cfg(self, **kw):
+        from magiah.config import Config
+        return Config(**{'rank_model': 1, 'rank_model_min': 50, **kw})
+
+    def test_python_and_sql_features_agree(self):
+        from magiah import rankmodel as rm
+        model = {'bias': -0.3,
+                 'weights': {k: 0.1 * (j + 1) - 0.6
+                             for j, k in enumerate(rm.FEATURE_NAMES)}}
+        rows = [
+            dict(word='בות', errtype='edit1_sub', score=2.5, ctx_hits=2,
+                 sugg_local=4, book_repeat=0, tanach=0, ctx_assoc=0.7,
+                 rw_lr=None, par_vote=4.0),
+            dict(word='אבגדהוזחטיכלמנ', errtype='final_midword', score=3.0,
+                 ctx_hits=0, sugg_local=12, book_repeat=1, tanach=3),
+            dict(word='אב', errtype='missing_space', score=None,
+                 ctx_hits=None, sugg_local=None, book_repeat=None,
+                 tanach=None, rw_lr=-7.0),
+        ]
+        con = sqlite3.connect(':memory:')
+        cols = ('word', 'errtype', 'score', 'ctx_hits', 'sugg_local',
+                'book_repeat', 'tanach', 'ctx_assoc', 'rw_lr', 'par_vote')
+        con.execute(f'CREATE TABLE t({", ".join(cols)})')
+        for r in rows:
+            con.execute(f'INSERT INTO t VALUES({",".join("?" * len(cols))})',
+                        [r.get(c) for c in cols])
+        got = [v for v, in con.execute(
+            f'SELECT {rm.logit_sql(model)} FROM t ORDER BY rowid')]
+        for r, v in zip(rows, got):
+            self.assertAlmostEqual(rm.logit(model, r), v, places=9)
+
+    def test_fit_learns_the_signal(self):
+        from magiah import rankmodel as rm
+        rows = ([_row(i, 1, ctx_hits=2) for i in range(30)]
+                + [_row(i, 0, ctx_hits=0) for i in range(30, 60)])
+        m = rm.fit(rows, l2=0.1, iters=500)
+        self.assertGreater(m['weights']['ctx_hit'], 0)
+        self.assertGreater(rm.prob(m, rows[0]), 0.8)
+        self.assertLess(rm.prob(m, rows[-1]), 0.2)
+
+    def test_too_few_labels_fall_back(self):
+        from magiah import rankmodel as rm
+        rows = [_row(i, i % 2) for i in range(8)]
+        model, info = rm.train(rows, 200)
+        self.assertIsNone(model)
+        self.assertIn('8 labels', info['reason'])
+
+    def test_calibrate_with_few_labels_keeps_the_formula(self):
+        from magiah import rankmodel as rm
+        self._label(n_docs=2)
+        info = core.calibrate(self._cfg(), self.out)
+        self.assertEqual(info['rank_model']['state'], 'fallback')
+        self.assertFalse(os.path.exists(os.path.join(self.out, rm.MODEL_F)))
+        self.assertEqual(rm.rank_sql(self.out, core.RANK_SQL),
+                         (core.RANK_SQL, None))
+
+    def test_calibrate_fits_saves_and_vouches(self):
+        from magiah import rankmodel as rm
+        self._label()
+        info = core.calibrate(self._cfg(), self.out)
+        self.assertEqual(info['rank_model']['state'], 'fitted')
+        self.assertIn('held_out', info['rank_model'])
+        model = rm.load_model(self.out)
+        self.assertIsNotNone(model)
+        self.assertGreater(model['weights']['ctx_hit'], 0)
+        expr, m = rm.rank_sql(self.out, core.RANK_SQL)
+        self.assertIs(m is not None, True)
+        self.assertNotEqual(expr, core.RANK_SQL)
+        # edited afterwards: no longer vouched for
+        path = os.path.join(self.out, rm.MODEL_F)
+        with open(path, encoding='utf-8') as f:
+            obj = f.read()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(obj.replace('"bias": ', '"bias": 1 + 0 * '))
+        self.assertIsNone(rm.load_model(self.out))
+
+    def test_calibrate_without_the_flag_removes_the_model(self):
+        from magiah import rankmodel as rm
+        self._label()
+        core.calibrate(self._cfg(), self.out)
+        self.assertIsNotNone(rm.load_model(self.out))
+        info = core.calibrate(self._cfg(rank_model=0), self.out)
+        self.assertEqual(info['rank_model'], {'state': 'off'})
+        self.assertIsNone(rm.load_model(self.out))
+
+    def test_reports_rank_by_the_model_with_prob(self):
+        from magiah import rankmodel as rm
+        self._label()
+        core.calibrate(self._cfg(), self.out)
+        expr, model = rm.rank_sql(self.out, core.RANK_SQL)
+        con = sqlite3.connect(':memory:')
+        con.execute('CREATE TABLE occurrences_full(word, errtype, '
+                    'suggestion, score, ctx_hits, sugg_local, book_repeat, '
+                    'tanach, source, ref, unit, snippet, origin, doc, '
+                    'evidence)')
+        con.execute('CREATE TABLE space_errors_full(part1, part2, joined, '
+                    'join_freq, source, ref, unit, snippet, origin)')
+        con.executemany(
+            'INSERT INTO occurrences_full VALUES(' + ','.join('?' * 15) + ')',
+            [('בות', 'edit1_sub', 'בית', 2.0, h, 0, 0, 0, 'b', 'r', str(h),
+              's', '', 'd', 'none') for h in (0, 5)])
+        for m, e in ((None, None), (model, expr)):
+            dest = tempfile.mkdtemp(dir=self.out)
+            core._write_reports(con, dest, '', (), 0, e, m)
+            with open(os.path.join(dest, 'errors_edit1_sub.csv'),
+                      encoding='utf-8-sig', newline='') as f:
+                rows = list(csv.DictReader(f))
+            if m is None:
+                self.assertEqual({r['prob'] for r in rows}, {''})
+            else:
+                probs = [float(r['prob']) for r in rows]
+                self.assertEqual(probs, sorted(probs, reverse=True))
+                self.assertEqual(rows[0]['ctx_hits'], '5')
+                self.assertTrue(all(0 < p < 1 for p in probs))
+
+
 class Diagnostics(unittest.TestCase):
 
     def test_by_group_precision_and_recall(self):

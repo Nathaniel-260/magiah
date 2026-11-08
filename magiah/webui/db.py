@@ -20,7 +20,9 @@ Rank formula
 ------------
 ``RANK_SQL`` below is copied VERBATIM from magiah.core (do not edit here
 without editing there) and is precomputed into the ``rank`` column at import
-time for family='error'. Other families have no corpus-evidence columns, so
+time for family='error' -- or, when ``calibrate`` fitted a ranking model
+(magiah.rankmodel, rank_model.json vouched by calibration_meta.json), that
+model's log-odds instead. Other families have no corpus-evidence columns, so
 their rank is documented per family:
 
 * extra_space  — rank = round(log10(join_freq + 1), 2)  (log-scaled join
@@ -99,6 +101,14 @@ VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
 
 OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr', 'par_vote')
 # ---------------------------------------------------------------------------
+
+
+def _rank_sql(outdir):
+    """The rank expression: a calibrated model's log-odds when calibrate
+    fitted one (magiah.rankmodel, vouched by calibration_meta.json), else
+    RANK_SQL."""
+    from ..rankmodel import rank_sql
+    return rank_sql(outdir, RANK_SQL)[0]
 
 
 def _rank_source(cur, table, schema=''):
@@ -905,7 +915,8 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute(f'''
             INSERT INTO imp
             SELECT 'error', errtype, word, suggestion, score,
-                   ROUND({RANK_SQL}, 2), ctx_hits, sugg_local, book_repeat,
+                   ROUND({_rank_sql(outdir)}, 2), ctx_hits, sugg_local,
+                   book_repeat,
                    tanach,
                    CASE WHEN {VERIFIED_SQL} THEN 1 ELSE 0 END,
                    origin, source, ref, unit, doc, snippet,
@@ -1404,7 +1415,8 @@ def import_book_scan(outdir, result):
         cur.execute(f'''INSERT INTO findings(id, {cols})
             SELECT ? + ROW_NUMBER() OVER (ORDER BY rowid),
                    family, errtype, word, suggestion, score,
-                   CASE WHEN family = 'error' THEN ROUND({RANK_SQL}, 2)
+                   CASE WHEN family = 'error'
+                        THEN ROUND({_rank_sql(outdir)}, 2)
                         ELSE flat_rank END,
                    ctx_hits, sugg_local, book_repeat, tanach,
                    CASE WHEN family = 'error' AND ({VERIFIED_SQL})

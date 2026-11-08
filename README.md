@@ -230,7 +230,29 @@ learns nothing and says so; `--calibrate-from-machine` learns from
 `calibration_meta.json`. Learned files without that provenance (written by
 older versions), or whose hash no longer matches it, are ignored, and a
 `calibrate` run with nothing to learn disables the previous files. `python -m magiah.eval --out results` measures
-the ranking's precision on reviewed books held out from calibration.
+the ranking's precision on reviewed books held out from calibration, per
+error class and evidence kind, what each rank cut-off would lose, a
+calibration table and the effect of removing each rank term. Reviewed
+findings are mostly the top of the ranking, so `--sample-out sample.csv`
+exports a stratified random sample (error class x rank band, with stratum
+weights) to label, and `--sample-labels sample.csv` turns it into unbiased
+estimates.
+
+**Rank signals measured against chance.** `report.db` stores, per
+occurrence, `ctx_exp` (the context pairs independence would predict) and
+`ctx_assoc` (log10 of hits against it): the rank bonus grows with it, and
+no hits cost a penalty only where hits were expected. Two optional signals
+cost a longer context pass and are off by default: `--rw-corpus 1`
+(`rw_lr`: the real-word language model, original vs. correction between the
+same neighbours, the original's n-grams counted outside its own book) and
+`--par-corpus 1` (`par_sugg` / `par_word` / `par_vote`: the two-words-each-
+side window seen with the correction vs. with the original in other books).
+All of them move findings up or down, never in or out. With
+`--rank-model 1`, `calibrate` fits a logistic ranking on the review labels
+(`rank_model.json`, provenance-checked like the confusion matrix) once
+there are `--rank-model-min` (200) of them; the reports then rank by its
+log-odds and fill a `prob` column. With fewer labels the hand formula
+stays.
 
 **Scan a single book** (seconds instead of an hour):
 

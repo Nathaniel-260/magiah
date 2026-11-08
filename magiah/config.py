@@ -56,6 +56,11 @@ class Config:
                              # with the correction / with the original in
                              # other books (columns par_sugg, par_word,
                              # par_vote). Rank only; a longer context pass
+    rank_model: int = 0      # calibrate (1 = on): fit a logistic ranking on
+                             # the human review labels (rank_model.json,
+                             # magiah.rankmodel); rank only. Without
+                             # enough labels the hand formula stays
+    rank_model_min: int = 200  # ... labels needed to fit it
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
