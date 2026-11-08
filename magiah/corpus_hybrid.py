@@ -22,6 +22,7 @@ import re
 import sqlite3
 
 from . import tanach
+from .rankstats import ENRICH_STAT_COLS
 from .corpus import OTZARIA_DB
 from .textsource import (OtzariaDB, ReadStats, TextSourceError, connect_ro,
                          iter_file_lines)
@@ -377,7 +378,8 @@ def _meta_enrich(con, meta):
                  COALESCE(m.source, o.doc) AS source,
                  COALESCE(m.ref, '') AS ref, o.unit, o.snippet,
                  COALESCE(m.origin, '{FALLBACK_ORIGIN}') AS origin,
-                 o.doc AS doc, o.evidence AS evidence, {tanach.ENRICH_COLS}
+                 o.doc AS doc, o.evidence AS evidence, {ENRICH_STAT_COLS},
+                 {tanach.ENRICH_COLS}
           FROM occurrences o
           JOIN errors e ON e.word = o.word
           {tanach.ENRICH_JOIN}

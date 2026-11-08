@@ -35,6 +35,23 @@ class Config:
                              # findings. 0 (or less): off
     ocr_pair_min: int = 8    # confirmed substitutions of one letter pair in a
                              # single book to establish an OCR profile
+    book_spelling_min: int = 5  # a book that swaps one SOUND-alike (not
+                             # look-alike) letter pair (א/ע, ס/ש, כ/ק, ט/ת)
+                             # in this many different flagged words spells
+                             # that way on purpose: those findings get
+                             # book_repeat = 2 and rank lower (never removed).
+                             # A pair the book's reviewed OCR profile lists
+                             # stays an error. 0 (or less): off
+    loanword: int = 0        # 1 = on: a long word with a Greek/Latin-like
+                             # ending (core.LOANWORD_ENDINGS) whose best
+                             # correction
+                             # swaps ג/ק, ט/ת, ו/י or ס/צ is likely a
+                             # transliteration variant (אונגלוס / אונקלוס):
+                             # its score drops by loanword_penalty. Rank only
+                             # — the finding and its suggestion stay. Off by
+                             # default until measured on a full corpus
+    loanword_min_len: int = 6
+    loanword_penalty: float = 1.5
     ocr_rare_max: int = 5    # profiled books: scan words up to this frequency
     ocr_ratio: int = 20      # ... requiring correction/word frequency ratio
     real_word: int = 0       # book scan (1 = on): also judge common words by
@@ -45,6 +62,22 @@ class Config:
     real_word_rep: int = 3   # ... a word the book uses this often (>= 1),
                              # and more often than the suggestion, is its
                              # own spelling
+    rw_corpus: int = 0       # corpus scan (1 = on): weigh each edit-1 /
+                             # spelling-variant correction against the
+                             # original between the same neighbours
+                             # (realword.posterior; column rw_lr). Rank
+                             # only; the context pass counts more n-grams
+                             # (roughly 20-40% longer)
+    par_corpus: int = 0      # corpus scan (1 = on): parallel passages --
+                             # the window of 2 words each side looked up
+                             # with the correction / with the original in
+                             # other books (columns par_sugg, par_word,
+                             # par_vote). Rank only; a longer context pass
+    rank_model: int = 0      # calibrate (1 = on): fit a logistic ranking on
+                             # the human review labels (rank_model.json,
+                             # magiah.rankmodel); rank only. Without
+                             # enough labels the hand formula stays
+    rank_model_min: int = 200  # ... labels needed to fit it
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never

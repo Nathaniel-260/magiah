@@ -28,6 +28,8 @@ from multiprocessing import Pool
 from .config import Config
 from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
+from . import rankmodel, rankstats
+from .rankstats import OCC_STAT_COLS, ctx_stats
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
                         SUFFIX_LETTERS, TO_FINAL, is_abbrev, tokenize)
@@ -861,6 +863,7 @@ LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
 CALIBRATION_META_F = 'calibration_meta.json'
 LEARNED_F = 'confusion_learned.json'
 OCR_PROFILES_F = 'ocr_profiles.pkl'
+RANK_MODEL_F = 'rank_model.json'     # magiah.rankmodel.MODEL_F
 SPLIT_ALTS_F = 'split_alts.pkl'
 
 # What actually supports a finding (report column `evidence`). Book-scope
@@ -989,6 +992,29 @@ def _frequency_penalty(fw, cfg):
     return math.log10(fw / rm) if fw > rm else 0.0
 
 
+# Letter swaps typical of transliterating Greek/Latin (גמ"ל/קו"ף for gamma/
+# kappa, טי"ת/תי"ו for theta/tau, ו/י for the vowels, ס/צ for sigma)
+LOANWORD_PAIRS = frozenset(
+    p for a, b in (('ג', 'ק'), ('ט', 'ת'), ('ו', 'י'), ('ס', 'צ'))
+    for p in ((a, b), (b, a)))
+# endings of transliterated Greek/Latin words (-os/-us, -ion, -ike). Not
+# -in (טופסין): in the v0.6 scan results ~75% of the long -ין words with
+# these swaps were Hebrew/Aramaic plurals (שימעין/שומעין), i.e. real findings
+LOANWORD_ENDINGS = ('וס', 'יון', 'קי')
+
+
+def loanword_penalty(w, kind, ch_a, ch_b, cfg):
+    """Score demotion of an edit-1 correction that looks like a variant
+    transliteration of a Greek/Latin loanword (cfg.loanword), else 0. Only
+    lowers the rank: the correction is still chosen and reported."""
+    if (not cfg.loanword or kind != 'sub'
+            or (ch_a, ch_b) not in LOANWORD_PAIRS
+            or len(w) < cfg.loanword_min_len
+            or not w.endswith(LOANWORD_ENDINGS)):
+        return 0.0
+    return max(0.0, cfg.loanword_penalty)
+
+
 def evaluate_word(w, fw, lex, edit1_cands):
     """Every per-word rule for one word type.
 
@@ -1091,7 +1117,11 @@ def evaluate_word(w, fw, lex, edit1_cands):
             score += 1
         if score > best_score:
             best_c, best_score, best_kind, best_ch = c, score, kind, ch_a
+            best_sub = ch_b
     if best_c:
+        # chosen on the full score, then demoted: a loanword variant keeps
+        # its finding and suggestion, only ranks lower
+        best_score -= loanword_penalty(w, best_kind, best_ch, best_sub, cfg)
         # extra/missing ו or י is ktiv male/chaser variation: own class
         if best_kind in ('ins', 'del') and best_ch in 'וי':
             errtype = 'spelling_variant'
@@ -1290,6 +1320,68 @@ def book_repeat_flag(errtype, n_located, only_this_book):
                  and only_this_book) else 0
 
 
+# Letter pairs that sound alike in some traditional pronunciations but do not
+# look alike, so a book swapping them is spelling, not OCR (אגמת / עגמת).
+# Visually confusable pairs (ד/ר, ה/ח, ו/י ... see CONFUSABLE) are never
+# here: a book that confuses those many times has an OCR fault, which is
+# what the per-book OCR profiles are for.
+PHONETIC_PAIRS = frozenset(
+    p for a, b in (('א', 'ע'), ('ס', 'ש'), ('כ', 'ק'), ('ך', 'ק'),
+                   ('ט', 'ת'))
+    for p in ((a, b), (b, a)))
+assert not PHONETIC_PAIRS & CONFUSABLE
+
+# book_repeat value of a finding whose letter swap is its book's convention
+# (1 stays "all occurrences of this word sit in one book")
+BOOK_SPELLING = 2
+
+
+def phonetic_pair(errtype, w, sugg):
+    """``'ab'`` (letter in the word, letter in the suggestion) when the
+    finding is a single substitution of a :data:`PHONETIC_PAIRS` pair."""
+    if errtype != 'edit1_sub' or not sugg:
+        return None
+    r = _dld1(w, sugg)
+    if r and r[0] == 'sub' and (r[1], r[2]) in PHONETIC_PAIRS:
+        return r[1] + r[2]
+    return None
+
+
+def book_spelling_pairs(items, min_words, profiles=None):
+    """``{doc: {pair}}``: phonetic letter swaps each book makes in at least
+    `min_words` DIFFERENT flagged words — the book's own spelling.
+
+    `items` are ``(doc, word, errtype, suggestion)`` (repeats are fine).
+    Directional: a book writing א for ע does not excuse ע for א. A pair the
+    book's OCR profile lists (`profiles`, learned from reviewed findings) is
+    a confirmed error there and never becomes a convention. A word swapping
+    a pair its book does NOT swap systematically is still an ordinary
+    finding (ישראל with ס in a book that otherwise writes ש).
+    """
+    if min_words <= 0:
+        return {}
+    profiles = profiles or {}
+    words = {}
+    for doc, w, errtype, sugg in items:
+        p = phonetic_pair(errtype, w, sugg)
+        if p and p not in (profiles.get(doc) or ()):
+            words.setdefault((doc, p), set()).add(w)
+    out = {}
+    for (doc, p), ws in words.items():
+        if len(ws) >= min_words:
+            out.setdefault(doc, set()).add(p)
+    return out
+
+
+def book_repeat_value(errtype, w, sugg, n_located, only_this_book, pairs):
+    """The ``book_repeat`` column: 1 (the word lives in one book), 2 (its
+    letter swap is the book's spelling, `pairs` from
+    :func:`book_spelling_pairs` for this doc) or 0."""
+    if book_repeat_flag(errtype, n_located, only_this_book):
+        return 1
+    return BOOK_SPELLING if phonetic_pair(errtype, w, sugg) in pairs else 0
+
+
 # ---------------------------------------------------------------------------
 # calibration provenance: learned weights are used only when they say where
 # they came from
@@ -1311,7 +1403,7 @@ def write_calibration_meta(out_dir, info):
     info = dict(info)
     info['hashes'] = {
         fn: _file_digest(os.path.join(out_dir, fn))
-        for fn in (LEARNED_F, OCR_PROFILES_F)} \
+        for fn in (LEARNED_F, OCR_PROFILES_F, RANK_MODEL_F)} \
         if info.get('source') in ('human_review', 'machine_unreviewed') \
         else {}
     with open(os.path.join(out_dir, CALIBRATION_META_F), 'w',
@@ -1477,6 +1569,7 @@ def calibrate(cfg, out_dir, from_machine=False):
               '--calibrate-from-machine to learn (labelled unreviewed) from '
               'the machine report. Earlier learned files are now disabled.',
               flush=True)
+        rankmodel.remove(out_dir)
         return write_calibration_meta(out_dir, {
             'source': 'none', 'rows': 0, 'reason': why,
             'created': time.strftime('%Y-%m-%d %H:%M:%S')})
@@ -1501,9 +1594,10 @@ def calibrate(cfg, out_dir, from_machine=False):
     profiles = {d: ps for d, ps in profiles.items() if ps}
     with open(os.path.join(out_dir, OCR_PROFILES_F), 'wb') as f:
         pickle.dump(profiles, f, protocol=4)
+    model_info = _calibrate_rank_model(cfg, out_dir, source)
     info = write_calibration_meta(out_dir, {
         'source': source, 'rows': len(conf_rows), 'pairs': len(pairs),
-        'profiles': len(profiles),
+        'profiles': len(profiles), 'rank_model': model_info,
         'created': time.strftime('%Y-%m-%d %H:%M:%S')})
     print(f'[calibrate] OCR profiles: {len(profiles)} books, '
           f'{sum(len(v) for v in profiles.values())} systematic pairs',
@@ -1513,6 +1607,32 @@ def calibrate(cfg, out_dir, from_machine=False):
               '(labelled machine_unreviewed in calibration_meta.json)',
               flush=True)
     return info
+
+
+def _calibrate_rank_model(cfg, out_dir, source):
+    """Fit the optional logistic ranking (magiah.rankmodel) on the human
+    labels, or remove an old one: a model is the product of the calibration
+    that vouches for it. Returns a summary for calibration_meta.json."""
+    if not cfg.rank_model:
+        rankmodel.remove(out_dir)
+        return {'state': 'off'}
+    if source != 'human_review':
+        rankmodel.remove(out_dir)
+        print('[calibrate] rank model: not fitted - it learns from human '
+              'review decisions only', flush=True)
+        return {'state': 'no_human_labels'}
+    from .eval import load_labels
+    rows = load_labels(out_dir)
+    model, info = rankmodel.train(rows, cfg.rank_model_min)
+    if model is None:
+        rankmodel.remove(out_dir)
+        print(f'[calibrate] rank model: not fitted ({info["reason"]}); the '
+              f'ranking stays the hand formula (RANK_SQL)', flush=True)
+        return {'state': 'fallback', **info}
+    rankmodel.save(out_dir, model, info)
+    print(f'[calibrate] rank model fitted on {info["labels"]:,} labels '
+          f'(held-out: {info.get("held_out")})', flush=True)
+    return {'state': 'fitted', **info}
 
 
 def _split_verify_chunk(chunk):
@@ -1755,7 +1875,8 @@ def _tanach_check(db_path, all_occ, flagged, lstats, out_dir, passes,
 
 def _snippet(text, s, e):
     """Bounded context of one token — never the whole (possibly huge) line."""
-    return text[max(0, s - 45):e + 45].strip()
+    pad = rankstats.SNIPPET_PAD      # par_window reads the slice back
+    return text[max(0, s - pad):e + pad].strip()
 
 
 def _editorial_adjacent(text, s, e):
@@ -1965,7 +2086,12 @@ def _ctx_count_chunk(chunk):
     * seq (book scan only): spaced occurrences of split candidates.
     * rw (book scan with ``Config.real_word`` only): the bigrams and trigrams
       the real-word check needs, counted outside the scanned book itself.
-      Returned as ``(bigram counts, trigram counts)``, or None."""
+      Returned as ``(bigram counts, trigram counts)``, or None.
+    * stats (corpus scan only): the rank signals of magiah.rankstats, as
+      ``{name: (per-book counts of the original's n-grams, counts of the
+      correction's)}`` -- ``rwc`` (``Config.rw_corpus``, the n-grams of
+      :func:`magiah.rankstats.rw_needs`) and ``par`` (``Config.par_corpus``,
+      the windows of :func:`magiah.rankstats.par_needs`)."""
     _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
@@ -1976,6 +2102,11 @@ def _ctx_count_chunk(chunk):
     if rw is not None:
         from .realword import count_ngrams
         rw_counts = (Counter(), Counter())
+    from .rankstats import count_par, count_rw
+    stat_fns = [(k, fn, _W[k]) for k, fn in (('rwc', count_rw),
+                                              ('par', count_par))
+                if k in _W]
+    stats = {k: (Counter(), Counter()) for k, _, _ in stat_fns}
     for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
         need = book_need.get(doc)
@@ -1989,7 +2120,19 @@ def _ctx_count_chunk(chunk):
         if rw is not None and doc != rw['skip_doc']:
             count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
                          rw['first3'], *rw_counts)
-    return counts, local, seq_counts, rw_counts, _chunk_stats_end()
+        for k, fn, need in stat_fns:
+            fn(toks, doc, need, *stats[k])
+    return (counts, local, seq_counts, rw_counts, stats,
+            _chunk_stats_end())
+
+
+# the columns of report.db's `occurrences`, in insert order; after
+# occ_score come the rank signals of magiah.rankstats (NULL: not measured)
+OCC_COLS = ('word', 'unit', 'doc', 'ctx_hits', 'sugg_local', 'book_repeat',
+            'tanach', 'tanach_sugg', 'snippet', 'evidence', 'occ_sugg',
+            'occ_score') + OCC_STAT_COLS
+_OCC_INSERT = (f'INSERT INTO occurrences({", ".join(OCC_COLS)}) '
+               f'VALUES({",".join("?" * len(OCC_COLS))})')
 
 
 def write_scan_meta(con, spec):
@@ -2085,6 +2228,17 @@ def locate(spec, cfg, out_dir):
                     if book_repeat_flag(flagged[w][1], n, len(w_docs[w]) == 1)}
     print(f'[locate] same-book-repeat words suppressed: {len(repeat_words):,}',
           flush=True)
+    # a sound-alike letter swap that one book makes in many different words
+    # is that book's spelling (book_repeat = 2); a pair its reviewed OCR
+    # profile lists stays an error
+    spell_pairs = book_spelling_pairs(
+        ((doc, w, flagged[w][1], flagged[w][2])
+         for w, _, doc, _, _, _ in all_occ),
+        cfg.book_spelling_min, load_ocr_profiles(out_dir)[0])
+    print(f'[locate] books with a phonetic spelling convention: '
+          f'{len(spell_pairs):,} '
+          f'({sum(len(v) for v in spell_pairs.values()):,} letter pairs)',
+          flush=True)
 
     # context verification for edit-distance-1 suggestions (does the corrected
     # word occur next to the same neighbors elsewhere?) + book-local counts
@@ -2101,7 +2255,26 @@ def locate(spec, cfg, out_dir):
         if fr[1] in LOCAL_TYPES and fr[2]:
             book_need.setdefault(doc, set()).add(fr[2])
     print(f'[locate] context pairs to verify: {len(ctx_pairs):,}', flush=True)
+    # optional rank signals (magiah.rankstats), counted in the same pass
+    stat_need = {}
+    rwc = None
+    if cfg.rw_corpus:       # the n-grams of the real-word comparison
+        rwc = stat_need['rwc'] = rankstats.rw_needs(all_occ, flagged,
+                                                    uses_context)
+        print(f'[locate] real-word n-grams to count: '
+              f'{len(rwc["own"]) + len(rwc["sugg3"]):,}', flush=True)
+    par_win = None
+    if cfg.par_corpus:      # the windows of the parallel-passage vote
+        par_win = [rankstats.par_window(w, prev, nxt, snip)
+                   if uses_context(flagged[w][1]) and flagged[w][2] else None
+                   for w, _, _, prev, nxt, snip in all_occ]
+        stat_need['par'] = rankstats.par_needs(
+            (win, (oc[0], flagged[oc[0]][2]))
+            for win, oc in zip(par_win, all_occ) if win)
+        print(f'[locate] parallel-passage windows to count: '
+              f'{len(stat_need["par"]["word"]):,}', flush=True)
     ctx_counts, local_counts = Counter(), Counter()
+    stat_counts = {k: (Counter(), Counter()) for k in stat_need}
     if ctx_pairs or book_need:
         ctx_path = os.path.join(out_dir, 'ctx_pairs.pkl')
         with open(ctx_path, 'wb') as f:
@@ -2109,19 +2282,47 @@ def locate(spec, cfg, out_dir):
         need_path = os.path.join(out_dir, 'book_need.pkl')
         with open(need_path, 'wb') as f:
             pickle.dump(book_need, f, protocol=4)
+        cloads = {'ctx_pairs': ctx_path, 'book_need': need_path}
+        for k, need in stat_need.items():
+            cloads[k] = os.path.join(out_dir, f'stat_{k}.pkl')
+            with open(cloads[k], 'wb') as f:
+                pickle.dump(need, f, protocol=4)
         cstats = passes['context'] = ReadStats()
-        with _pool(spec, cfg, {'ctx_pairs': ctx_path,
-                               'book_need': need_path}) as pool:
-            for i, (c, lc, _sc, _rw, st) in enumerate(
+        with _pool(spec, cfg, cloads) as pool:
+            for i, (c, lc, _sc, _rw, sc, st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
+                for k, (own_c, sugg_c) in sc.items():
+                    stat_counts[k][0].update(own_c)
+                    stat_counts[k][1].update(sugg_c)
                 cstats.add(ReadStats.from_dict(st))
                 if i % 6 == 0:
                     print(f'  [context] chunk {i}/{len(chunks)} '
                           f'({time.time()-t0:.0f}s)', flush=True)
         _fail_if_partial('locate', lstats, out_dir, passes=passes,
                          policy=policy)
+    # the corpus frequencies the chance expectation of each context pair
+    # needs (ctx_expected): the neighbours' and the corrections'
+    ctx_freq, ctx_N = {}, 0
+    if ctx_pairs:
+        with open(loads['lexicon'], 'rb') as f:
+            lexicon = pickle.load(f)
+        ctx_N = sum(lexicon.values())
+        for a, b in ctx_pairs:
+            ctx_freq[a] = lexicon.get(a, 0)
+            ctx_freq[b] = lexicon.get(b, 0)
+        for w in (rwc['words'] if rwc else ()):
+            ctx_freq[w] = lexicon.get(w, 0)
+        del lexicon
+    rw_own, rw_sugg3 = stat_counts.get('rwc', ({}, {}))
+    rw_tot = rankstats.own_totals(rw_own) if rwc else {}
+    par_own, par_sugg = stat_counts.get('par', ({}, {}))
+    par_tot = rankstats.own_totals(par_own)
+    # occurrences of each word in its own book: left out of its frequency
+    # as its n-grams are left out of their counts
+    w_in_doc = Counter((w, doc) for w, _, doc, _, _, _ in all_occ) \
+        if rwc else {}
 
     # --- write the report database ---------------------------------------
     # built under a temp name and moved into place only once complete, so a
@@ -2133,16 +2334,18 @@ def locate(spec, cfg, out_dir):
     con = sqlite3.connect(tmp_path)
     # occurrences.occ_sugg/occ_score: an occurrence-level suggestion (OCR
     # profiles differ per book) that overrides the word-level one in enrich;
-    # evidence: what actually supports the finding (see evidence_kind)
+    # evidence: what actually supports the finding (see evidence_kind);
+    # the rank signals of magiah.rankstats follow (REAL, NULL: not measured)
+    stat_cols = ''.join(f', {c} REAL' for c in OCC_STAT_COLS)
     try:
-        con.executescript('''
+        con.executescript(f'''
         CREATE TABLE errors(word TEXT PRIMARY KEY, freq INT, errtype TEXT,
                             suggestion TEXT, sugg_freq INT, score REAL);
         CREATE TABLE occurrences(word TEXT, unit TEXT, doc TEXT, ctx_hits INT,
                                  sugg_local INT, book_repeat INT, tanach INT,
                                  tanach_sugg TEXT, snippet TEXT,
                                  evidence TEXT, occ_sugg TEXT,
-                                 occ_score REAL);
+                                 occ_score REAL{stat_cols});
         CREATE TABLE space_errors(unit TEXT, part1 TEXT, part2 TEXT,
                                   joined TEXT, join_freq INT, snippet TEXT);
         CREATE TABLE tanach_matches(word TEXT, unit TEXT, doc TEXT,
@@ -2159,19 +2362,33 @@ def locate(spec, cfg, out_dir):
         rows = []
         for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
             fr = flagged[w]
-            hits = 0
+            hits, cstat, lr = 0, (None, None), None
             if uses_context(fr[1]):
                 sugg = fr[2]
                 hits = (ctx_counts.get((prev, sugg), 0)
                         + ctx_counts.get((sugg, nxt), 0))
+                cstat = ctx_stats(ctx_freq, ctx_N, prev, sugg, nxt, hits)
+                if rwc and sugg and (prev or nxt):
+                    lr = rankstats.rw_lr(
+                        ctx_freq, ctx_N,
+                        rankstats.OccCounts(ctx_counts, rw_sugg3, rw_tot,
+                                            rw_own, doc),
+                        prev, w, sugg, nxt, w_in_doc[(w, doc)])
+            par = (None, None, None)
+            win = par_win[j] if par_win else None
+            if win:
+                ps, pw = rankstats.par_counts(win, w, fr[2], doc, par_sugg,
+                                              par_tot, par_own)
+                par = (ps, pw, rankstats.par_vote(ps, pw))
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
-            rows.append((w, uid, doc, hits, local,
-                         1 if w in repeat_words else 0, tan, tsugg, snip,
-                         ev, None, None))
-        con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                        rows)
+            rep = book_repeat_value(fr[1], w, fr[2], w_count[w],
+                                    len(w_docs[w]) == 1,
+                                    spell_pairs.get(doc, ()))
+            rows.append((w, uid, doc, hits, local, rep, tan, tsugg, snip,
+                         ev, None, None, *cstat, lr, *par))
+        con.executemany(_OCC_INSERT, rows)
         # OCR-profile findings: word-level entry + occurrence rows carrying their
         # own book's suggestion (the word-level one is only the first seen)
         for w, fw, sugg, fs, uid, doc, snip in all_ocr:
@@ -2179,11 +2396,10 @@ def locate(spec, cfg, out_dir):
                 score = ocr_score(fw, fs)
                 con.execute('INSERT OR IGNORE INTO errors VALUES(?,?,?,?,?,?)',
                             (w, fw, 'ocr_profile', sugg, fs, score))
-                con.execute('INSERT INTO occurrences '
-                            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                con.execute(_OCC_INSERT,
                             (w, uid, doc, 0, 0, 0, 0, '', snip,
                              evidence_kind('ocr_profile', sugg, fs, 0, 0, 0),
-                             sugg, score))
+                             sugg, score) + (None,) * (len(OCC_COLS) - 12))
         if all_ocr:
             print(f'[locate] ocr-profile findings: {len(all_ocr):,}', flush=True)
         alts_path = os.path.join(out_dir, SPLIT_ALTS_F)
@@ -2247,24 +2463,112 @@ def locate(spec, cfg, out_dir):
 # * ctx_hits    — the correction was seen next to the same neighbors (edit1)
 # * sugg_local  — the correction is used inside the very same book
 # * book_repeat — all occurrences of the word sit in one book (idiosyncratic
-#                 spelling, not a typo) — strong demotion
+#                 spelling, not a typo) — strong demotion; book_repeat = 2:
+#                 the word's sound-alike letter swap is its book's spelling
+#                 convention (book_spelling_pairs) — a milder demotion
 # plus the Tanach signal: tanach = 3 (an aligned verse whose reading, backed
 # by >= 2 independent sources, differs from the word AND equals the detector's
 # suggestion). tanach = 4 (the verse reads otherwise than the detector) and
 # tanach = 2 (rows of the old trigram heuristic) earn nothing.
+#
+# ctx_assoc (log10 of the context hits against chance, ctx_association)
+# grades the context signal: hits far above chance earn up to +2.0, hits at
+# chance +0.5; no hits where chance expected several cost up to -1.0, no
+# hits where chance expected next to none cost (almost) nothing. A row
+# without ctx_assoc (an older report.db, a book-scope scan) keeps the flat
+# +1.5 / -1.0.
+#
+# rw_lr (Config.rw_corpus; magiah.rankstats.rw_lr): how far the bigram/
+# trigram context shifts the odds toward the correction, log10, half of it
+# within [-1.0, +1.5]. NULL (not measured) adds nothing.
+#
+# par_vote (Config.par_corpus; magiah.rankstats.par_vote): the occurrence's
+# two-words-each-side window seen with the correction vs. with the original
+# in other books, log10; 0.75 of it within [-1.5, +1.5]. NULL: nothing.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
-                  CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                  CASE WHEN ctx_assoc IS NULL THEN
+                         CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                       WHEN ctx_hits > 0 THEN
+                         0.5 + 0.5 * MIN(3.0, MAX(0.0, ctx_assoc))
+                       ELSE MAX(-1.0, MIN(0.0, ctx_assoc)) END
                 ELSE 0 END
+              + CASE WHEN rw_lr IS NULL THEN 0
+                     ELSE 0.5 * MAX(-2.0, MIN(3.0, rw_lr)) END
+              + CASE WHEN par_vote IS NULL THEN 0
+                     ELSE 0.75 * MAX(-2.0, MIN(2.0, par_vote)) END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END
+              - CASE WHEN book_repeat = 2 THEN 2.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
-# proposed correction and the word is not an in-book spelling convention.
+# proposed correction and the word is not an in-book spelling convention;
+# context hits count only above chance (where chance was measured).
 # The column `evidence` names WHICH support was found (and its scope).
-VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
+VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
+                'COALESCE(ctx_assoc, 1) > 0) OR sugg_local >= 3)')
+
+# columns RANK_SQL / VERIFIED_SQL read that a table may lack (an older
+# report.db, a hand-made one): read as NULL, i.e. "not measured"
+OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr', 'par_vote')
+
+
+def rank_source(con, table, schema=''):
+    """`table`, or a sub-select of it that adds the OPTIONAL_RANK_COLS it
+    lacks as NULL, so RANK_SQL can be evaluated over it."""
+    pre = f'{schema}.' if schema else ''
+    have = {r[1] for r in con.execute(f'PRAGMA {pre}table_info({table})')}
+    missing = [c for c in OPTIONAL_RANK_COLS if c not in have]
+    if not missing:
+        return pre + table
+    pad = ', '.join(f'NULL AS {c}' for c in missing)
+    return f'(SELECT *, {pad} FROM {pre}{table})'
+
+
+def _num(r, k):
+    v = r.get(k)
+    return 0 if v is None else v
+
+
+# RANK_SQL, term by term, in Python: what `magiah.eval` ablates (drops one
+# term and measures the ranking without it). tests/ keep the two equal.
+def _ctx_term(r):
+    if not str(r.get('errtype') or '').startswith('edit1'):
+        return 0.0
+    a = r.get('ctx_assoc')
+    if a is None:
+        return 1.5 if _num(r, 'ctx_hits') > 0 else -1.0
+    if _num(r, 'ctx_hits') > 0:
+        return 0.5 + 0.5 * min(3.0, max(0.0, a))
+    return max(-1.0, min(0.0, a))
+
+
+RANK_TERMS = {
+    'ctx': _ctx_term,
+    'rw': lambda r: (0.0 if r.get('rw_lr') is None
+                     else 0.5 * max(-2.0, min(3.0, r['rw_lr']))),
+    'par': lambda r: (0.0 if r.get('par_vote') is None
+                      else 0.75 * max(-2.0, min(2.0, r['par_vote']))),
+    'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
+                             0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
+    'book_repeat': lambda r: (-3.0 if _num(r, 'book_repeat') == 1 else
+                              -2.0 if _num(r, 'book_repeat') == 2 else 0.0),
+    'tanach': lambda r: 4.0 if _num(r, 'tanach') == 3 else 0.0,
+}
+
+
+def rank_terms(r):
+    """``{term: value}`` of RANK_SQL for one row dict (base: ``score``)."""
+    out = {'score': float(_num(r, 'score'))}
+    out.update((k, f(r)) for k, f in RANK_TERMS.items())
+    return out
+
+
+def rank_value(r, drop=()):
+    """RANK_SQL of one row dict, without the terms named in `drop`."""
+    return sum(v for k, v in rank_terms(r).items() if k not in drop)
 
 
 def _open_report(path):
@@ -2276,9 +2580,14 @@ def _open_report(path):
         return None
 
 
-def _write_reports(con, dest_dir, extra_where, params, top):
+def _write_reports(con, dest_dir, extra_where, params, top, rank=None,
+                   model=None):
     """Write the full set of report CSVs into dest_dir, optionally filtered
-    (extra_where/params) to a single source repository."""
+    (extra_where/params) to a single source repository. `rank`: the ranking
+    expression (default RANK_SQL); with a calibrated `model`
+    (magiah.rankmodel) it is the model's log-odds and the ``prob`` column
+    holds its probability, else ``prob`` is empty."""
+    rank = rank or RANK_SQL
     limit = f'LIMIT {top}' if top else ''
     types = [r[0] for r in con.execute(
         'SELECT DISTINCT errtype FROM occurrences_full ORDER BY errtype')]
@@ -2287,11 +2596,15 @@ def _write_reports(con, dest_dir, extra_where, params, top):
     ev = 'evidence' if 'evidence' in have else "''"      # older report.db
     tan_col = ("COALESCE(tanach_reading, '')" if 'tanach_reading' in have
                else "''")
+    src = rank_source(con, 'occurrences_full')
+    # the chance-normalised signals go last: readers address columns by name
     cols = ('word, suggestion, {tan}, ROUND({rank}, 2), ctx_hits, '
-            'sugg_local, {ev}, source, ref, unit, snippet').format(
-                rank=RANK_SQL, tan=tan_col, ev=ev)
+            'sugg_local, {ev}, source, ref, unit, snippet, {stats}, '
+            '{rank}').format(rank=rank, tan=tan_col, ev=ev,
+                             stats=', '.join(OPTIONAL_RANK_COLS))
     header = ['word', 'suggestion', 'tanach_reading', 'rank', 'ctx_hits',
-              'sugg_local', 'evidence', 'source', 'ref', 'unit', 'snippet']
+              'sugg_local', 'evidence', 'source', 'ref', 'unit', 'snippet',
+              *OPTIONAL_RANK_COLS, 'prob']
     for t in types:
         variants = [(f'errors_{t}.csv', f'errtype = ?{extra_where}')]
         if t.startswith('edit1'):
@@ -2309,9 +2622,11 @@ def _write_reports(con, dest_dir, extra_where, params, top):
                 wr.writerow(header)
                 n = 0
                 for row in con.execute(f'''
-                        SELECT {cols} FROM occurrences_full WHERE {where}
-                        ORDER BY {RANK_SQL} DESC {limit}''', (t, *params)):
-                    wr.writerow(row)
+                        SELECT {cols} FROM {src} WHERE {where}
+                        ORDER BY {rank} DESC {limit}''', (t, *params)):
+                    p = (round(rankmodel._sigmoid(row[-1]), 4)
+                         if model is not None else '')
+                    wr.writerow((*row[:-1], p))
                     n += 1
             print(f'[report] {n:,} rows -> {path}', flush=True)
     # Tanach review files (Otzaria corpora)
@@ -2380,7 +2695,11 @@ def report(cfg, out_dir, top=0):
         print(f'[report] אזהרה: הדוחות מבוססים על סריקה חלקית — {rows:,} '
               f'שורות מהקלט לא נקראו (אושר במפורש ב-‎--allow-unread‎). '
               f'פרטים: {path}', flush=True)
-    _write_reports(con, out_dir, '', (), top)
+    rank, model = rankmodel.rank_sql(out_dir, RANK_SQL)
+    print('[report] ranking: ' + (
+        f'calibrated model ({RANK_MODEL_F}), rank = log-odds, prob = its '
+        f'probability' if model else 'hand formula (RANK_SQL)'), flush=True)
+    _write_reports(con, out_dir, '', (), top, rank, model)
     # a separate folder per source repository (Sefaria, Dicta, wikisource...)
     try:
         origins = [r[0] for r in con.execute(
@@ -2393,5 +2712,5 @@ def report(cfg, out_dir, top=0):
         d = os.path.join(out_dir, 'by_source', safe)
         os.makedirs(d, exist_ok=True)
         print(f'[report] ===== {org} =====', flush=True)
-        _write_reports(con, d, ' AND origin = ?', (org,), top)
+        _write_reports(con, d, ' AND origin = ?', (org,), top, rank, model)
     con.close()

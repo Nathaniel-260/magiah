@@ -19,7 +19,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .core import RANK_SQL, REPORT_DB_F
+from .core import RANK_SQL, REPORT_DB_F, rank_source
 
 DECISIONS_F = 'decisions.db'
 # columns named: the review UI may have added companion tables/columns
@@ -253,7 +253,8 @@ class _Handler(BaseHTTPRequestHandler):
                     SELECT word, suggestion, ROUND({RANK_SQL},2) AS rank,
                            ctx_hits, sugg_local, errtype, source, ref, unit,
                            snippet
-                    FROM occurrences_full o WHERE {where}
+                    FROM {rank_source(con, 'occurrences_full')} o
+                    WHERE {where}
                     ORDER BY {order_sql} LIMIT 50''', params)
                 cols = ['word', 'suggestion', 'rank', 'ctx_hits', 'sugg_local',
                         'errtype', 'source', 'ref', 'unit', 'snippet']

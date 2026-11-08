@@ -14,6 +14,7 @@ import os
 import sqlite3
 
 from . import tanach
+from .rankstats import ENRICH_STAT_COLS
 from .textsource import OtzariaDB, ReadStats, TextSourceError, iter_file_lines
 
 LEGACY_OTZARIA_DB = r'C:\ProgramData\otzaria\books\seforim.db'
@@ -185,7 +186,8 @@ class SqliteCorpus:
                      o.tanach,
                      b.title AS source, l.heRef AS ref, o.unit, o.snippet,
                      COALESCE(sr.name, 'Unknown') AS origin, o.doc AS doc,
-                     o.evidence AS evidence, {tanach.ENRICH_COLS}
+                     o.evidence AS evidence, {ENRICH_STAT_COLS},
+                     {tanach.ENRICH_COLS}
               FROM occurrences o
               JOIN errors e ON e.word = o.word
               {tanach.ENRICH_JOIN}
@@ -293,6 +295,7 @@ def _default_enrich(con):
                  o.sugg_local, o.book_repeat, o.tanach,
                  o.doc AS source, '' AS ref, o.unit, o.snippet,
                  '' AS origin, o.doc AS doc, o.evidence AS evidence,
+                 {ENRICH_STAT_COLS},
                  {tanach.ENRICH_COLS}
           FROM occurrences o JOIN errors e ON e.word = o.word
           {tanach.ENRICH_JOIN};

@@ -20,7 +20,9 @@ Rank formula
 ------------
 ``RANK_SQL`` below is copied VERBATIM from magiah.core (do not edit here
 without editing there) and is precomputed into the ``rank`` column at import
-time for family='error'. Other families have no corpus-evidence columns, so
+time for family='error' -- or, when ``calibrate`` fitted a ranking model
+(magiah.rankmodel, rank_model.json vouched by calibration_meta.json), that
+model's log-odds instead. Other families have no corpus-evidence columns, so
 their rank is documented per family:
 
 * extra_space  — rank = round(log10(join_freq + 1), 2)  (log-scaled join
@@ -79,15 +81,46 @@ IMPORT_SOURCE_KEY = 'import_source'
 # --- copied VERBATIM from magiah/core.py (keep in sync) --------------------
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
-                  CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                  CASE WHEN ctx_assoc IS NULL THEN
+                         CASE WHEN ctx_hits > 0 THEN 1.5 ELSE -1.0 END
+                       WHEN ctx_hits > 0 THEN
+                         0.5 + 0.5 * MIN(3.0, MAX(0.0, ctx_assoc))
+                       ELSE MAX(-1.0, MIN(0.0, ctx_assoc)) END
                 ELSE 0 END
+              + CASE WHEN rw_lr IS NULL THEN 0
+                     ELSE 0.5 * MAX(-2.0, MIN(3.0, rw_lr)) END
+              + CASE WHEN par_vote IS NULL THEN 0
+                     ELSE 0.75 * MAX(-2.0, MIN(2.0, par_vote)) END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END
+              - CASE WHEN book_repeat = 2 THEN 2.0 ELSE 0 END'''
 
-VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
+VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
+                'COALESCE(ctx_assoc, 1) > 0) OR sugg_local >= 3)')
+
+OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr', 'par_vote')
 # ---------------------------------------------------------------------------
+
+
+def _rank_sql(outdir):
+    """The rank expression: a calibrated model's log-odds when calibrate
+    fitted one (magiah.rankmodel, vouched by calibration_meta.json), else
+    RANK_SQL."""
+    from ..rankmodel import rank_sql
+    return rank_sql(outdir, RANK_SQL)[0]
+
+
+def _rank_source(cur, table, schema=''):
+    """As core.rank_source: `table` with the OPTIONAL_RANK_COLS it lacks (an
+    older report.db) added as NULL, so RANK_SQL reads them as unmeasured;
+    its rowid is kept as ``_rid`` for the source-order numbering."""
+    pre = f'{schema}.' if schema else ''
+    have = {r[1] for r in cur.execute(f'PRAGMA {pre}table_info({table})')}
+    pad = ''.join(f', NULL AS {c}' for c in OPTIONAL_RANK_COLS
+                  if c not in have)
+    return f'(SELECT *, rowid AS _rid{pad} FROM {pre}{table})'
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS findings(
@@ -883,12 +916,14 @@ def import_all(outdir, migrate_legacy=False):
         cur.execute(f'''
             INSERT INTO imp
             SELECT 'error', errtype, word, suggestion, score,
-                   ROUND({RANK_SQL}, 2), ctx_hits, sugg_local, book_repeat,
+                   ROUND({_rank_sql(outdir)}, 2), ctx_hits, sugg_local,
+                   book_repeat,
                    tanach,
                    CASE WHEN {VERIFIED_SQL} THEN 1 ELSE 0 END,
                    origin, source, ref, unit, doc, snippet,
                    CASE WHEN tanach = 2 THEN ? {evid} ELSE NULL END
-            FROM rep.occurrences_full ORDER BY rowid''', (LEGACY_EXTRA,))
+            FROM {_rank_source(cur, 'occurrences_full', 'rep')}
+            ORDER BY _rid''', (LEGACY_EXTRA,))
         counts['error'] = cur.rowcount
 
         # -- family 'extra_space' -------------------------------------------
@@ -1327,11 +1362,12 @@ def import_book_scan(outdir, result):
         # `rank` for non-error families is log-scaled in Python (as in
         # import_all): SQLite's LOG() is a compile-time option and must not be
         # relied on — the frozen build may ship without it.
-        cur.execute('''CREATE TEMP TABLE bimp(
+        cur.execute(f'''CREATE TEMP TABLE bimp(
             family TEXT, errtype TEXT, word TEXT, suggestion TEXT,
             score REAL, ctx_hits INT, sugg_local INT, book_repeat INT,
             tanach INT, origin TEXT, source TEXT, ref TEXT, unit TEXT,
-            snippet TEXT, extra TEXT, flat_rank REAL)''')
+            snippet TEXT, extra TEXT, flat_rank REAL,
+            {', '.join(c + ' REAL' for c in OPTIONAL_RANK_COLS)})''')
         extra_json = json.dumps({'book_scan': True,
                                  'ctx_scope': result.get('ctx_scope')},
                                 ensure_ascii=False)
@@ -1340,7 +1376,8 @@ def import_book_scan(outdir, result):
                      int(r.get('ctx_hits') or 0), int(r.get('sugg_local') or 0),
                      int(r.get('book_repeat') or 0), int(r.get('tanach') or 0),
                      r.get('origin'), r.get('source'), r.get('ref'),
-                     r.get('unit'), r.get('snippet'), extra_json, None)
+                     r.get('unit'), r.get('snippet'), extra_json, None,
+                     *(r.get(c) for c in OPTIONAL_RANK_COLS))
                     for r in (result.get('findings') or [])]
         space_rows = []
         for r in result.get('space_errors') or []:
@@ -1354,9 +1391,11 @@ def import_book_scan(outdir, result):
                 json.dumps({'part1': r.get('part1'), 'part2': r.get('part2'),
                             'joined': r.get('joined'), 'join_freq': jf,
                             'book_scan': True}, ensure_ascii=False),
-                round(math.log10(jf + 1), 2)))
-        cur.executemany('INSERT INTO bimp VALUES(' + ','.join('?' * 16) + ')',
-                        err_rows + space_rows)
+                round(math.log10(jf + 1), 2),
+                *(None for _ in OPTIONAL_RANK_COLS)))
+        cur.executemany('INSERT INTO bimp VALUES(' + ','.join(
+            '?' * (16 + len(OPTIONAL_RANK_COLS))) + ')',
+            err_rows + space_rows)
 
         cols = ('family, errtype, word, suggestion, score, rank, ctx_hits, '
                 'sugg_local, book_repeat, tanach, verified, origin, source, '
@@ -1377,7 +1416,8 @@ def import_book_scan(outdir, result):
         cur.execute(f'''INSERT INTO findings(id, {cols})
             SELECT ? + ROW_NUMBER() OVER (ORDER BY rowid),
                    family, errtype, word, suggestion, score,
-                   CASE WHEN family = 'error' THEN ROUND({RANK_SQL}, 2)
+                   CASE WHEN family = 'error'
+                        THEN ROUND({_rank_sql(outdir)}, 2)
                         ELSE flat_rank END,
                    ctx_hits, sugg_local, book_repeat, tanach,
                    CASE WHEN family = 'error' AND ({VERIFIED_SQL})

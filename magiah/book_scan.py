@@ -44,6 +44,9 @@ book. By default it verifies inside the book only, and says so:
 ``book_repeat`` (all occurrences in one book = the author's own spelling) is
 derived from the lexicon: the word's global count is fully explained by this
 book. The full pipeline asks the same question of its located occurrences.
+``book_repeat = 2`` (a sound-alike letter swap the book makes in many
+different words, :func:`magiah.core.book_spelling_pairs`) is computed from
+the book's own findings in both paths.
 
 The Tanach reference check is an Otzaria full-pipeline feature and is not run
 here (``tanach`` is always 0). Words absent from the lexicon (``freq == 0``)
@@ -55,7 +58,7 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core, realword
+from . import core, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
@@ -262,7 +265,7 @@ def verify_context(spec, cfg, ctx_pairs, book_need, seqs=(), progress=None,
             with open(paths[key], 'wb') as f:
                 pickle.dump(obj, f, protocol=4)
         with core._pool(spec, cfg, paths) as pool:
-            for i, (c, lc, sc, rc, st) in enumerate(
+            for i, (c, lc, sc, rc, _rwc, st) in enumerate(
                     pool.imap_unordered(core._ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
@@ -419,6 +422,11 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         local_counts = Counter({w: present.get(w, 0) for w in need})
 
     n_located = Counter(w for _, _, w, _, _, _ in occ)
+    spell_pairs = core.book_spelling_pairs(
+        ((book.doc, w, errors[w][1], errors[w][2])
+         for _, _, w, _, _, _ in occ),
+        cfg.book_spelling_min, {book.doc: prof} if prof else None
+    ).get(book.doc, ())
     base = {'tanach': 0, 'origin': book.origin, 'source': book.title,
             'doc': book.doc}
     rows = []
@@ -429,11 +437,19 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             hits = (ctx_counts.get((prev, sugg), 0)
                     + ctx_counts.get((sugg, nxt), 0))
         local = local_counts.get(sugg, 0) if errtype in LOCAL_TYPES else 0
+        # measured against chance only corpus-wide, as the full pipeline
+        # does; a book's own pair counts have no corpus expectation
+        cexp, cassoc = (rankstats.ctx_stats(freq, lex.N, prev, sugg, nxt,
+                                            hits)
+                        if scope == 'corpus' and core.uses_context(errtype)
+                        else (None, None))
         rows.append({
+            'ctx_exp': cexp, 'ctx_assoc': cassoc,
             **base, 'word': w, 'errtype': errtype, 'suggestion': sugg,
             'score': score, 'ctx_hits': hits, 'sugg_local': local,
-            'book_repeat': core.book_repeat_flag(
-                errtype, n_located[w], freq.get(w, 0) <= present.get(w, 0)),
+            'book_repeat': core.book_repeat_value(
+                errtype, w, sugg, n_located[w],
+                freq.get(w, 0) <= present.get(w, 0), spell_pairs),
             'evidence': core.evidence_kind(errtype, sugg, fs, hits, local, 0,
                                            ctx_scope=scope,
                                            split_scope=scope),
