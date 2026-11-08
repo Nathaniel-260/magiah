@@ -28,6 +28,7 @@ from multiprocessing import Pool
 from .config import Config
 from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
+from . import rankstats
 from .rankstats import OCC_STAT_COLS, ctx_stats
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
@@ -1966,17 +1967,24 @@ def _ctx_count_chunk(chunk):
     * seq (book scan only): spaced occurrences of split candidates.
     * rw (book scan with ``Config.real_word`` only): the bigrams and trigrams
       the real-word check needs, counted outside the scanned book itself.
-      Returned as ``(bigram counts, trigram counts)``, or None."""
+      Returned as ``(bigram counts, trigram counts)``, or None.
+    * rwc (corpus scan with ``Config.rw_corpus`` only): the n-grams of
+      :func:`magiah.rankstats.rw_needs`, as ``(per-book counts of the
+      original's, trigram counts of the correction's)``, or None."""
     _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
     seq = _W.get('seq')
     rw = _W.get('rw')
+    rwc = _W.get('rwc')
     counts, local, seq_counts = Counter(), Counter(), {}
-    rw_counts = None
+    rw_counts = rwc_counts = None
     if rw is not None:
         from .realword import count_ngrams
         rw_counts = (Counter(), Counter())
+    if rwc is not None:
+        from .rankstats import count_rw
+        rwc_counts = (Counter(), Counter())
     for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
         need = book_need.get(doc)
@@ -1990,7 +1998,10 @@ def _ctx_count_chunk(chunk):
         if rw is not None and doc != rw['skip_doc']:
             count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
                          rw['first3'], *rw_counts)
-    return counts, local, seq_counts, rw_counts, _chunk_stats_end()
+        if rwc is not None:
+            count_rw(toks, doc, rwc, *rwc_counts)
+    return (counts, local, seq_counts, rw_counts, rwc_counts,
+            _chunk_stats_end())
 
 
 # the columns of report.db's `occurrences`, in insert order; after
@@ -2111,7 +2122,14 @@ def locate(spec, cfg, out_dir):
         if fr[1] in LOCAL_TYPES and fr[2]:
             book_need.setdefault(doc, set()).add(fr[2])
     print(f'[locate] context pairs to verify: {len(ctx_pairs):,}', flush=True)
+    # Config.rw_corpus: the n-grams the real-word comparison needs
+    rwc = None
+    if cfg.rw_corpus:
+        rwc = rankstats.rw_needs(all_occ, flagged, uses_context)
+        print(f'[locate] real-word n-grams to count: '
+              f'{len(rwc["own"]) + len(rwc["sugg3"]):,}', flush=True)
     ctx_counts, local_counts = Counter(), Counter()
+    rw_own, rw_sugg3 = Counter(), Counter()
     if ctx_pairs or book_need:
         ctx_path = os.path.join(out_dir, 'ctx_pairs.pkl')
         with open(ctx_path, 'wb') as f:
@@ -2119,13 +2137,20 @@ def locate(spec, cfg, out_dir):
         need_path = os.path.join(out_dir, 'book_need.pkl')
         with open(need_path, 'wb') as f:
             pickle.dump(book_need, f, protocol=4)
+        cloads = {'ctx_pairs': ctx_path, 'book_need': need_path}
+        if rwc is not None:
+            cloads['rwc'] = os.path.join(out_dir, 'rw_corpus.pkl')
+            with open(cloads['rwc'], 'wb') as f:
+                pickle.dump(rwc, f, protocol=4)
         cstats = passes['context'] = ReadStats()
-        with _pool(spec, cfg, {'ctx_pairs': ctx_path,
-                               'book_need': need_path}) as pool:
-            for i, (c, lc, _sc, _rw, st) in enumerate(
+        with _pool(spec, cfg, cloads) as pool:
+            for i, (c, lc, _sc, _rw, rwcc, st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
+                if rwcc is not None:
+                    rw_own.update(rwcc[0])
+                    rw_sugg3.update(rwcc[1])
                 cstats.add(ReadStats.from_dict(st))
                 if i % 6 == 0:
                     print(f'  [context] chunk {i}/{len(chunks)} '
@@ -2142,7 +2167,14 @@ def locate(spec, cfg, out_dir):
         for a, b in ctx_pairs:
             ctx_freq[a] = lexicon.get(a, 0)
             ctx_freq[b] = lexicon.get(b, 0)
+        for w in (rwc['words'] if rwc else ()):
+            ctx_freq[w] = lexicon.get(w, 0)
         del lexicon
+    rw_tot = rankstats.own_totals(rw_own) if rwc else {}
+    # occurrences of each word in its own book: left out of its frequency
+    # as its n-grams are left out of their counts
+    w_in_doc = Counter((w, doc) for w, _, doc, _, _, _ in all_occ) \
+        if rwc else {}
 
     # --- write the report database ---------------------------------------
     # built under a temp name and moved into place only once complete, so a
@@ -2182,18 +2214,24 @@ def locate(spec, cfg, out_dir):
         rows = []
         for j, (w, uid, doc, prev, nxt, snip) in enumerate(all_occ):
             fr = flagged[w]
-            hits, cstat = 0, (None, None)
+            hits, cstat, lr = 0, (None, None), None
             if uses_context(fr[1]):
                 sugg = fr[2]
                 hits = (ctx_counts.get((prev, sugg), 0)
                         + ctx_counts.get((sugg, nxt), 0))
                 cstat = ctx_stats(ctx_freq, ctx_N, prev, sugg, nxt, hits)
+                if rwc and sugg and (prev or nxt):
+                    lr = rankstats.rw_lr(
+                        ctx_freq, ctx_N,
+                        rankstats.OccCounts(ctx_counts, rw_sugg3, rw_tot,
+                                            rw_own, doc),
+                        prev, w, sugg, nxt, w_in_doc[(w, doc)])
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
             rows.append((w, uid, doc, hits, local,
                          1 if w in repeat_words else 0, tan, tsugg, snip,
-                         ev, None, None, *cstat))
+                         ev, None, None, *cstat, lr))
         con.executemany(_OCC_INSERT, rows)
         # OCR-profile findings: word-level entry + occurrence rows carrying their
         # own book's suggestion (the word-level one is only the first seen)
@@ -2281,6 +2319,10 @@ def locate(spec, cfg, out_dir):
 # hits where chance expected next to none cost (almost) nothing. A row
 # without ctx_assoc (an older report.db, a book-scope scan) keeps the flat
 # +1.5 / -1.0.
+#
+# rw_lr (Config.rw_corpus; magiah.rankstats.rw_lr): how far the bigram/
+# trigram context shifts the odds toward the correction, log10, half of it
+# within [-1.0, +1.5]. NULL (not measured) adds nothing.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
                   CASE WHEN ctx_assoc IS NULL THEN
@@ -2289,6 +2331,8 @@ RANK_SQL = '''score
                          0.5 + 0.5 * MIN(3.0, MAX(0.0, ctx_assoc))
                        ELSE MAX(-1.0, MIN(0.0, ctx_assoc)) END
                 ELSE 0 END
+              + CASE WHEN rw_lr IS NULL THEN 0
+                     ELSE 0.5 * MAX(-2.0, MIN(3.0, rw_lr)) END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
@@ -2303,7 +2347,7 @@ VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
 
 # columns RANK_SQL / VERIFIED_SQL read that a table may lack (an older
 # report.db, a hand-made one): read as NULL, i.e. "not measured"
-OPTIONAL_RANK_COLS = ('ctx_assoc',)
+OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr')
 
 
 def rank_source(con, table, schema=''):
@@ -2338,6 +2382,8 @@ def _ctx_term(r):
 
 RANK_TERMS = {
     'ctx': _ctx_term,
+    'rw': lambda r: (0.0 if r.get('rw_lr') is None
+                     else 0.5 * max(-2.0, min(3.0, r['rw_lr']))),
     'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
                              0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
     'book_repeat': lambda r: -3.0 if _num(r, 'book_repeat') == 1 else 0.0,

@@ -41,6 +41,10 @@ class RankMirror(unittest.TestCase):
              book_repeat=0, tanach=0, ctx_assoc=-0.01),
         dict(score=2.0, errtype='edit1_ins', ctx_hits=0, sugg_local=0,
              book_repeat=0, tanach=0, ctx_assoc=-1.6),
+        dict(score=2.0, errtype='edit1_sub', ctx_hits=1, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=0.4, rw_lr=2.2),
+        dict(score=2.0, errtype='spelling_variant', ctx_hits=0,
+             sugg_local=0, book_repeat=0, tanach=0, rw_lr=-5.0),
     ]
 
     def _sql(self, case):
@@ -141,6 +145,86 @@ class ContextAgainstChance(unittest.TestCase):
         self.assertEqual(self._sql(core.VERIFIED_SQL, book_repeat=0,
                                    sugg_local=3, ctx_hits=1,
                                    ctx_assoc=-0.3), 1)
+
+
+class RealWordInCorpusScan(unittest.TestCase):
+    """(2) the real-word model weighs original vs correction in context."""
+
+    FREQ = {'ראה': 300, 'ספר': 500, 'ספד': 2, 'גדול': 400, 'הלך': 300}
+    N = 100_000
+
+    def _counts(self, pairs=None, tri=None, own=None, doc='a'):
+        from magiah import rankstats as rs
+        own = own or {}
+        return rs.OccCounts(pairs or {}, tri or {}, rs.own_totals(own), own,
+                            doc)
+
+    def test_context_seen_with_the_correction_favours_it(self):
+        from magiah import rankstats as rs
+        c = self._counts(pairs={('ראה', 'ספר'): 40, ('ספר', 'גדול'): 30},
+                         tri={('ראה', 'ספר', 'גדול'): 20})
+        lr = rs.rw_lr(self.FREQ, self.N, c, 'ראה', 'ספד', 'ספר', 'גדול')
+        self.assertGreater(lr, 1.0)
+
+    def test_context_never_seen_with_the_correction_disfavours_it(self):
+        from magiah import rankstats as rs
+        c = self._counts(own={(('ראה', 'ספד'), 'b'): 1,
+                              (('ספד', 'גדול'), 'b'): 1,
+                              (('ראה', 'ספד', 'גדול'), 'b'): 1})
+        lr = rs.rw_lr(self.FREQ, self.N, c, 'ראה', 'ספד', 'ספר', 'גדול')
+        self.assertLess(lr, 0)
+
+    def test_the_originals_own_book_does_not_vouch_for_it(self):
+        from magiah import rankstats as rs
+        g = ('ראה', 'ספד', 'גדול')
+        own = {(g, 'a'): 2, ((g[0], g[1]), 'a'): 2, ((g[1], g[2]), 'a'): 2}
+        c = self._counts(own=own, doc='a')
+        self.assertEqual((c.bi('ראה', 'ספד'), c.tri(*g)), (0, 0))
+        other = self._counts(own=own, doc='b')
+        self.assertEqual(other.tri(*g), 2)
+
+    def test_count_rw_counts_per_book_from_the_middle_word(self):
+        from collections import Counter
+        from magiah import rankstats as rs
+        flagged = {'ספד': (2, 'edit1_sub', 'ספר', 500, 2.0)}
+        need = rs.rw_needs([('ספד', 'u', 'a', 'ראה', 'גדול', 's')], flagged,
+                           core.uses_context)
+        own, s3 = Counter(), Counter()
+        rs.count_rw(['ראה', 'ספד', 'גדול'], 'a', need, own, s3)
+        rs.count_rw(['ראה', 'ספר', 'גדול', 'ראה', 'ספר', 'גדול'], 'b',
+                    need, own, s3)
+        self.assertEqual(own[(('ראה', 'ספד', 'גדול'), 'a')], 1)
+        self.assertEqual(own[(('ראה', 'ספד'), 'a')], 1)
+        self.assertEqual(s3[('ראה', 'ספר', 'גדול')], 2)
+
+    def test_pipeline_flag_is_rank_only(self):
+        import test_detection as td
+        tmp = tempfile.mkdtemp(prefix='magiah_rw_')
+        try:
+            lib = os.path.join(tmp, 'lib')
+            td.write_lib(lib, {td.BOOK_A: td.A_LINES, td.BOOK_D: td.D_LINES,
+                               f'{td.LIB_TOP}/b.txt': td.B_LINES})
+            spec = {'type': 'library', 'path': lib}
+            rows = {}
+            for flag in (0, 1):
+                out = os.path.join(tmp, f'out{flag}')
+                os.makedirs(out)
+                td.run_full(spec, td.small_cfg(rw_corpus=flag), out)
+                rows[flag] = sorted(td.report_rows(out),
+                                    key=lambda r: (r['word'], r['unit']))
+            self.assertTrue(rows[0])
+            keep = [k for k in rows[0][0] if k != 'rw_lr']
+            self.assertEqual([[r[k] for k in keep] for r in rows[0]],
+                             [[r[k] for k in keep] for r in rows[1]])
+            self.assertTrue(all(r['rw_lr'] is None for r in rows[0]))
+            measured = [r for r in rows[1] if r['rw_lr'] is not None]
+            self.assertTrue(measured)
+            self.assertTrue(all(core.uses_context(r['errtype'])
+                                for r in measured))
+            # the slip ספד in "ראה ספד גדול": the corpus reads ספר there
+            self.assertTrue(any(r['rw_lr'] > 0 for r in measured))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class Diagnostics(unittest.TestCase):

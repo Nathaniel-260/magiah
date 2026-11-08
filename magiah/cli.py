@@ -17,6 +17,12 @@ RUN_CONFIG = 'run_config.json'
 PIPELINE = {'all': ('lexicon', 'detect', 'locate', 'report')}
 
 
+# integer Config fields settable from the command line (remembered in
+# run_config.json like every setting)
+TUNABLE = ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
+           'workers', 'n_chunks', 'rw_corpus')
+
+
 def _build_spec(args):
     library = getattr(args, 'library', None)
     if library:
@@ -217,8 +223,7 @@ def main(argv=None):
                          'stage. Applies to this run only — never remembered '
                          'in run_config.json.')
     tune = ap.add_argument_group('thresholds')
-    for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
-              'workers', 'n_chunks'):
+    for f in TUNABLE:
         tune.add_argument(f'--{f.replace("_", "-")}', type=int, default=None)
     args = ap.parse_args(argv)
 
@@ -236,8 +241,7 @@ def main(argv=None):
         ap.error('no corpus source: use --otzaria, --sqlite or --textdir')
     cfg = Config.from_run_config(prev['config']) if prev else Config()
     cfg.allow_unread = args.allow_unread
-    for f in ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
-              'workers', 'n_chunks'):
+    for f in TUNABLE:
         v = getattr(args, f)
         if v is not None:
             setattr(cfg, f, v)

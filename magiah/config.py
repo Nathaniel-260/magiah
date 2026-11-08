@@ -45,6 +45,12 @@ class Config:
     real_word_rep: int = 3   # ... a word the book uses this often (>= 1),
                              # and more often than the suggestion, is its
                              # own spelling
+    rw_corpus: int = 0       # corpus scan (1 = on): weigh each edit-1 /
+                             # spelling-variant correction against the
+                             # original between the same neighbours
+                             # (realword.posterior; column rw_lr). Rank
+                             # only; the context pass counts more n-grams
+                             # (roughly 20-40% longer)
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
