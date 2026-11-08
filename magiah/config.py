@@ -42,6 +42,16 @@ class Config:
                              # book_repeat = 2 and rank lower (never removed).
                              # A pair the book's reviewed OCR profile lists
                              # stays an error. 0 (or less): off
+    loanword: int = 0        # 1 = on: a long word with a Greek/Latin-like
+                             # ending (core.LOANWORD_ENDINGS) whose best
+                             # correction
+                             # swaps ג/ק, ט/ת, ו/י or ס/צ is likely a
+                             # transliteration variant (אונגלוס / אונקלוס):
+                             # its score drops by loanword_penalty. Rank only
+                             # — the finding and its suggestion stay. Off by
+                             # default until measured on a full corpus
+    loanword_min_len: int = 6
+    loanword_penalty: float = 1.5
     ocr_rare_max: int = 5    # profiled books: scan words up to this frequency
     ocr_ratio: int = 20      # ... requiring correction/word frequency ratio
     real_word: int = 0       # book scan (1 = on): also judge common words by

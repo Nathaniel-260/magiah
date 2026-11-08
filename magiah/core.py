@@ -989,6 +989,29 @@ def _frequency_penalty(fw, cfg):
     return math.log10(fw / rm) if fw > rm else 0.0
 
 
+# Letter swaps typical of transliterating Greek/Latin (גמ"ל/קו"ף for gamma/
+# kappa, טי"ת/תי"ו for theta/tau, ו/י for the vowels, ס/צ for sigma)
+LOANWORD_PAIRS = frozenset(
+    p for a, b in (('ג', 'ק'), ('ט', 'ת'), ('ו', 'י'), ('ס', 'צ'))
+    for p in ((a, b), (b, a)))
+# endings of transliterated Greek/Latin words (-os/-us, -ion, -ike). Not
+# -in (טופסין): in the v0.6 scan results ~75% of the long -ין words with
+# these swaps were Hebrew/Aramaic plurals (שימעין/שומעין), i.e. real findings
+LOANWORD_ENDINGS = ('וס', 'יון', 'קי')
+
+
+def loanword_penalty(w, kind, ch_a, ch_b, cfg):
+    """Score demotion of an edit-1 correction that looks like a variant
+    transliteration of a Greek/Latin loanword (cfg.loanword), else 0. Only
+    lowers the rank: the correction is still chosen and reported."""
+    if (not cfg.loanword or kind != 'sub'
+            or (ch_a, ch_b) not in LOANWORD_PAIRS
+            or len(w) < cfg.loanword_min_len
+            or not w.endswith(LOANWORD_ENDINGS)):
+        return 0.0
+    return max(0.0, cfg.loanword_penalty)
+
+
 def evaluate_word(w, fw, lex, edit1_cands):
     """Every per-word rule for one word type.
 
@@ -1091,7 +1114,11 @@ def evaluate_word(w, fw, lex, edit1_cands):
             score += 1
         if score > best_score:
             best_c, best_score, best_kind, best_ch = c, score, kind, ch_a
+            best_sub = ch_b
     if best_c:
+        # chosen on the full score, then demoted: a loanword variant keeps
+        # its finding and suggestion, only ranks lower
+        best_score -= loanword_penalty(w, best_kind, best_ch, best_sub, cfg)
         # extra/missing ו or י is ktiv male/chaser variation: own class
         if best_kind in ('ins', 'del') and best_ch in 'וי':
             errtype = 'spelling_variant'
