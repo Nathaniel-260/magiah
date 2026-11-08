@@ -180,7 +180,6 @@ class RealWordInCorpusScan(unittest.TestCase):
         self.assertLess(lr, 0)
 
     def test_the_originals_own_book_does_not_vouch_for_it(self):
-        from magiah import rankstats as rs
         g = ('ראה', 'ספד', 'גדול')
         own = {(g, 'a'): 2, ((g[0], g[1]), 'a'): 2, ((g[1], g[2]), 'a'): 2}
         c = self._counts(own=own, doc='a')
