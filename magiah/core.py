@@ -1290,6 +1290,68 @@ def book_repeat_flag(errtype, n_located, only_this_book):
                  and only_this_book) else 0
 
 
+# Letter pairs that sound alike in some traditional pronunciations but do not
+# look alike, so a book swapping them is spelling, not OCR (אגמת / עגמת).
+# Visually confusable pairs (ד/ר, ה/ח, ו/י ... see CONFUSABLE) are never
+# here: a book that confuses those many times has an OCR fault, which is
+# what the per-book OCR profiles are for.
+PHONETIC_PAIRS = frozenset(
+    p for a, b in (('א', 'ע'), ('ס', 'ש'), ('כ', 'ק'), ('ך', 'ק'),
+                   ('ט', 'ת'))
+    for p in ((a, b), (b, a)))
+assert not PHONETIC_PAIRS & CONFUSABLE
+
+# book_repeat value of a finding whose letter swap is its book's convention
+# (1 stays "all occurrences of this word sit in one book")
+BOOK_SPELLING = 2
+
+
+def phonetic_pair(errtype, w, sugg):
+    """``'ab'`` (letter in the word, letter in the suggestion) when the
+    finding is a single substitution of a :data:`PHONETIC_PAIRS` pair."""
+    if errtype != 'edit1_sub' or not sugg:
+        return None
+    r = _dld1(w, sugg)
+    if r and r[0] == 'sub' and (r[1], r[2]) in PHONETIC_PAIRS:
+        return r[1] + r[2]
+    return None
+
+
+def book_spelling_pairs(items, min_words, profiles=None):
+    """``{doc: {pair}}``: phonetic letter swaps each book makes in at least
+    `min_words` DIFFERENT flagged words — the book's own spelling.
+
+    `items` are ``(doc, word, errtype, suggestion)`` (repeats are fine).
+    Directional: a book writing א for ע does not excuse ע for א. A pair the
+    book's OCR profile lists (`profiles`, learned from reviewed findings) is
+    a confirmed error there and never becomes a convention. A word swapping
+    a pair its book does NOT swap systematically is still an ordinary
+    finding (ישראל with ס in a book that otherwise writes ש).
+    """
+    if min_words <= 0:
+        return {}
+    profiles = profiles or {}
+    words = {}
+    for doc, w, errtype, sugg in items:
+        p = phonetic_pair(errtype, w, sugg)
+        if p and p not in (profiles.get(doc) or ()):
+            words.setdefault((doc, p), set()).add(w)
+    out = {}
+    for (doc, p), ws in words.items():
+        if len(ws) >= min_words:
+            out.setdefault(doc, set()).add(p)
+    return out
+
+
+def book_repeat_value(errtype, w, sugg, n_located, only_this_book, pairs):
+    """The ``book_repeat`` column: 1 (the word lives in one book), 2 (its
+    letter swap is the book's spelling, `pairs` from
+    :func:`book_spelling_pairs` for this doc) or 0."""
+    if book_repeat_flag(errtype, n_located, only_this_book):
+        return 1
+    return BOOK_SPELLING if phonetic_pair(errtype, w, sugg) in pairs else 0
+
+
 # ---------------------------------------------------------------------------
 # calibration provenance: learned weights are used only when they say where
 # they came from
@@ -2085,6 +2147,17 @@ def locate(spec, cfg, out_dir):
                     if book_repeat_flag(flagged[w][1], n, len(w_docs[w]) == 1)}
     print(f'[locate] same-book-repeat words suppressed: {len(repeat_words):,}',
           flush=True)
+    # a sound-alike letter swap that one book makes in many different words
+    # is that book's spelling (book_repeat = 2); a pair its reviewed OCR
+    # profile lists stays an error
+    spell_pairs = book_spelling_pairs(
+        ((doc, w, flagged[w][1], flagged[w][2])
+         for w, _, doc, _, _, _ in all_occ),
+        cfg.book_spelling_min, load_ocr_profiles(out_dir)[0])
+    print(f'[locate] books with a phonetic spelling convention: '
+          f'{len(spell_pairs):,} '
+          f'({sum(len(v) for v in spell_pairs.values()):,} letter pairs)',
+          flush=True)
 
     # context verification for edit-distance-1 suggestions (does the corrected
     # word occur next to the same neighbors elsewhere?) + book-local counts
@@ -2167,8 +2240,10 @@ def locate(spec, cfg, out_dir):
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
-            rows.append((w, uid, doc, hits, local,
-                         1 if w in repeat_words else 0, tan, tsugg, snip,
+            rep = book_repeat_value(fr[1], w, fr[2], w_count[w],
+                                    len(w_docs[w]) == 1,
+                                    spell_pairs.get(doc, ()))
+            rows.append((w, uid, doc, hits, local, rep, tan, tsugg, snip,
                          ev, None, None))
         con.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                         rows)
@@ -2247,7 +2322,9 @@ def locate(spec, cfg, out_dir):
 # * ctx_hits    — the correction was seen next to the same neighbors (edit1)
 # * sugg_local  — the correction is used inside the very same book
 # * book_repeat — all occurrences of the word sit in one book (idiosyncratic
-#                 spelling, not a typo) — strong demotion
+#                 spelling, not a typo) — strong demotion; book_repeat = 2:
+#                 the word's sound-alike letter swap is its book's spelling
+#                 convention (book_spelling_pairs) — a milder demotion
 # plus the Tanach signal: tanach = 3 (an aligned verse whose reading, backed
 # by >= 2 independent sources, differs from the word AND equals the detector's
 # suggestion). tanach = 4 (the verse reads otherwise than the detector) and
@@ -2259,7 +2336,8 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END
+              - CASE WHEN book_repeat = 2 THEN 2.0 ELSE 0 END'''
 
 # a finding is "verified" when the context or the book itself supports the
 # proposed correction and the word is not an in-book spelling convention.

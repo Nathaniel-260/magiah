@@ -84,7 +84,8 @@ RANK_SQL = '''score
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
-              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END'''
+              + CASE WHEN tanach = 3 THEN 4.0 ELSE 0 END
+              - CASE WHEN book_repeat = 2 THEN 2.0 ELSE 0 END'''
 
 VERIFIED_SQL = 'book_repeat = 0 AND (ctx_hits > 0 OR sugg_local >= 3)'
 # ---------------------------------------------------------------------------
