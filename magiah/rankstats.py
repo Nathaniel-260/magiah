@@ -21,11 +21,18 @@ imports, can name the columns too.
   neighbours, bigrams and trigrams (:func:`rw_lr`). The original's n-grams
   are counted outside its own book: an error copied within a book would
   otherwise vouch for itself.
+* ``par_sugg`` / ``par_word`` / ``par_vote`` (``Config.par_corpus``) --
+  parallel passages: the occurrence's window of up to two words on each
+  side (:func:`par_window`) is looked up in the corpus with the correction
+  in the middle (``par_sugg``: evidence of an error) and with the original
+  word in another book (``par_word``: evidence the text is right), and
+  ``par_vote`` is the smoothed log10 ratio of the two (:func:`par_vote`).
 """
 import math
 
 # columns of report.db's `occurrences` after occ_score, in insert order
-OCC_STAT_COLS = ('ctx_exp', 'ctx_assoc', 'rw_lr')
+OCC_STAT_COLS = ('ctx_exp', 'ctx_assoc', 'rw_lr', 'par_sugg', 'par_word',
+                 'par_vote')
 # ... as carried into occurrences_full by every corpus adapter's enrich
 ENRICH_STAT_COLS = ', '.join('o.' + c for c in OCC_STAT_COLS)
 
@@ -158,3 +165,93 @@ def rw_lr(freq, N, counts, prev, w, sugg, nxt, own_w=0):
     _, ctx = posterior(lex, counts, prev, w, nxt, [sugg], own)
     _, uni = posterior(lex, counts, '', w, '', [sugg], own)
     return round(((ctx[1] - ctx[0]) - (uni[1] - uni[0])) / math.log(10), 4)
+
+
+# ---------------------------------------------------------------------------
+# (3) parallel passages: the same five-word window elsewhere in the corpus
+# ---------------------------------------------------------------------------
+
+PAR_SHAPES = ((2, 2), (2, 1), (1, 2))   # words left / right of the centre
+SNIPPET_PAD = 45      # characters each side of a word in its snippet
+
+
+def par_window(w, prev, nxt, snippet):
+    """``(left, right)`` -- up to two words on each side of `w`, at least
+    three in all -- read from the occurrence's snippet, or None.
+
+    The snippet is a character slice of the line, ``SNIPPET_PAD``
+    characters each side of the word (magiah.core._snippet): where that
+    many characters stand beside the word the slice may have cut into the
+    edge token, which is then not used; fewer means the line (or a space)
+    ended there. A snippet where the word stands twice between the same
+    neighbours with different outer words is ambiguous."""
+    if not prev or not nxt or not snippet:
+        return None
+    from .normalize import TOKEN_RE
+    toks = list(TOKEN_RE.finditer(snippet))
+    q = [m.group() for m in toks]
+    n = len(q)
+    found = set()
+    for i in range(1, n - 1):
+        if q[i] == w and q[i - 1] == prev and q[i + 1] == nxt:
+            whole_l = i - 2 >= 1 or toks[i].start() < SNIPPET_PAD
+            whole_r = (i + 2 <= n - 2
+                       or len(snippet) - toks[i].end() < SNIPPET_PAD)
+            left = (q[i - 2], prev) if i >= 2 and whole_l else (prev,)
+            right = (nxt, q[i + 2]) if i + 2 < n and whole_r else (nxt,)
+            found.add((left, right))
+    if len(found) != 1:
+        return None
+    left, right = found.pop()
+    if len(left) + len(right) < 3:
+        return None
+    return left, right
+
+
+def par_needs(windows):
+    """The windows :func:`count_par` counts, from ``{(left, right): ...}``
+    pairs of (original, correction): a dict with ``word`` (the original's
+    windows, counted per book), ``sugg`` (the correction's, counted in
+    total) and their centre words."""
+    word, sugg, wc, sc = set(), set(), set(), set()
+    for (left, right), (w, s) in windows:
+        word.add(left + (w,) + right)
+        sugg.add(left + (s,) + right)
+        wc.add(w)
+        sc.add(s)
+    return {'word': word, 'sugg': sugg, 'words': wc, 'suggs': sc}
+
+
+def count_par(toks, doc, par, word_counts, sugg_counts):
+    """Count one token list's windows of :func:`par_needs`, looked up from
+    their centre word."""
+    words, suggs = par['words'], par['suggs']
+    n = len(toks)
+    for i, t in enumerate(toks):
+        is_w, is_s = t in words, t in suggs
+        if not (is_w or is_s):
+            continue
+        for lw, rw in PAR_SHAPES:
+            if i - lw < 0 or i + rw >= n:
+                continue
+            g = tuple(toks[i - lw:i + rw + 1])
+            if is_w and g in par['word']:
+                word_counts[(g, doc)] += 1
+            if is_s and g in par['sugg']:
+                sugg_counts[g] += 1
+
+
+def par_counts(win, w, sugg, doc, sugg_counts, word_total, word_counts):
+    """``(par_sugg, par_word)`` of one occurrence: its window with the
+    correction, anywhere; with the original, outside its own book."""
+    left, right = win
+    g = left + (w,) + right
+    return (sugg_counts.get(left + (sugg,) + right, 0),
+            word_total.get(g, 0) - word_counts.get((g, doc), 0))
+
+
+def par_vote(par_sugg, par_word):
+    """log10 of the window seen with the correction against seen with the
+    original (elsewhere), smoothed: positive -- parallel passages read the
+    correction; negative -- they read the original."""
+    return round(math.log10((par_sugg + 0.5) / (par_word + 0.5)), 4)

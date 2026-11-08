@@ -45,6 +45,11 @@ class RankMirror(unittest.TestCase):
              book_repeat=0, tanach=0, ctx_assoc=0.4, rw_lr=2.2),
         dict(score=2.0, errtype='spelling_variant', ctx_hits=0,
              sugg_local=0, book_repeat=0, tanach=0, rw_lr=-5.0),
+        dict(score=2.0, errtype='edit1_sub', ctx_hits=2, sugg_local=0,
+             book_repeat=0, tanach=0, ctx_assoc=1.0, rw_lr=0.3,
+             par_vote=1.3),
+        dict(score=2.0, errtype='edit1_del', ctx_hits=0, sugg_local=0,
+             book_repeat=0, tanach=0, par_vote=-3.0),
     ]
 
     def _sql(self, case):
@@ -198,33 +203,96 @@ class RealWordInCorpusScan(unittest.TestCase):
         self.assertEqual(s3[('ראה', 'ספר', 'גדול')], 2)
 
     def test_pipeline_flag_is_rank_only(self):
-        import test_detection as td
-        tmp = tempfile.mkdtemp(prefix='magiah_rw_')
-        try:
-            lib = os.path.join(tmp, 'lib')
-            td.write_lib(lib, {td.BOOK_A: td.A_LINES, td.BOOK_D: td.D_LINES,
-                               f'{td.LIB_TOP}/b.txt': td.B_LINES})
-            spec = {'type': 'library', 'path': lib}
-            rows = {}
-            for flag in (0, 1):
-                out = os.path.join(tmp, f'out{flag}')
-                os.makedirs(out)
-                td.run_full(spec, td.small_cfg(rw_corpus=flag), out)
-                rows[flag] = sorted(td.report_rows(out),
-                                    key=lambda r: (r['word'], r['unit']))
-            self.assertTrue(rows[0])
-            keep = [k for k in rows[0][0] if k != 'rw_lr']
-            self.assertEqual([[r[k] for k in keep] for r in rows[0]],
-                             [[r[k] for k in keep] for r in rows[1]])
-            self.assertTrue(all(r['rw_lr'] is None for r in rows[0]))
-            measured = [r for r in rows[1] if r['rw_lr'] is not None]
-            self.assertTrue(measured)
-            self.assertTrue(all(core.uses_context(r['errtype'])
-                                for r in measured))
-            # the slip ספד in "ראה ספד גדול": the corpus reads ספר there
-            self.assertTrue(any(r['rw_lr'] > 0 for r in measured))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        measured = flag_is_rank_only(self, 'rw_corpus', ('rw_lr',))
+        # the slip ספד in "ראה ספד גדול": the corpus reads ספר there
+        self.assertTrue(any(r['rw_lr'] > 0 for r in measured))
+
+
+def flag_is_rank_only(case, flag, cols):
+    """Run the detection fixture's library with `flag` off and on: only
+    `cols` may differ, they are NULL when off and measured (for context
+    types only) when on. Returns the measured rows."""
+    import test_detection as td
+    tmp = tempfile.mkdtemp(prefix='magiah_flag_')
+    try:
+        lib = os.path.join(tmp, 'lib')
+        td.write_lib(lib, {td.BOOK_A: td.A_LINES, td.BOOK_D: td.D_LINES,
+                           f'{td.LIB_TOP}/b.txt': td.B_LINES})
+        spec = {'type': 'library', 'path': lib}
+        rows = {}
+        for on in (0, 1):
+            out = os.path.join(tmp, f'out{on}')
+            os.makedirs(out)
+            td.run_full(spec, td.small_cfg(**{flag: on}), out)
+            rows[on] = sorted(td.report_rows(out),
+                              key=lambda r: (r['word'], r['unit']))
+        case.assertTrue(rows[0])
+        keep = [k for k in rows[0][0] if k not in cols]
+        case.assertEqual([[r[k] for k in keep] for r in rows[0]],
+                         [[r[k] for k in keep] for r in rows[1]])
+        case.assertTrue(all(r[c] is None for r in rows[0] for c in cols))
+        measured = [r for r in rows[1] if r[cols[0]] is not None]
+        case.assertTrue(measured)
+        case.assertTrue(all(core.uses_context(r['errtype'])
+                            for r in measured))
+        return measured
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ParallelPassages(unittest.TestCase):
+    """(3) the occurrence's window voted on by its parallel passages."""
+
+    def test_window_from_a_whole_line_snippet(self):
+        from magiah import rankstats as rs
+        self.assertEqual(rs.par_window('ספד', 'ראה', 'גדול',
+                                       'הילד ראה ספד גדול'),
+                         (('הילד', 'ראה'), ('גדול',)))
+        # one word each side only: too little context
+        self.assertIsNone(rs.par_window('ספד', 'ראה', 'גדול',
+                                        'ראה ספד גדול'))
+
+    def test_cut_edge_token_is_not_used(self):
+        from magiah import rankstats as rs
+        # a full pad of characters left of the word: the slice may have
+        # cut into the edge token, which is then left out
+        cut = 'ב' * (rs.SNIPPET_PAD - 4) + ' ראה ספד גדול טוב'
+        self.assertEqual(rs.par_window('ספד', 'ראה', 'גדול', cut),
+                         (('ראה',), ('גדול', 'טוב')))
+        # fewer: the line starts there, the edge token is whole
+        whole = 'ב' * 10 + ' ראה ספד גדול טוב'
+        self.assertEqual(rs.par_window('ספד', 'ראה', 'גדול', whole),
+                         (('ב' * 10, 'ראה'), ('גדול', 'טוב')))
+
+    def test_ambiguous_snippet_gives_nothing(self):
+        from magiah import rankstats as rs
+        self.assertIsNone(rs.par_window(
+            'ספד', 'ראה', 'גדול', 'אז ראה ספד גדול ואז הוא ראה ספד גדול שם'))
+
+    def test_counts_and_vote(self):
+        from collections import Counter
+        from magiah import rankstats as rs
+        win = (('הילד', 'ראה'), ('גדול',))
+        need = rs.par_needs([(win, ('ספד', 'ספר'))])
+        own, sugg = Counter(), Counter()
+        rs.count_par('הילד ראה ספד גדול'.split(), 'a', need, own, sugg)
+        for _ in range(3):
+            rs.count_par('הילד ראה ספר גדול מאד'.split(), 'b', need, own,
+                         sugg)
+        rs.count_par('הילד ראה ספד גדול'.split(), 'c', need, own, sugg)
+        ps, pw = rs.par_counts(win, 'ספד', 'ספר', 'a', sugg,
+                               rs.own_totals(own), own)
+        self.assertEqual((ps, pw), (3, 1))
+        self.assertGreater(rs.par_vote(ps, pw), 0)
+        self.assertLess(rs.par_vote(0, 4), 0)
+        self.assertEqual(rs.par_vote(0, 0), 0)
+
+    def test_pipeline_flag_is_rank_only(self):
+        measured = flag_is_rank_only(
+            self, 'par_corpus', ('par_vote', 'par_sugg', 'par_word'))
+        # "הילד ראה ספד גדול": another book reads ספר in the same window
+        self.assertTrue(any(r['par_sugg'] > 0 and r['par_vote'] > 0
+                            for r in measured))
 
 
 class Diagnostics(unittest.TestCase):

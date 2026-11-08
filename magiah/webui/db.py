@@ -87,6 +87,8 @@ RANK_SQL = '''score
                 ELSE 0 END
               + CASE WHEN rw_lr IS NULL THEN 0
                      ELSE 0.5 * MAX(-2.0, MIN(3.0, rw_lr)) END
+              + CASE WHEN par_vote IS NULL THEN 0
+                     ELSE 0.75 * MAX(-2.0, MIN(2.0, par_vote)) END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
@@ -95,7 +97,7 @@ RANK_SQL = '''score
 VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
                 'COALESCE(ctx_assoc, 1) > 0) OR sugg_local >= 3)')
 
-OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr')
+OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr', 'par_vote')
 # ---------------------------------------------------------------------------
 
 

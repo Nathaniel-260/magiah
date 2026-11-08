@@ -1757,7 +1757,8 @@ def _tanach_check(db_path, all_occ, flagged, lstats, out_dir, passes,
 
 def _snippet(text, s, e):
     """Bounded context of one token — never the whole (possibly huge) line."""
-    return text[max(0, s - 45):e + 45].strip()
+    pad = rankstats.SNIPPET_PAD      # par_window reads the slice back
+    return text[max(0, s - pad):e + pad].strip()
 
 
 def _editorial_adjacent(text, s, e):
@@ -1968,23 +1969,26 @@ def _ctx_count_chunk(chunk):
     * rw (book scan with ``Config.real_word`` only): the bigrams and trigrams
       the real-word check needs, counted outside the scanned book itself.
       Returned as ``(bigram counts, trigram counts)``, or None.
-    * rwc (corpus scan with ``Config.rw_corpus`` only): the n-grams of
-      :func:`magiah.rankstats.rw_needs`, as ``(per-book counts of the
-      original's, trigram counts of the correction's)``, or None."""
+    * stats (corpus scan only): the rank signals of magiah.rankstats, as
+      ``{name: (per-book counts of the original's n-grams, counts of the
+      correction's)}`` -- ``rwc`` (``Config.rw_corpus``, the n-grams of
+      :func:`magiah.rankstats.rw_needs`) and ``par`` (``Config.par_corpus``,
+      the windows of :func:`magiah.rankstats.par_needs`)."""
     _chunk_stats_begin()
     pairs, first = _W['ctx_pairs'], _W['ctx_first']
     book_need = _W['book_need']
     seq = _W.get('seq')
     rw = _W.get('rw')
-    rwc = _W.get('rwc')
     counts, local, seq_counts = Counter(), Counter(), {}
-    rw_counts = rwc_counts = None
+    rw_counts = None
     if rw is not None:
         from .realword import count_ngrams
         rw_counts = (Counter(), Counter())
-    if rwc is not None:
-        from .rankstats import count_rw
-        rwc_counts = (Counter(), Counter())
+    from .rankstats import count_par, count_rw
+    stat_fns = [(k, fn, _W[k]) for k, fn in (('rwc', count_rw),
+                                              ('par', count_par))
+                if k in _W]
+    stats = {k: (Counter(), Counter()) for k, _, _ in stat_fns}
     for _, doc, text in _W['corpus'].iter_texts_docs(chunk):
         toks = tokenize(text)
         need = book_need.get(doc)
@@ -1998,9 +2002,9 @@ def _ctx_count_chunk(chunk):
         if rw is not None and doc != rw['skip_doc']:
             count_ngrams(toks, rw['n2'], rw['first2'], rw['n3'],
                          rw['first3'], *rw_counts)
-        if rwc is not None:
-            count_rw(toks, doc, rwc, *rwc_counts)
-    return (counts, local, seq_counts, rw_counts, rwc_counts,
+        for k, fn, need in stat_fns:
+            fn(toks, doc, need, *stats[k])
+    return (counts, local, seq_counts, rw_counts, stats,
             _chunk_stats_end())
 
 
@@ -2122,14 +2126,26 @@ def locate(spec, cfg, out_dir):
         if fr[1] in LOCAL_TYPES and fr[2]:
             book_need.setdefault(doc, set()).add(fr[2])
     print(f'[locate] context pairs to verify: {len(ctx_pairs):,}', flush=True)
-    # Config.rw_corpus: the n-grams the real-word comparison needs
+    # optional rank signals (magiah.rankstats), counted in the same pass
+    stat_need = {}
     rwc = None
-    if cfg.rw_corpus:
-        rwc = rankstats.rw_needs(all_occ, flagged, uses_context)
+    if cfg.rw_corpus:       # the n-grams of the real-word comparison
+        rwc = stat_need['rwc'] = rankstats.rw_needs(all_occ, flagged,
+                                                    uses_context)
         print(f'[locate] real-word n-grams to count: '
               f'{len(rwc["own"]) + len(rwc["sugg3"]):,}', flush=True)
+    par_win = None
+    if cfg.par_corpus:      # the windows of the parallel-passage vote
+        par_win = [rankstats.par_window(w, prev, nxt, snip)
+                   if uses_context(flagged[w][1]) and flagged[w][2] else None
+                   for w, _, _, prev, nxt, snip in all_occ]
+        stat_need['par'] = rankstats.par_needs(
+            (win, (oc[0], flagged[oc[0]][2]))
+            for win, oc in zip(par_win, all_occ) if win)
+        print(f'[locate] parallel-passage windows to count: '
+              f'{len(stat_need["par"]["word"]):,}', flush=True)
     ctx_counts, local_counts = Counter(), Counter()
-    rw_own, rw_sugg3 = Counter(), Counter()
+    stat_counts = {k: (Counter(), Counter()) for k in stat_need}
     if ctx_pairs or book_need:
         ctx_path = os.path.join(out_dir, 'ctx_pairs.pkl')
         with open(ctx_path, 'wb') as f:
@@ -2138,19 +2154,19 @@ def locate(spec, cfg, out_dir):
         with open(need_path, 'wb') as f:
             pickle.dump(book_need, f, protocol=4)
         cloads = {'ctx_pairs': ctx_path, 'book_need': need_path}
-        if rwc is not None:
-            cloads['rwc'] = os.path.join(out_dir, 'rw_corpus.pkl')
-            with open(cloads['rwc'], 'wb') as f:
-                pickle.dump(rwc, f, protocol=4)
+        for k, need in stat_need.items():
+            cloads[k] = os.path.join(out_dir, f'stat_{k}.pkl')
+            with open(cloads[k], 'wb') as f:
+                pickle.dump(need, f, protocol=4)
         cstats = passes['context'] = ReadStats()
         with _pool(spec, cfg, cloads) as pool:
-            for i, (c, lc, _sc, _rw, rwcc, st) in enumerate(
+            for i, (c, lc, _sc, _rw, sc, st) in enumerate(
                     pool.imap_unordered(_ctx_count_chunk, chunks), 1):
                 ctx_counts.update(c)
                 local_counts.update(lc)
-                if rwcc is not None:
-                    rw_own.update(rwcc[0])
-                    rw_sugg3.update(rwcc[1])
+                for k, (own_c, sugg_c) in sc.items():
+                    stat_counts[k][0].update(own_c)
+                    stat_counts[k][1].update(sugg_c)
                 cstats.add(ReadStats.from_dict(st))
                 if i % 6 == 0:
                     print(f'  [context] chunk {i}/{len(chunks)} '
@@ -2170,7 +2186,10 @@ def locate(spec, cfg, out_dir):
         for w in (rwc['words'] if rwc else ()):
             ctx_freq[w] = lexicon.get(w, 0)
         del lexicon
+    rw_own, rw_sugg3 = stat_counts.get('rwc', ({}, {}))
     rw_tot = rankstats.own_totals(rw_own) if rwc else {}
+    par_own, par_sugg = stat_counts.get('par', ({}, {}))
+    par_tot = rankstats.own_totals(par_own)
     # occurrences of each word in its own book: left out of its frequency
     # as its n-grams are left out of their counts
     w_in_doc = Counter((w, doc) for w, _, doc, _, _, _ in all_occ) \
@@ -2226,12 +2245,18 @@ def locate(spec, cfg, out_dir):
                         rankstats.OccCounts(ctx_counts, rw_sugg3, rw_tot,
                                             rw_own, doc),
                         prev, w, sugg, nxt, w_in_doc[(w, doc)])
+            par = (None, None, None)
+            win = par_win[j] if par_win else None
+            if win:
+                ps, pw = rankstats.par_counts(win, w, fr[2], doc, par_sugg,
+                                              par_tot, par_own)
+                par = (ps, pw, rankstats.par_vote(ps, pw))
             local = local_counts.get((doc, fr[2]), 0) if fr[1] in LOCAL_TYPES else 0
             tan, tsugg = tan_info[j] if tan_info else (0, '')
             ev = occurrence_evidence(fr, hits, local, tan)
             rows.append((w, uid, doc, hits, local,
                          1 if w in repeat_words else 0, tan, tsugg, snip,
-                         ev, None, None, *cstat, lr))
+                         ev, None, None, *cstat, lr, *par))
         con.executemany(_OCC_INSERT, rows)
         # OCR-profile findings: word-level entry + occurrence rows carrying their
         # own book's suggestion (the word-level one is only the first seen)
@@ -2323,6 +2348,10 @@ def locate(spec, cfg, out_dir):
 # rw_lr (Config.rw_corpus; magiah.rankstats.rw_lr): how far the bigram/
 # trigram context shifts the odds toward the correction, log10, half of it
 # within [-1.0, +1.5]. NULL (not measured) adds nothing.
+#
+# par_vote (Config.par_corpus; magiah.rankstats.par_vote): the occurrence's
+# two-words-each-side window seen with the correction vs. with the original
+# in other books, log10; 0.75 of it within [-1.5, +1.5]. NULL: nothing.
 RANK_SQL = '''score
               + CASE WHEN errtype LIKE 'edit1%' THEN
                   CASE WHEN ctx_assoc IS NULL THEN
@@ -2333,6 +2362,8 @@ RANK_SQL = '''score
                 ELSE 0 END
               + CASE WHEN rw_lr IS NULL THEN 0
                      ELSE 0.5 * MAX(-2.0, MIN(3.0, rw_lr)) END
+              + CASE WHEN par_vote IS NULL THEN 0
+                     ELSE 0.75 * MAX(-2.0, MIN(2.0, par_vote)) END
               + CASE WHEN sugg_local >= 10 THEN 1.5
                      WHEN sugg_local >= 3 THEN 0.7 ELSE 0 END
               - CASE WHEN book_repeat = 1 THEN 3.0 ELSE 0 END
@@ -2347,7 +2378,7 @@ VERIFIED_SQL = ('book_repeat = 0 AND ((ctx_hits > 0 AND '
 
 # columns RANK_SQL / VERIFIED_SQL read that a table may lack (an older
 # report.db, a hand-made one): read as NULL, i.e. "not measured"
-OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr')
+OPTIONAL_RANK_COLS = ('ctx_assoc', 'rw_lr', 'par_vote')
 
 
 def rank_source(con, table, schema=''):
@@ -2384,6 +2415,8 @@ RANK_TERMS = {
     'ctx': _ctx_term,
     'rw': lambda r: (0.0 if r.get('rw_lr') is None
                      else 0.5 * max(-2.0, min(3.0, r['rw_lr']))),
+    'par': lambda r: (0.0 if r.get('par_vote') is None
+                      else 0.75 * max(-2.0, min(2.0, r['par_vote']))),
     'sugg_local': lambda r: (1.5 if _num(r, 'sugg_local') >= 10 else
                              0.7 if _num(r, 'sugg_local') >= 3 else 0.0),
     'book_repeat': lambda r: -3.0 if _num(r, 'book_repeat') == 1 else 0.0,

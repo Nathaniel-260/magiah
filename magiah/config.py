@@ -51,6 +51,11 @@ class Config:
                              # (realword.posterior; column rw_lr). Rank
                              # only; the context pass counts more n-grams
                              # (roughly 20-40% longer)
+    par_corpus: int = 0      # corpus scan (1 = on): parallel passages --
+                             # the window of 2 words each side looked up
+                             # with the correction / with the original in
+                             # other books (columns par_sugg, par_word,
+                             # par_vote). Rank only; a longer context pass
     workers: int = 3
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
