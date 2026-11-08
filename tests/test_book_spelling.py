@@ -100,7 +100,8 @@ def rank_of(row):
     con.execute(f'INSERT INTO t VALUES({",".join("?" * len(cols))})',
                 [row.get(c) or 0 if c != 'errtype' else row[c]
                  for c in cols])
-    return con.execute(f'SELECT {core.RANK_SQL} FROM t').fetchone()[0]
+    src = core.rank_source(con, 't')
+    return con.execute(f'SELECT {core.RANK_SQL} FROM {src}').fetchone()[0]
 
 
 class Pipeline(unittest.TestCase):
