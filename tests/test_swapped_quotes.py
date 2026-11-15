@@ -4,7 +4,7 @@
 import tempfile
 import unittest
 
-from magiah import book_scan, core
+from magiah import book_scan, cli, core
 from magiah.config import Config
 from magiah.normalize import tokenize
 
@@ -80,6 +80,7 @@ class SwappedQuotes(unittest.TestCase):
             self.assertIn('swapped_quotes', group)
         self.assertEqual(core.evidence_kind('swapped_quotes', 'כגב"ד',
                                             400, 0, 0, 0), 'structural')
+        self.assertIn('swapped_quotes', cli.TUNABLE)   # --swapped-quotes 1
 
     def test_book_scan(self):
         freq = {**COMMON, **RARE}
