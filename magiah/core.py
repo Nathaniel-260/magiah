@@ -1015,6 +1015,55 @@ def loanword_penalty(w, kind, ch_a, ch_b, cfg):
     return max(0.0, cfg.loanword_penalty)
 
 
+def edit1_scored(w, fw, lex, edit1_cands):
+    """Every edit-1 correction of `w` the edit-1 rule accepts, in sorted
+    order (ties break the same way whichever candidate source produced the
+    set): ``(correction, score, kind, ch_a, ch_b)``. The score is the
+    frequency ratio plus the substitution / ו-י / swap bonus, before any
+    loanword penalty; :func:`evaluate_word` keeps the best of them."""
+    cfg, freq = lex.cfg, lex.freq
+    fw1 = max(fw, 1)
+    out = []
+    for c in sorted(edit1_cands(w)):
+        if c == w or not lex.is_common(c):
+            continue
+        fc = freq[c]
+        if fc < cfg.ed1_ratio * fw1:
+            continue
+        r = _dld1(w, c)
+        if r is None:
+            continue
+        kind, ch_a, ch_b, pos = r
+        if kind == 'ins':
+            # a doubled letter (למללך, נגמרר) is always suspicious
+            doubled = ((pos > 0 and w[pos - 1] == ch_a)
+                       or (pos + 1 < len(w) and w[pos + 1] == ch_a))
+            # extra letter in the leading prefix cluster (דלאליעזר) or a
+            # trailing inflection suffix (מזדעזעה): morphology, not a typo
+            if (not doubled and pos <= 2 and ch_a in PREFIX_LETTERS
+                    and all(x in PREFIX_LETTERS for x in w[:pos])):
+                continue
+            if not doubled and pos == len(w) - 1 and ch_a in SUFFIX_LETTERS:
+                continue
+        elif kind == 'sub' and pos == 0 \
+                and ch_a in PREFIX_LETTERS and ch_b in PREFIX_LETTERS:
+            # Hebrew vs Aramaic prefix variation (אידועים = אַ+ידועים)
+            continue
+        score = math.log10(fc / fw1)
+        if kind == 'sub':
+            lc = lex.learned.get(ch_a + ch_b, 0)
+            if lc:
+                score += learned_bonus(lc)
+            elif not lex.learned and (ch_a, ch_b) in CONFUSABLE:
+                score += 2
+        elif kind in ('ins', 'del') and ch_a in 'וי':
+            score += 1
+        elif kind == 'swap':
+            score += 1
+        out.append((c, score, kind, ch_a, ch_b))
+    return out
+
+
 def evaluate_word(w, fw, lex, edit1_cands):
     """Every per-word rule for one word type.
 
@@ -1076,59 +1125,30 @@ def evaluate_word(w, fw, lex, edit1_cands):
     if _frequent_stem(w, freq, cfg.common_min):
         return recs, splits
 
-    # edit distance 1 from a frequent word (sorted: ties break the same way
-    # whichever candidate source produced the set)
-    best_c, best_score, best_kind, best_ch = None, 0.0, '', ''
-    for c in sorted(edit1_cands(w)):
-        if c == w or not lex.is_common(c):
-            continue
-        fc = freq[c]
-        if fc < cfg.ed1_ratio * fw1:
-            continue
-        r = _dld1(w, c)
-        if r is None:
-            continue
-        kind, ch_a, ch_b, pos = r
-        if kind == 'ins':
-            # a doubled letter (למללך, נגמרר) is always suspicious
-            doubled = ((pos > 0 and w[pos - 1] == ch_a)
-                       or (pos + 1 < len(w) and w[pos + 1] == ch_a))
-            # extra letter in the leading prefix cluster (דלאליעזר) or a
-            # trailing inflection suffix (מזדעזעה): morphology, not a typo
-            if (not doubled and pos <= 2 and ch_a in PREFIX_LETTERS
-                    and all(x in PREFIX_LETTERS for x in w[:pos])):
-                continue
-            if not doubled and pos == len(w) - 1 and ch_a in SUFFIX_LETTERS:
-                continue
-        elif kind == 'sub' and pos == 0 \
-                and ch_a in PREFIX_LETTERS and ch_b in PREFIX_LETTERS:
-            # Hebrew vs Aramaic prefix variation (אידועים = אַ+ידועים)
-            continue
-        score = math.log10(fc / fw1)
-        if kind == 'sub':
-            lc = lex.learned.get(ch_a + ch_b, 0)
-            if lc:
-                score += learned_bonus(lc)
-            elif not lex.learned and (ch_a, ch_b) in CONFUSABLE:
-                score += 2
-        elif kind in ('ins', 'del') and ch_a in 'וי':
-            score += 1
-        elif kind == 'swap':
-            score += 1
-        if score > best_score:
-            best_c, best_score, best_kind, best_ch = c, score, kind, ch_a
-            best_sub = ch_b
-    if best_c:
-        # chosen on the full score, then demoted: a loanword variant keeps
-        # its finding and suggestion, only ranks lower
-        best_score -= loanword_penalty(w, best_kind, best_ch, best_sub, cfg)
-        # extra/missing ו or י is ktiv male/chaser variation: own class
-        if best_kind in ('ins', 'del') and best_ch in 'וי':
-            errtype = 'spelling_variant'
-        else:
-            errtype = f'edit1_{best_kind}'
-        recs.append((errtype, best_c, freq[best_c], best_score))
+    # edit distance 1 from a frequent word: the best-scoring correction (the
+    # first in sorted order on a tie)
+    best = None
+    for cand in edit1_scored(w, fw, lex, edit1_cands):
+        if cand[1] > (best[1] if best else 0.0):
+            best = cand
+    if best:
+        recs.append(edit1_record(w, best, lex))
     return recs, splits
+
+
+def edit1_record(w, cand, lex):
+    """The finding ``(errtype, suggestion, sugg_freq, score)`` of one
+    :func:`edit1_scored` correction of `w`."""
+    c, score, kind, ch_a, ch_b = cand
+    # chosen on the full score, then demoted: a loanword variant keeps its
+    # finding and suggestion, only ranks lower
+    score -= loanword_penalty(w, kind, ch_a, ch_b, lex.cfg)
+    # extra/missing ו or י is ktiv male/chaser variation: own class
+    if kind in ('ins', 'del') and ch_a in 'וי':
+        errtype = 'spelling_variant'
+    else:
+        errtype = f'edit1_{kind}'
+    return (errtype, c, lex.freq[c], score)
 
 
 def record_best(errors, w, fw, rec):

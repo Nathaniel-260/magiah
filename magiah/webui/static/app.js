@@ -888,9 +888,14 @@ function altList(word, alts) {
   const box = el("div", { class: "alt-list" });
   for (const a of alts) {
     if (!a || typeof a !== "object") continue;
-    const by = a.by === "tanach" ? "נוסח המקרא" : "הגלאי";
+    // context / frequency: the book scan's ranked alternatives
+    const by = a.by === "tanach" ? "נוסח המקרא"
+      : a.by === "context" ? "לפי המילים הסמוכות"
+      : a.by === "frequency" ? "לפי השכיחות" : "הגלאי";
     const parts = [];
-    if (a.by === "tanach") {
+    if (a.ctx_hits != null && (a.by === "context" || a.by === "frequency")) {
+      parts.push("נראתה ליד המילים הסמוכות: " + a.ctx_hits);
+    } else if (a.by === "tanach") {
       if (a.ref) parts.push(a.ref);
       if (a.works != null) parts.push("ספרים: " + a.works);
       if (a.independent_sources != null) parts.push("מקורות בלתי תלויים: " + a.independent_sources);

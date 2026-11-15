@@ -297,6 +297,17 @@ judged until the next corpus-scope scan. `real_word/` holds one file per book
 scanned this way and is never pruned; deleting it only means the next
 book-scope scan needs a `--book-verify-ctx` rescan first.
 
+`--alternatives N` (off by default) lists, for each edit-1 / spelling-variant
+finding, up to N of the corrections the edit-1 rule accepted for the word
+(`alternatives` in the finding; in the review UI, the drawer's "הצעות
+חלופיות"). With `--book-verify-ctx` they are ranked per occurrence by the
+same bigram/trigram model as `--book-real-word`, counted in the same pass
+without the book's own rows (`by: context`); with no counts, no neighbour,
+or no candidate ever seen beside these neighbours, they keep the detector's
+order (`by: frequency`). The finding's suggestion does not change unless
+`--alt-rerank 1` is also given: the suggestion then becomes the alternative
+the context ranks first.
+
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
