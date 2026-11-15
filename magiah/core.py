@@ -858,7 +858,8 @@ NUMERAL_LETTERS = frozenset('אבגדהוזחטיכלמנסעפצקרשת')
 
 # error types whose suggestion is a single word the book itself may also use
 LOCAL_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
-               'nonfinal_end', 'spelling_variant', 'lost_quotes')
+               'nonfinal_end', 'spelling_variant', 'lost_quotes',
+               'swapped_quotes')
 
 CALIBRATION_META_F = 'calibration_meta.json'
 LEARNED_F = 'confusion_learned.json'
@@ -871,7 +872,8 @@ SPLIT_ALTS_F = 'split_alts.pkl'
 EVIDENCE_KINDS = ('tanach', 'context', 'context_book', 'book_local',
                   'split_observed', 'split_observed_book', 'structural',
                   'ocr_profile', 'suspicion', 'context_lm', 'none')
-STRUCTURAL_TYPES = ('nonfinal_end', 'final_midword', 'lost_quotes')
+STRUCTURAL_TYPES = ('nonfinal_end', 'final_midword', 'lost_quotes',
+                    'swapped_quotes')
 
 
 class Lexicon:
@@ -1015,6 +1017,31 @@ def loanword_penalty(w, kind, ch_a, ch_b, cfg):
     return max(0.0, cfg.loanword_penalty)
 
 
+def swapped_quotes(w, fw, lex):
+    """An abbreviation typed with a geresh for its gershayim or the reverse
+    (רמב'ם -> רמב"ם): `w` is rare and the form with one mark swapped is
+    frequent. Same bar and score as lost_quotes. Returns at most one record.
+
+    The tokenizer keeps only marks between letters (a trailing geresh is not
+    part of the token), and normalization has already folded ׳ ״ and the
+    typographic quotes into ' and ".
+    """
+    cfg, freq = lex.cfg, lex.freq
+    if fw > cfg.rare_max:
+        return []
+    fw1 = max(fw, 1)
+    best = None
+    for i, ch in enumerate(w):
+        if ch not in '\'"':
+            continue
+        v = w[:i] + ('"' if ch == "'" else "'") + w[i + 1:]
+        fv = freq.get(v, 0)
+        if (fv >= cfg.common_min and fv >= cfg.ed1_ratio * fw1
+                and (best is None or fv > best[2])):
+            best = ('swapped_quotes', v, fv, 5 + math.log10(fv / fw1))
+    return [best] if best else []
+
+
 def evaluate_word(w, fw, lex, edit1_cands):
     """Every per-word rule for one word type.
 
@@ -1025,8 +1052,11 @@ def evaluate_word(w, fw, lex, edit1_cands):
     """
     cfg, freq = lex.cfg, lex.freq
     recs, splits = [], []
-    # geresh/gershayim mark abbreviations, which follow their own spelling
+    # geresh/gershayim mark abbreviations, which follow their own spelling;
+    # only the mark itself may be the wrong one (cfg.swapped_quotes)
     if len(w) < 3 or is_abbrev(w):
+        if cfg.swapped_quotes and len(w) >= 3:
+            recs.extend(swapped_quotes(w, fw, lex))
         return recs, splits
     fw1 = max(fw, 1)
 
