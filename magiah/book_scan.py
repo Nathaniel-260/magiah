@@ -62,7 +62,7 @@ from . import core, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
-from .normalize import tokenize
+from .normalize import is_abbrev, tokenize
 from .textsource import ReadStats
 
 LOCAL_TYPES = core.LOCAL_TYPES
@@ -137,6 +137,52 @@ def detect_in_book(book, freq, cfg, out_dir, progress=None):
         if splits:
             split_cands[w] = splits
     return lex, errors, split_cands, present, lsource
+
+
+# Findings the domain gate (Config.book_domain_max) leaves out: the rules
+# that call a word wrong because the lexicon finds it rare and knows a
+# similar, a split or an abbreviated common form. In a book outside the
+# lexicon's domain most rare words are simply words the lexicon never saw.
+# Final-letter rules, the book's reviewed OCR profile and extra spaces do
+# not rest on the word being rare, and stay.
+DOMAIN_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
+                'spelling_variant', 'missing_space', 'lost_quotes',
+                realword.ERRTYPE)
+
+
+def domain_on(cfg):
+    """Is the domain gate on (``Config.book_domain_max`` above 0)?"""
+    try:
+        return float(cfg.book_domain_max or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def book_domain(book, freq, present, cfg):
+    """How much of `book` the lexicon does not know, and whether the book is
+    outside the lexicon's domain.
+
+    Counted over the book's words of 3+ letters that are not abbreviations;
+    a word is unknown when the lexicon has it at most ``rare_max`` times
+    apart from this book (a file from outside the corpus was never counted
+    in it, so nothing is taken away). Returns a dict: ``words``,
+    ``unknown``, ``share``, ``max`` and ``out`` (True when the share is above
+    ``book_domain_max``; never for a book with fewer than
+    ``book_domain_min_words`` such words).
+    """
+    own = book.kind != 'file'
+    words = unknown = 0
+    for w, c in present.items():
+        if len(w) < 3 or is_abbrev(w):
+            continue
+        words += c
+        if freq.get(w, 0) - (c if own else 0) <= cfg.rare_max:
+            unknown += c
+    share = unknown / words if words else 0.0
+    limit = float(cfg.book_domain_max)
+    return {'words': words, 'unknown': unknown, 'share': round(share, 4),
+            'max': limit,
+            'out': words >= cfg.book_domain_min_words and share > limit}
 
 
 def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
@@ -471,6 +517,21 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
                                     _covered(joins, ocr))
         rows.extend(real_word.pop('rows'))
 
+    domain = None
+    if domain_on(cfg):
+        domain = book_domain(book, freq, present, cfg)
+        left_out = Counter()
+        if domain['out']:
+            kept = []
+            for r in rows:
+                if r['errtype'] in DOMAIN_TYPES:
+                    left_out[r['errtype']] += 1
+                else:
+                    kept.append(r)
+            rows = kept
+        domain['left_out'] = dict(left_out)
+        say(book_domain_message(book.title, domain))
+
     space_rows = [{
         'part1': p1, 'part2': p2, 'joined': j, 'join_freq': jf,
         'origin': book.origin, 'source': book.title, 'ref': ref,
@@ -518,7 +579,25 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     }
     if real_word is not None:       # off: the result is as it always was
         out['real_word'] = real_word
+    if domain is not None:          # likewise
+        out['domain'] = domain
     return out
+
+
+def book_domain_message(title, domain):
+    """The Hebrew line that reports the domain gate's verdict on a book."""
+    share, limit = domain['share'], domain['max']
+    if not domain['out']:
+        why = (f'מעט מדי מילים למדידה ({domain["words"]:,})'
+               if share > limit else 'בתוך תחום המילון')
+        return (f'[book] מילים שהמילון אינו מכיר: {share:.1%} '
+                f'(סף {limit:.0%}) — {why}')
+    n = sum(domain['left_out'].values())
+    return (f'[book] «{title}» מחוץ לתחום המילון: {share:.1%} ממילותיו '
+            f'(3 אותיות ומעלה) כמעט אינן במאגר, יותר מ-{limit:.0%} '
+            f'(book_domain_max). {n:,} ממצאים שנשענים על נדירות המילה '
+            f'הושמטו; ממצאי אותיות סופיות, פרופיל OCR ורווחים מיותרים '
+            f'נשארו')
 
 
 # ---------------------------------------------------------------------------

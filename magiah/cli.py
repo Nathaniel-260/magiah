@@ -122,6 +122,8 @@ def _run_book_cmd(args, spec, cfg, out_dir):
     source = args.book_source or _guess_book_source(args.book)
     if args.book_real_word:
         cfg.real_word = 1
+    if args.book_domain_max is not None:
+        cfg.book_domain_max = args.book_domain_max
     from .webui import db as uidb
     # recorded apart from the pipeline's runs: a book scan never touches the
     # full scan's results, so it must neither raise nor clear their warning
@@ -180,6 +182,12 @@ def main(argv=None):
                          'another existing word, judged by the neighbouring '
                          'words; the corpus counts are made by a '
                          '--book-verify-ctx scan and kept for later scans')
+    bk.add_argument('--book-domain-max', type=float, default=None,
+                    metavar='SHARE',
+                    help='leave out the rarity-based findings of a book in '
+                         'which more than this share of the words (e.g. '
+                         '0.05) is unknown to the lexicon: modern Hebrew, '
+                         'another language or spelling (default 0: off)')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')

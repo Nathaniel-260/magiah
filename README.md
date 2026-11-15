@@ -297,6 +297,26 @@ judged until the next corpus-scope scan. `real_word/` holds one file per book
 scanned this way and is never pruned; deleting it only means the next
 book-scope scan needs a `--book-verify-ctx` rescan first.
 
+`--book-domain-max SHARE` (off by default; 0.05 is a measured value) is a
+**domain gate** for the whole book. The lexicon knows the language most of
+the library is written in; a book in modern Hebrew, another language or another spelling
+system is full of words it has never seen, and the rarity rules then flag
+correct words. Before reporting, the scan counts the book's words of 3+
+letters (abbreviations aside) that the lexicon has at most `rare_max` times
+apart from the book itself. When more than SHARE of them are unknown (and
+the book has at least `book_domain_min_words`, 200, such words), the
+findings that rest on a word being rare are left out — `edit1_*`,
+`spelling_variant`, `missing_space`, `lost_quotes` and `real_word` — and
+the scan says so in its log and in the result's `domain` entry (the share
+and how many findings of each kind were left out). Final-letter findings,
+the book's OCR profile and extra spaces stay. The foreign-line skip
+(`foreign_ratio`) still works line by line inside any book; the gate is
+the book-level decision on top of it. On the Otzaria library lexicon,
+99% of the books of halacha, Talmud, responsa and Mishnah measure under 2%;
+the 0.6% of library books above 5% are mostly Aramaic targums, plus the
+Judeo-Arabic and Syriac translations and a few piyyut and midrash collections;
+digital modern-Hebrew books measure 6-16%.
+
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
