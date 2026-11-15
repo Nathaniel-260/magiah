@@ -180,6 +180,19 @@ def main(argv=None):
                          'another existing word, judged by the neighbouring '
                          'words; the corpus counts are made by a '
                          '--book-verify-ctx scan and kept for later scans')
+    lx = ap.add_argument_group(
+        'lexicon: update the existing lexicon instead of recounting it')
+    lxm = lx.add_mutually_exclusive_group()
+    lxm.add_argument('--update', action='store_true',
+                     help='recount only the books added, changed or removed '
+                          'since the last update (the first one counts all '
+                          'and keeps per-book counts in lexicon_books.pkl); '
+                          'same lexicon as a full count')
+    lxm.add_argument('--status', action='store_true',
+                     help='say what --update would do now (writes nothing)')
+    lxm.add_argument('--rollback', action='store_true',
+                     help='swap the lexicon with the one the last --update '
+                          'replaced (again: swap back)')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')
@@ -227,6 +240,10 @@ def main(argv=None):
     for f in TUNABLE:
         tune.add_argument(f'--{f.replace("_", "-")}', type=int, default=None)
     args = ap.parse_args(argv)
+    lex_mode = args.update or args.status or args.rollback
+    if lex_mode and args.command != 'lexicon':
+        ap.error('--update, --status and --rollback go with the lexicon '
+                 'command')
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -248,6 +265,25 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
+    if args.status or args.rollback:
+        # read the lexicon folder only: the remembered settings stay as they
+        # are
+        from . import lexicon_update
+        try:
+            if args.status:
+                return lexicon_update.print_status(spec, out_dir)
+            # nothing to roll back to is not a failed lexicon run
+            problem = lexicon_update.rollback_problem(out_dir)
+            if problem:
+                print(problem, file=sys.stderr, flush=True)
+                return 1
+            with runstate.track_scan(out_dir, ('lexicon',)) as run:
+                run.enter('lexicon')
+                lexicon_update.rollback(out_dir)
+            return 0
+        except (core.StageError, TextSourceError) as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
     if args.command in ('lexicon', 'detect', 'locate', 'all'):
         # a folder that is not there is refused before run_config.json is
         # rewritten with it, and before any stage starts
@@ -263,8 +299,15 @@ def main(argv=None):
         review.serve(out_dir, port=args.port or 8765)
         return
 
+    def lexicon_step():
+        if args.update:
+            from . import lexicon_update
+            lexicon_update.update(spec, cfg, out_dir)
+        else:
+            core.build_lexicon(spec, cfg, out_dir)
+
     steps = {
-        'lexicon': lambda: core.build_lexicon(spec, cfg, out_dir),
+        'lexicon': lexicon_step,
         'calibrate': lambda: core.calibrate(
             cfg, out_dir, from_machine=args.calibrate_from_machine),
         'detect': lambda: core.detect(spec, cfg, out_dir),
