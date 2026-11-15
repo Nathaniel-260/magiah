@@ -21,7 +21,7 @@ PIPELINE = {'all': ('lexicon', 'detect', 'locate', 'report')}
 # run_config.json like every setting)
 TUNABLE = ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
            'workers', 'n_chunks', 'rw_corpus', 'par_corpus', 'rank_model',
-           'rank_model_min')
+           'rank_model_min', 'extra_min')
 
 
 def _build_spec(args):
@@ -145,6 +145,39 @@ def _run_book_cmd(args, spec, cfg, out_dir):
     return 0
 
 
+def _run_extra_cmd(args, out_dir, prev=None):
+    """`magiah extra` — build (--name + --from), remove (--remove) or list
+    the extra lexicons of the output folder. Needs no corpus."""
+    from . import extralex
+    min_count = (Config.from_run_config(prev.get('config')) if prev
+                 else Config()).extra_min
+    try:
+        if args.remove:
+            extralex.remove(out_dir, args.remove)
+            print(f'[extra] המילון הנוסף "{args.remove}" נמחק', flush=True)
+            return 0
+        if args.name or args.extra_from:
+            if not args.name:
+                raise extralex.ExtraLexiconError(
+                    'יש לתת שם למילון הנוסף: --name <שם>')
+            rec = extralex.build(out_dir, args.name, args.extra_from or (),
+                                 progress=lambda s: print(s, flush=True))
+            print('[extra] ' + extralex.summary(rec, min_count),
+                  flush=True)
+            print(f'[extra] לשימוש בסריקה: --extra-lexicon {args.name}',
+                  flush=True)
+            return 0
+        names = extralex.list_names(out_dir)
+        for name in names:
+            print(extralex.summary(extralex.load(out_dir, name),
+                                   min_count), flush=True)
+        print(f'-- {len(names)} extra lexicons', flush=True)
+        return 0
+    except extralex.ExtraLexiconError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
+
+
 def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -157,7 +190,8 @@ def main(argv=None):
                     'dictionary.')
     ap.add_argument('command',
                     choices=['lexicon', 'calibrate', 'detect', 'locate',
-                             'report', 'review', 'ui', 'all', 'book'])
+                             'report', 'review', 'ui', 'all', 'book',
+                             'extra'])
     bk = ap.add_argument_group(
         'book: scan a single book against the existing lexicon')
     bk.add_argument('--book', metavar='KEY',
@@ -180,6 +214,29 @@ def main(argv=None):
                          'another existing word, judged by the neighbouring '
                          'words; the corpus counts are made by a '
                          '--book-verify-ctx scan and kept for later scans')
+    ex = ap.add_argument_group(
+        'extra: an extra lexicon built from your own documents (.txt, '
+        '.html, .docx, .epub; not PDF). Its words are never flagged when a '
+        'scan selects it with --extra-lexicon. Without --name/--remove: '
+        'list them')
+    ex.add_argument('--name', metavar='NAME',
+                    help='build (or rebuild) the extra lexicon NAME from '
+                         '--from')
+    ex.add_argument('--from', dest='extra_from', action='append',
+                    metavar='PATH',
+                    help='a document, or a folder read with its subfolders; '
+                         'may be given multiple times')
+    ex.add_argument('--remove', metavar='NAME',
+                    help='delete the extra lexicon NAME')
+    ex.add_argument('--extra-lexicon', action='append', metavar='NAME',
+                    help='detect/all/book: words this extra lexicon holds '
+                         'at least --extra-min times (default 3) are never '
+                         'flagged. May be given multiple times; remembered '
+                         'in run_config.json like --whitelist. Off by '
+                         'default: in rabbinic text it hides some real '
+                         'errors, so select it for the books that need it')
+    ex.add_argument('--no-extra-lexicon', action='store_true',
+                    help='stop using the remembered extra lexicons')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')
@@ -237,6 +294,8 @@ def main(argv=None):
         return
 
     prev = _load_run_config(out_dir)
+    if args.command == 'extra':
+        return _run_extra_cmd(args, out_dir, prev)
     spec = _build_spec(args) or (prev and prev['corpus'])
     if spec is None:
         ap.error('no corpus source: use --otzaria, --sqlite or --textdir')
@@ -248,6 +307,19 @@ def main(argv=None):
             setattr(cfg, f, v)
     if args.whitelist:
         cfg.whitelist = tuple(os.path.abspath(p) for p in args.whitelist)
+    if args.no_extra_lexicon:
+        cfg.extra_lexicon = ()
+    if args.extra_lexicon:
+        cfg.extra_lexicon = tuple(args.extra_lexicon)
+    if args.extra_lexicon and args.command in ('detect', 'all', 'book'):
+        # a name that is not there is refused before it is remembered
+        from . import extralex
+        try:
+            for name in cfg.extra_lexicon:
+                extralex.load(out_dir, name)
+        except extralex.ExtraLexiconError as e:
+            print(str(e), file=sys.stderr, flush=True)
+            return 1
     if args.command in ('lexicon', 'detect', 'locate', 'all'):
         # a folder that is not there is refused before run_config.json is
         # rewritten with it, and before any stage starts

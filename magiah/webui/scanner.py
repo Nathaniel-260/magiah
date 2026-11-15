@@ -125,6 +125,10 @@ def load_run_config(outdir):
     return None
 
 
+# Config fields edited as one entry per line
+LIST_FIELDS = ('whitelist', 'extra_lexicon')
+
+
 def _merge_config(outdir, overrides):
     prev = load_run_config(outdir)
     cfg = Config.from_run_config(prev['config']) \
@@ -135,7 +139,7 @@ def _merge_config(outdir, overrides):
             continue
         cur = getattr(cfg, key)
         try:
-            if key == 'whitelist':
+            if key in LIST_FIELDS:
                 if isinstance(val, str):
                     val = [v.strip() for v in val.splitlines() if v.strip()]
                 setattr(cfg, key, tuple(val))
@@ -565,7 +569,7 @@ def scan_config(outdir):
             'default': list(default) if isinstance(default, tuple) else default,
             'value': (list(current[key]) if isinstance(current[key], tuple)
                       else current[key]),
-            'type': ('list' if key == 'whitelist'
+            'type': ('list' if key in LIST_FIELDS
                      else 'float' if isinstance(default, float) else 'int'),
         })
     have_reviews = calibrate_available(outdir)

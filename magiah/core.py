@@ -28,7 +28,7 @@ from multiprocessing import Pool
 from .config import Config
 from . import tanach
 from .corpus import OTZARIA_DB, make_corpus
-from . import rankmodel, rankstats
+from . import extralex, rankmodel, rankstats
 from .rankstats import OCC_STAT_COLS, ctx_stats
 from .textsource import OtzariaDB, ReadStats, TextSourceError
 from .normalize import (CONFUSABLE, FINALS, FROM_FINAL, PREFIX_LETTERS,
@@ -1709,6 +1709,12 @@ def detect(spec, cfg, out_dir):
             whitelist.update(line.strip() for line in f if line.strip())
     if whitelist:
         print(f'[detect] whitelist: {len(whitelist):,} words', flush=True)
+    # selected extra lexicons (magiah.extralex): suppression only, as above
+    try:
+        whitelist |= extralex.known_words(
+            cfg, out_dir, lambda s: print(s, flush=True))
+    except extralex.ExtraLexiconError as e:
+        raise StageError(str(e)) from e
 
     # words the user rejected EVERYWHERE in review are never flagged again
     rejected = load_review_rejections(out_dir)
