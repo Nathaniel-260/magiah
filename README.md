@@ -167,6 +167,22 @@ corpus source and thresholds are remembered in `results/run_config.json`, so
 after tuning thresholds you can rerun from `detect` without recounting the
 lexicon.
 
+**Updating the lexicon (`lexicon --update`).** When the library changed only
+a little (a new Otzaria release), `magiah lexicon --update` recounts only the
+books that were added, changed or removed, and writes the same lexicon a full
+`magiah lexicon` would. The first update counts everything and keeps each
+book's counts in `results/lexicon_books.pkl`; later ones compare each book's
+stamp (a seforim.db book: its `contentHash` and number of lines; a text file:
+its size and modification time) and subtract/add only those books. Nothing
+changed: nothing is written. The files it replaces are kept in
+`results/lexicon_prev/`, and `magiah lexicon --rollback` swaps them back (run
+it again to swap forward). `magiah lexicon --status` says what an update
+would do. The side file is used only with the lexicon it was written with;
+after a plain `magiah lexicon`, a corpus change or a partial lexicon, the
+update counts everything again and says why. A plain `--sqlite` table has no
+books to compare, so its update is a full count. As after `magiah lexicon`,
+rerun `detect` and `locate` to bring the results up to date.
+
 A failed stage never replaces its previous output, so after a failed run the
 folder still holds the last good results. Every run therefore records itself
 in `results/run_state/` — when it started, the stage it reached, and how it
