@@ -71,7 +71,15 @@ class Config:
                              # findings (book_scan.DOMAIN_TYPES) are left out
                              # the result says so. 0 (or less): off
     book_domain_min_words: int = 200  # ... judged only on books with at
-                             # least this many such words
+                             # least this many such word OCCURRENCES ...
+    book_domain_min_types: int = 100  # ... and this many DIFFERENT such
+                             # words (a short repetitive text reaches the
+                             # first without being a sample of a language)
+    book_domain_min_lexicon: int = 1000000  # the gate applies only when the
+                             # lexicon counted at least this many words in
+                             # all (a near-empty lexicon knows no word: every
+                             # book would look foreign) and was not built
+                             # partial (--allow-unread); 0: no size floor
     rw_corpus: int = 0       # corpus scan (1 = on): weigh each edit-1 /
                              # spelling-variant correction against the
                              # original between the same neighbours

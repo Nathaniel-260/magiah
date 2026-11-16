@@ -165,24 +165,59 @@ def book_domain(book, freq, present, cfg):
     Counted over the book's words of 3+ letters that are not abbreviations;
     a word is unknown when the lexicon has it at most ``rare_max`` times
     apart from this book (a file from outside the corpus was never counted
-    in it, so nothing is taken away). Returns a dict: ``words``,
-    ``unknown``, ``share``, ``max`` and ``out`` (True when the share is above
-    ``book_domain_max``; never for a book with fewer than
-    ``book_domain_min_words`` such words).
+    in it, so nothing is taken away). Returns a dict: ``words`` (their
+    occurrences), ``types`` (how many different ones), ``unknown``
+    (occurrences), ``share``, ``max`` and ``out`` (True when the share is
+    above ``book_domain_max``; never for a book with fewer than
+    ``book_domain_min_words`` such occurrences or fewer than
+    ``book_domain_min_types`` different words: the minimum is both, so a
+    short text that repeats a few words is not judged).
+
+    Own count: a book read from the corpus (kind 'db' or 'library') is part
+    of what the lexicon counted, once, tokenized as ``_book_tokens`` does
+    (the lexicon's counting reads text the same way), so its own
+    occurrences are taken away before asking whether the lexicon knows the
+    word. This is the same assumption as the book-repeat rule
+    (``freq <= present`` is "only this book", ``core.book_repeat_value``)
+    and the real-word check (``own = present`` unless kind is 'file'). A
+    'file' is never taken away from, even one that happens to sit inside
+    the corpus library: that can only understate the unknown share (the
+    safe side for a gate that drops findings).
     """
     own = book.kind != 'file'
-    words = unknown = 0
+    words = types = unknown = 0
     for w, c in present.items():
         if len(w) < 3 or is_abbrev(w):
             continue
         words += c
+        types += 1
         if freq.get(w, 0) - (c if own else 0) <= cfg.rare_max:
             unknown += c
     share = unknown / words if words else 0.0
     limit = float(cfg.book_domain_max)
-    return {'words': words, 'unknown': unknown, 'share': round(share, 4),
-            'max': limit,
-            'out': words >= cfg.book_domain_min_words and share > limit}
+    return {'words': words, 'types': types, 'unknown': unknown,
+            'share': round(share, 4), 'max': limit,
+            'out': (words >= cfg.book_domain_min_words
+                    and types >= cfg.book_domain_min_types
+                    and share > limit)}
+
+
+def domain_lexicon_problem(freq, cfg, out_dir):
+    """Why the lexicon cannot tell what is outside its domain, or None.
+
+    The share of unknown words is only meaningful against a lexicon that
+    knows a language. Two cases make nearly every word of a normal book
+    look unknown, so the gate would drop the findings of an ordinary book:
+    a lexicon with too few words in all (``book_domain_min_lexicon``;
+    'small'), and one built partial under ``--allow-unread``
+    ('partial': a missing part of the library is missing words). Returns
+    ``'small'`` / ``'partial'``; the gate then does not apply.
+    """
+    if core.accepted_gaps(out_dir, 'lexicon'):
+        return 'partial'
+    if sum(freq.values()) < cfg.book_domain_min_lexicon:
+        return 'small'
+    return None
 
 
 def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
@@ -518,17 +553,30 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         rows.extend(real_word.pop('rows'))
 
     domain = None
+    dropped_words = set()   # words whose every finding the gate left out
     if domain_on(cfg):
         domain = book_domain(book, freq, present, cfg)
+        refused = domain_lexicon_problem(freq, cfg, out_dir)
+        if refused:     # measured, but not enough of a yardstick to act on
+            domain['out'] = False
+            domain['refused'] = refused
+            domain['lexicon_words'] = sum(freq.values())
+            domain['lexicon_min'] = cfg.book_domain_min_lexicon
         left_out = Counter()
         if domain['out']:
             kept = []
             for r in rows:
                 if r['errtype'] in DOMAIN_TYPES:
                     left_out[r['errtype']] += 1
+                    dropped_words.add(r['word'])
                 else:
                     kept.append(r)
             rows = kept
+            dropped_words -= {r['word'] for r in rows}
+            if real_word is not None:    # its summary counts what is shown
+                n_rw = left_out.get(realword.ERRTYPE, 0)
+                real_word['hints'] -= n_rw
+                real_word['domain_left_out'] = n_rw
         domain['left_out'] = dict(left_out)
         say(book_domain_message(book.title, domain))
 
@@ -538,10 +586,13 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         'unit': unit, 'doc': book.doc, 'snippet': snip,
     } for unit, ref, p1, p2, j, jf, snip in joins]
 
+    # a split of a word whose finding the gate left out is not shown either,
+    # and no word is primary for a missing_space finding that is gone
+    gone = 'missing_space' in left_out_types(domain)
     split_alts = [{'word': w, 'parts': p, 'observed': o, 'expected': e,
                    'chosen': bool(ch),
-                   'is_primary': errors[w][1] == 'missing_space'}
-                  for w, lst in alts.items()
+                   'is_primary': errors[w][1] == 'missing_space' and not gone}
+                  for w, lst in alts.items() if w not in dropped_words
                   for p, o, e, ch in lst]
 
     # same rule as a full scan: accepted is not complete
@@ -584,11 +635,24 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     return out
 
 
+def left_out_types(domain):
+    """The finding types the domain gate left out (empty: it did not act)."""
+    return set((domain or {}).get('left_out') or ())
+
+
 def book_domain_message(title, domain):
     """The Hebrew line that reports the domain gate's verdict on a book."""
     share, limit = domain['share'], domain['max']
+    if domain.get('refused'):
+        if domain['refused'] == 'partial':
+            why = 'המילון נבנה חלקית (--allow-unread)'
+        else:
+            why = (f'המילון קטן מדי: {domain["lexicon_words"]:,} מילים, '
+                   f'נדרשים לפחות {domain["lexicon_min"]:,} (book_domain_min_lexicon)')
+        return (f'[book] שער התחום (book_domain_max) לא הופעל: {why}; '
+                f'כל הממצאים נשמרים (השיעור המדוד: {share:.1%})')
     if not domain['out']:
-        why = (f'מעט מדי מילים למדידה ({domain["words"]:,})'
+        why = (f'מעט מדי מילים למדידה ({domain["words"]:,} מופעים, {domain["types"]:,} שונות)'
                if share > limit else 'בתוך תחום המילון')
         return (f'[book] מילים שהמילון אינו מכיר: {share:.1%} '
                 f'(סף {limit:.0%}) — {why}')

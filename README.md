@@ -304,7 +304,9 @@ system is full of words it has never seen, and the rarity rules then flag
 correct words. Before reporting, the scan counts the book's words of 3+
 letters (abbreviations aside) that the lexicon has at most `rare_max` times
 apart from the book itself. When more than SHARE of them are unknown (and
-the book has at least `book_domain_min_words`, 200, such words), the
+the book has at least `book_domain_min_words`, 200, such word occurrences
+**and** at least `book_domain_min_types`, 100, different ones: a short text
+that repeats a few words is not judged), the
 findings that rest on a word being rare are left out — `edit1_*`,
 `spelling_variant`, `missing_space`, `lost_quotes` and `real_word` — and
 the scan says so in its log and in the result's `domain` entry (the share
@@ -316,6 +318,17 @@ the book-level decision on top of it. On the Otzaria library lexicon,
 the 0.6% of library books above 5% are mostly Aramaic targums, plus the
 Judeo-Arabic and Syriac translations and a few piyyut and midrash collections;
 digital modern-Hebrew books measure 6-16%.
+
+The gate refuses to apply, says so in the log and keeps every finding
+(`domain.refused` is `small` or `partial`, `out` is false) when the lexicon
+cannot serve as a yardstick: it counted fewer than `book_domain_min_lexicon`
+(1,000,000) words in all, or it was built partial under `--allow-unread`.
+A near-empty lexicon knows no word, so every ordinary book would look
+foreign. A book read from the corpus (`db`/`library`) has its own
+occurrences taken away from the lexicon's count first, the same rule as the
+book-repeat and real-word checks; a `file` has none taken away. When the gate
+acts, split alternatives of left-out `missing_space` findings are left out
+too, and `real_word.hints` counts what is still shown.
 
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
