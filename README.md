@@ -302,6 +302,39 @@ judged until the next corpus-scope scan. `real_word/` holds one file per book
 scanned this way and is never pruned; deleting it only means the next
 book-scope scan needs a `--book-verify-ctx` rescan first.
 
+`--book-domain-max SHARE` (off by default; 0.05 is a measured value) is a
+**domain gate** for the whole book. The lexicon knows the language most of
+the library is written in; a book in modern Hebrew, another language or another spelling
+system is full of words it has never seen, and the rarity rules then flag
+correct words. Before reporting, the scan counts the book's words of 3+
+letters (abbreviations aside) that the lexicon has at most `rare_max` times
+apart from the book itself. When more than SHARE of them are unknown (and
+the book has at least `book_domain_min_words`, 200, such word occurrences
+**and** at least `book_domain_min_types`, 100, different ones: a short text
+that repeats a few words is not judged), the
+findings that rest on a word being rare are left out — `edit1_*`,
+`spelling_variant`, `missing_space`, `lost_quotes` and `real_word` — and
+the scan says so in its log and in the result's `domain` entry (the share
+and how many findings of each kind were left out). Final-letter findings,
+the book's OCR profile and extra spaces stay. The foreign-line skip
+(`foreign_ratio`) still works line by line inside any book; the gate is
+the book-level decision on top of it. On the Otzaria library lexicon,
+99% of the books of halacha, Talmud, responsa and Mishnah measure under 2%;
+the 0.6% of library books above 5% are mostly Aramaic targums, plus the
+Judeo-Arabic and Syriac translations and a few piyyut and midrash collections;
+digital modern-Hebrew books measure 6-16%.
+
+The gate refuses to apply, says so in the log and keeps every finding
+(`domain.refused` is `small` or `partial`, `out` is false) when the lexicon
+cannot serve as a yardstick: it counted fewer than `book_domain_min_lexicon`
+(1,000,000) words in all, or it was built partial under `--allow-unread`.
+A near-empty lexicon knows no word, so every ordinary book would look
+foreign. A book read from the corpus (`db`/`library`) has its own
+occurrences taken away from the lexicon's count first, the same rule as the
+book-repeat and real-word checks; a `file` has none taken away. When the gate
+acts, split alternatives of left-out `missing_space` findings are left out
+too, and `real_word.hints` counts what is still shown.
+
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
@@ -343,6 +376,31 @@ Hebrew books hid 2.2% of the errors that were caught without it (one built
 from 100 books: 0.2%), while on other modern books it cut the findings per
 1,000 words from 29.3 to 4.3 (11.3 with 100 books). The larger the extra
 lexicon, the more it hides.
+**Check a correction after the fact** (`magiah guard`):
+
+```bash
+magiah guard --before page.ocr.txt --after page.fixed.txt --out results
+```
+
+Lines the two texts up word by word and judges every change by the corpus
+frequencies of `--out`'s lexicon: a common word (>= `common_min`) that
+became a rare or unknown one (<= `rare_max`) is `suspect` — the corrector
+(a person, an OCR post-corrector, a language model) probably broke a good
+word; the reverse is `supported`; anything else `neutral`. A split, join,
+insertion or deletion is one unit, judged by its least frequent word; but
+inside such a unit, words that clearly correspond (the same word with a
+letter or two changed) are paired first and judged one by one, so a real
+`common -> rare` slip is not hidden by a split or join next to it.
+Prints the suspect changes (`--guard-all`: every change) as tab-separated
+`line, verdict, old, new, f_old, f_new`, then a count. Writes nothing (a
+`--out` that does not exist is not created). The exit code is 0 even when
+suspects are found: it is 1 only when the check could not run (a missing,
+empty, corrupt or partial lexicon, an unreadable file, or two texts so
+different and repetitive that comparing them would take unreasonably
+long -- split them). Read the printed list, not the exit code. It
+sees only one kind of damage: a common word turned into another common
+word (a real-word slip) is `neutral`, and `supported` does not mean
+correct.
 
 **Review the findings** in your browser:
 
