@@ -1376,7 +1376,8 @@ def import_book_scan(outdir, result):
                      int(r.get('ctx_hits') or 0), int(r.get('sugg_local') or 0),
                      int(r.get('book_repeat') or 0), int(r.get('tanach') or 0),
                      r.get('origin'), r.get('source'), r.get('ref'),
-                     r.get('unit'), r.get('snippet'), extra_json, None,
+                     r.get('unit'), r.get('snippet'),
+                     _book_extra(extra_json, r), None,
                      *(r.get(c) for c in OPTIONAL_RANK_COLS))
                     for r in (result.get('findings') or [])]
         space_rows = []
@@ -1502,6 +1503,16 @@ def import_book_scan(outdir, result):
                 'space_errors': len(result.get('space_errors') or [])}
     finally:
         con.close()
+
+
+def _book_extra(extra_json, r):
+    """The `extra` of one book-scan finding: the scan's, plus the ranked
+    alternatives (magiah.alternatives) when the row has any."""
+    if not r.get('alternatives'):
+        return extra_json
+    extra = json.loads(extra_json)
+    extra['alternatives'] = r['alternatives']
+    return json.dumps(extra, ensure_ascii=False)
 
 
 def _mark_stale_approvals(cur, where='1', params=()):

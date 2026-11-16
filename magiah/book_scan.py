@@ -58,11 +58,11 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core, rankstats, realword
+from . import alternatives, core, extralex, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
-from .normalize import tokenize
+from .normalize import is_abbrev, tokenize
 from .textsource import ReadStats
 
 LOCAL_TYPES = core.LOCAL_TYPES
@@ -90,8 +90,9 @@ def load_lexicon(out_dir, allow_unread=0):
         return pickle.load(f)
 
 
-def _load_whitelist(cfg, out_dir):
-    """Whitelist files + words rejected everywhere in review (as detect)."""
+def _load_whitelist(cfg, out_dir, progress=None):
+    """Whitelist files + words rejected everywhere in review (as detect)
+    + the selected extra lexicons."""
     words = set()
     for path in (cfg.whitelist or ()):
         try:
@@ -100,6 +101,10 @@ def _load_whitelist(cfg, out_dir):
         except OSError:
             continue
     words.update(core.load_review_rejections(out_dir))
+    try:
+        words |= extralex.known_words(cfg, out_dir, progress)
+    except extralex.ExtraLexiconError as e:
+        raise BookScanError(str(e)) from e
     return words
 
 
@@ -116,7 +121,7 @@ def detect_in_book(book, freq, cfg, out_dir, progress=None):
     Returns ``(lex, errors, split_cands, present, learned_source)``; splits
     are not yet resolved (that needs spaced-sequence evidence).
     """
-    whitelist = _load_whitelist(cfg, out_dir)
+    whitelist = _load_whitelist(cfg, out_dir, progress)
     learned, lsource = core.load_learned(out_dir)
     present = Counter()
     for toks in _book_tokens(book):
@@ -137,6 +142,87 @@ def detect_in_book(book, freq, cfg, out_dir, progress=None):
         if splits:
             split_cands[w] = splits
     return lex, errors, split_cands, present, lsource
+
+
+# Findings the domain gate (Config.book_domain_max) leaves out: the rules
+# that call a word wrong because the lexicon finds it rare and knows a
+# similar, a split or an abbreviated common form. In a book outside the
+# lexicon's domain most rare words are simply words the lexicon never saw.
+# Final-letter rules, the book's reviewed OCR profile and extra spaces do
+# not rest on the word being rare, and stay.
+DOMAIN_TYPES = ('edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap',
+                'spelling_variant', 'missing_space', 'lost_quotes',
+                realword.ERRTYPE)
+
+
+def domain_on(cfg):
+    """Is the domain gate on (``Config.book_domain_max`` above 0)?"""
+    try:
+        return float(cfg.book_domain_max or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def book_domain(book, freq, present, cfg):
+    """How much of `book` the lexicon does not know, and whether the book is
+    outside the lexicon's domain.
+
+    Counted over the book's words of 3+ letters that are not abbreviations;
+    a word is unknown when the lexicon has it at most ``rare_max`` times
+    apart from this book (a file from outside the corpus was never counted
+    in it, so nothing is taken away). Returns a dict: ``words`` (their
+    occurrences), ``types`` (how many different ones), ``unknown``
+    (occurrences), ``share``, ``max`` and ``out`` (True when the share is
+    above ``book_domain_max``; never for a book with fewer than
+    ``book_domain_min_words`` such occurrences or fewer than
+    ``book_domain_min_types`` different words: the minimum is both, so a
+    short text that repeats a few words is not judged).
+
+    Own count: a book read from the corpus (kind 'db' or 'library') is part
+    of what the lexicon counted, once, tokenized as ``_book_tokens`` does
+    (the lexicon's counting reads text the same way), so its own
+    occurrences are taken away before asking whether the lexicon knows the
+    word. This is the same assumption as the book-repeat rule
+    (``freq <= present`` is "only this book", ``core.book_repeat_value``)
+    and the real-word check (``own = present`` unless kind is 'file'). A
+    'file' is never taken away from, even one that happens to sit inside
+    the corpus library: that can only understate the unknown share (the
+    safe side for a gate that drops findings).
+    """
+    own = book.kind != 'file'
+    words = types = unknown = 0
+    for w, c in present.items():
+        if len(w) < 3 or is_abbrev(w):
+            continue
+        words += c
+        types += 1
+        if freq.get(w, 0) - (c if own else 0) <= cfg.rare_max:
+            unknown += c
+    share = unknown / words if words else 0.0
+    limit = float(cfg.book_domain_max)
+    return {'words': words, 'types': types, 'unknown': unknown,
+            'share': round(share, 4), 'max': limit,
+            'out': (words >= cfg.book_domain_min_words
+                    and types >= cfg.book_domain_min_types
+                    and share > limit)}
+
+
+def domain_lexicon_problem(freq, cfg, out_dir):
+    """Why the lexicon cannot tell what is outside its domain, or None.
+
+    The share of unknown words is only meaningful against a lexicon that
+    knows a language. Two cases make nearly every word of a normal book
+    look unknown, so the gate would drop the findings of an ordinary book:
+    a lexicon with too few words in all (``book_domain_min_lexicon``;
+    'small'), and one built partial under ``--allow-unread``
+    ('partial': a missing part of the library is missing words). Returns
+    ``'small'`` / ``'partial'``; the gate then does not apply.
+    """
+    if core.accepted_gaps(out_dir, 'lexicon'):
+        return 'partial'
+    if sum(freq.values()) < cfg.book_domain_min_lexicon:
+        return 'small'
+    return None
 
 
 def _resolve_splits(errors, split_cands, freq, lex, seq_counts, scope):
@@ -355,7 +441,9 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     ctx_stats = ReadStats()
     lex, errors, split_cands, present, lsource = detect_in_book(
         book, freq, cfg, out_dir, progress=say)
-    rw_found = None
+    rw_found = alt_counts = None
+    alt_cands = _alt_candidates(lex, errors, freq) \
+        if int(cfg.alternatives or 0) > 0 else None
     if cfg.real_word:
         bad = realword.check_config(cfg)
         if bad:
@@ -390,15 +478,36 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             n2, n3 = realword.needs(_real_word_items(
                 book, lex, errors, _covered(pre_joins, ())))
             rw_need = (n2, n3, book.doc)
+        if alt_cands is not None:
+            # the alternatives' n-grams, counted in the same pass and, like
+            # the real-word ones, without the book's own rows
+            items = [(prev, w, nxt, [c[0] for c in alt_cands(w)])
+                     for _, _, w, prev, nxt, _ in pre_occ]
+            a2, a3 = alternatives.needs(items)
+            rw_need = ((rw_need[0] | a2, rw_need[1] | a3, book.doc)
+                       if rw_need else (a2, a3, book.doc))
+            if cfg.alt_rerank:
+                # a reranked suggestion is verified like any other
+                for prev, _, nxt, cs in items:
+                    for x in cs:
+                        if prev:
+                            ctx_pairs.add((prev, x))
+                        if nxt:
+                            ctx_pairs.add((x, nxt))
+                        need.add(x)
         say('[book] אימות הקשר מול כל המאגר — זה השלב הארוך בסריקת ספר בודד')
         ctx_counts, lc, seq_counts, rw_counts = verify_context(
             spec, cfg, ctx_pairs, {book.doc: need}, seqs, progress=say,
             stats=ctx_stats, rw_need=rw_need)
         if rw_need is not None:
-            rw_found = realword.Counts(
+            found = realword.Counts(
                 rw_counts[0], rw_counts[1], rw_need[0], rw_need[1],
                 {'corpus': spec, 'built': time.strftime('%Y-%m-%d %H:%M')})
-            realword.save_counts(out_dir, book.doc, rw_found)
+            if cfg.real_word:
+                rw_found = found
+                realword.save_counts(out_dir, book.doc, rw_found)
+            if alt_cands is not None:
+                alt_counts = found
         local_counts = Counter({w: c for (d, w), c in lc.items()
                                 if d == book.doc})
     else:
@@ -430,8 +539,21 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     base = {'tanach': 0, 'origin': book.origin, 'source': book.title,
             'doc': book.doc}
     rows = []
+    # the lexicon counted the book too, unless it is a file from outside
+    own = present if book.kind != 'file' else None
     for unit, ref, w, prev, nxt, snip in occ:
         fw, errtype, sugg, fs, score = errors[w]
+        ranked = None
+        if alt_cands is not None and alternatives.eligible(errtype):
+            # relative to the suggestion this finding actually carries (no
+            # alternatives if the edit-1 rule would not have offered it)
+            cands = alternatives.anchor(alt_cands(w), sugg)
+            ranked = alternatives.rank(lex, alt_counts, prev, w, nxt, cands,
+                                     cfg.alternatives, own) or None
+            new = (alternatives.reranked(w, cands, ranked, lex)
+                   if cfg.alt_rerank else None)
+            if new is not None:
+                errtype, sugg, fs, score = new
         hits = 0
         if core.uses_context(errtype):
             hits = (ctx_counts.get((prev, sugg), 0)
@@ -455,6 +577,8 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
                                            split_scope=scope),
             'ref': ref, 'unit': unit, 'snippet': snip,
         })
+        if ranked:                  # off: the row is as it always was
+            rows[-1]['alternatives'] = ranked
     for unit, ref, w, fw, sugg, fs, snip in ocr:
         rows.append({
             **base, 'word': w, 'errtype': 'ocr_profile', 'suggestion': sugg,
@@ -471,16 +595,47 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
                                     _covered(joins, ocr))
         rows.extend(real_word.pop('rows'))
 
+    domain = None
+    dropped_words = set()   # words whose every finding the gate left out
+    if domain_on(cfg):
+        domain = book_domain(book, freq, present, cfg)
+        refused = domain_lexicon_problem(freq, cfg, out_dir)
+        if refused:     # measured, but not enough of a yardstick to act on
+            domain['out'] = False
+            domain['refused'] = refused
+            domain['lexicon_words'] = sum(freq.values())
+            domain['lexicon_min'] = cfg.book_domain_min_lexicon
+        left_out = Counter()
+        if domain['out']:
+            kept = []
+            for r in rows:
+                if r['errtype'] in DOMAIN_TYPES:
+                    left_out[r['errtype']] += 1
+                    dropped_words.add(r['word'])
+                else:
+                    kept.append(r)
+            rows = kept
+            dropped_words -= {r['word'] for r in rows}
+            if real_word is not None:    # its summary counts what is shown
+                n_rw = left_out.get(realword.ERRTYPE, 0)
+                real_word['hints'] -= n_rw
+                real_word['domain_left_out'] = n_rw
+        domain['left_out'] = dict(left_out)
+        say(book_domain_message(book.title, domain))
+
     space_rows = [{
         'part1': p1, 'part2': p2, 'joined': j, 'join_freq': jf,
         'origin': book.origin, 'source': book.title, 'ref': ref,
         'unit': unit, 'doc': book.doc, 'snippet': snip,
     } for unit, ref, p1, p2, j, jf, snip in joins]
 
+    # a split of a word whose finding the gate left out is not shown either,
+    # and no word is primary for a missing_space finding that is gone
+    gone = 'missing_space' in left_out_types(domain)
     split_alts = [{'word': w, 'parts': p, 'observed': o, 'expected': e,
                    'chosen': bool(ch),
-                   'is_primary': errors[w][1] == 'missing_space'}
-                  for w, lst in alts.items()
+                   'is_primary': errors[w][1] == 'missing_space' and not gone}
+                  for w, lst in alts.items() if w not in dropped_words
                   for p, o, e, ch in lst]
 
     # same rule as a full scan: accepted is not complete
@@ -518,12 +673,60 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     }
     if real_word is not None:       # off: the result is as it always was
         out['real_word'] = real_word
+    if domain is not None:          # likewise
+        out['domain'] = domain
     return out
+
+
+def left_out_types(domain):
+    """The finding types the domain gate left out (empty: it did not act)."""
+    return set((domain or {}).get('left_out') or ())
+
+
+def book_domain_message(title, domain):
+    """The Hebrew line that reports the domain gate's verdict on a book."""
+    share, limit = domain['share'], domain['max']
+    if domain.get('refused'):
+        if domain['refused'] == 'partial':
+            why = 'המילון נבנה חלקית (--allow-unread)'
+        else:
+            why = (f'המילון קטן מדי: {domain["lexicon_words"]:,} מילים, '
+                   f'נדרשים לפחות {domain["lexicon_min"]:,} (book_domain_min_lexicon)')
+        return (f'[book] שער התחום (book_domain_max) לא הופעל: {why}; '
+                f'כל הממצאים נשמרים (השיעור המדוד: {share:.1%})')
+    if not domain['out']:
+        why = (f'מעט מדי מילים למדידה ({domain["words"]:,} מופעים, {domain["types"]:,} שונות)'
+               if share > limit else 'בתוך תחום המילון')
+        return (f'[book] מילים שהמילון אינו מכיר: {share:.1%} '
+                f'(סף {limit:.0%}) — {why}')
+    n = sum(domain['left_out'].values())
+    return (f'[book] «{title}» מחוץ לתחום המילון: {share:.1%} ממילותיו '
+            f'(3 אותיות ומעלה) כמעט אינן במאגר, יותר מ-{limit:.0%} '
+            f'(book_domain_max). {n:,} ממצאים שנשענים על נדירות המילה '
+            f'הושמטו; ממצאי אותיות סופיות, פרופיל OCR ורווחים מיותרים '
+            f'נשארו')
 
 
 # ---------------------------------------------------------------------------
 # optional: real-word errors judged by the neighbouring words
 # ---------------------------------------------------------------------------
+
+def _alt_candidates(lex, errors, freq):
+    """``word -> candidates`` (:func:`magiah.alternatives.candidates`) of
+    the findings that may carry alternatives, computed once per word; no
+    candidates for any other finding."""
+    probe, memo = core.edit1_probe(lex), {}
+
+    def get(w):
+        cs = memo.get(w)
+        if cs is None:
+            cs = memo[w] = (alternatives.candidates(
+                w, freq.get(w, 0), lex, probe)
+                if w in errors and alternatives.eligible(errors[w][1])
+                else [])
+        return cs
+    return get
+
 
 def _covered(joins, ocr):
     """``(unit, word)`` of the tokens an extra-space join or an OCR-profile
