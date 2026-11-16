@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Abbreviations typed with a geresh for gershayim or the reverse
-(cfg.swapped_quotes): off by default, and then nothing changes."""
+(cfg.swapped_quotes): on by default; 0 turns it off, and then nothing
+changes."""
 import tempfile
 import unittest
 
@@ -37,10 +38,36 @@ def evaluate(w, freq=None, **kw):
 
 class SwappedQuotes(unittest.TestCase):
 
-    def test_off_by_default(self):
-        self.assertEqual(Config().swapped_quotes, 0)
+    def test_off_when_disabled(self):
         for w in list(RARE) + list(COMMON):
-            self.assertEqual(evaluate(w), {}, w)
+            self.assertEqual(evaluate(w, swapped_quotes=0), {}, w)
+
+    def test_on_by_default(self):
+        self.assertEqual(Config().swapped_quotes, 1)
+        self.assertEqual(evaluate('כגב\'ד')['swapped_quotes'][1], 'כגב"ד')
+        self.assertEqual(evaluate('כגב\'ד'),
+                         evaluate('כגב\'ד', swapped_quotes=1))
+
+    def test_cli_default_and_disable(self):
+        # --swapped-quotes is unset by default (None keeps the Config
+        # default, on); an explicit 0 turns it off
+        self.assertIn('swapped_quotes', cli.TUNABLE)
+        self.assertEqual(Config.from_run_config({}).swapped_quotes, 1)
+        self.assertEqual(
+            Config.from_run_config({'swapped_quotes': 0}).swapped_quotes, 0)
+
+    def test_edges(self):
+        self.assertEqual(evaluate('', swapped_quotes=1), {})
+        self.assertEqual(evaluate('\'', swapped_quotes=1), {})
+        # nikud-bearing token: not in the lexicon form, no finding
+        self.assertEqual(evaluate('כְגב\'ד', swapped_quotes=1), {})
+
+    def test_other_outputs_unaffected(self):
+        # lost_quotes (a rare no-mark sequence) is the same on or off
+        freq = {**COMMON, **RARE, 'כגבד': 1}
+        on = evaluate('כגבד', freq, swapped_quotes=1)
+        off = evaluate('כגבד', freq, swapped_quotes=0)
+        self.assertEqual(on, off)
 
     def test_geresh_for_gershayim(self):
         rec = evaluate('כגב\'ד', swapped_quotes=1)['swapped_quotes']

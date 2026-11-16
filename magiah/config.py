@@ -52,7 +52,7 @@ class Config:
                              # default until measured on a full corpus
     loanword_min_len: int = 6
     loanword_penalty: float = 1.5
-    swapped_quotes: int = 0  # 1 = on: an abbreviation typed with a geresh
+    swapped_quotes: int = 1  # 1 = on (default; 0 = off): an abbreviation typed with a geresh
                              # for gershayim or the reverse (רמב'ם) whose
                              # form with that mark swapped is frequent —
                              # same bar as lost_quotes (written form at most
