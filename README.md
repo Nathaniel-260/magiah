@@ -105,6 +105,11 @@ common failure modes of naive edit-distance flagging:
   well with the [hspell](http://hspell.ivrix.org.il/)-derived inflected word
   lists from [hebrew_wordlists](https://github.com/eyaler/hebrew_wordlists)
   (AGPL-licensed data, hence downloaded separately rather than bundled).
+* **Optional extra lexicon** (`magiah extra`, then `--extra-lexicon NAME`;
+  off by default) — a word count built from your own documents, for a book
+  whose register the corpus does not cover (modern Hebrew, a technical
+  field). Suppression only, like the whitelist; see
+  [Extra lexicons](#extra-lexicons-from-your-own-documents).
 * **Your review decisions** — words you rejected in the review interface are
   automatically excluded from every future scan.
 
@@ -298,8 +303,145 @@ judged until the next corpus-scope scan. `real_word/` holds one file per book
 scanned this way and is never pruned; deleting it only means the next
 book-scope scan needs a `--book-verify-ctx` rescan first.
 
+`--alternatives N` (off by default) lists, for each edit-1 / spelling-variant
+finding, up to N of the corrections the edit-1 rule accepted for the word
+(`alternatives` in the finding; in the review UI, the drawer's "הצעות
+חלופיות"). With `--book-verify-ctx` they are ranked per occurrence by the
+same bigram/trigram model as `--book-real-word`, counted in the same pass
+without the book's own rows (`by: context`); with no counts, no neighbour,
+or no candidate ever seen beside these neighbours, they keep the detector's
+order (`by: frequency`). The finding's suggestion does not change unless
+`--alt-rerank 1` is also given: the suggestion then becomes the alternative
+the context ranks first, but only where the context prefers it to the
+detector's own choice by at least 2 (log10 odds, `alternatives.MARGIN`);
+otherwise the suggestion stays, and a finding whose candidates do not include
+its suggestion gets no alternatives. The reranked suggestion is verified like
+any other, so `--alt-rerank` also asks the context pass to count the
+neighbour pairs of every candidate (on a synthetic book about 1.9x the
+pairs of a plain scan; the pass reads the corpus once either way, so the
+added time was within noise there).
+
+`--book-domain-max SHARE` (off by default; 0.05 is a measured value) is a
+**domain gate** for the whole book. The lexicon knows the language most of
+the library is written in; a book in modern Hebrew, another language or another spelling
+system is full of words it has never seen, and the rarity rules then flag
+correct words. Before reporting, the scan counts the book's words of 3+
+letters (abbreviations aside) that the lexicon has at most `rare_max` times
+apart from the book itself. When more than SHARE of them are unknown (and
+the book has at least `book_domain_min_words`, 200, such word occurrences
+**and** at least `book_domain_min_types`, 100, different ones: a short text
+that repeats a few words is not judged), the
+findings that rest on a word being rare are left out — `edit1_*`,
+`spelling_variant`, `missing_space`, `lost_quotes` and `real_word` — and
+the scan says so in its log and in the result's `domain` entry (the share
+and how many findings of each kind were left out). Final-letter findings,
+the book's OCR profile and extra spaces stay. The foreign-line skip
+(`foreign_ratio`) still works line by line inside any book; the gate is
+the book-level decision on top of it. On the Otzaria library lexicon,
+99% of the books of halacha, Talmud, responsa and Mishnah measure under 2%;
+the 0.6% of library books above 5% are mostly Aramaic targums, plus the
+Judeo-Arabic and Syriac translations and a few piyyut and midrash collections;
+digital modern-Hebrew books measure 6-16%.
+
+The gate refuses to apply, says so in the log and keeps every finding
+(`domain.refused` is `small` or `partial`, `out` is false) when the lexicon
+cannot serve as a yardstick: it counted fewer than `book_domain_min_lexicon`
+(1,000,000) words in all, or it was built partial under `--allow-unread`.
+A near-empty lexicon knows no word, so every ordinary book would look
+foreign. A book read from the corpus (`db`/`library`) has its own
+occurrences taken away from the lexicon's count first, the same rule as the
+book-repeat and real-word checks; a `file` has none taken away. When the gate
+acts, split alternatives of left-out `missing_space` findings are left out
+too, and `real_word.hints` counts what is still shown.
+
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
+
+#### Extra lexicons from your own documents
+
+The corpus is the dictionary, so a book in modern Hebrew (or in a field the
+library does not cover) gets many ordinary words flagged as rare. An **extra
+lexicon** counts the words of documents you choose:
+
+```bash
+magiah extra --name modern --from "C:\modern texts" --out results  # a folder (with subfolders)
+magiah extra --name modern --from a.docx --from b.epub --out results  # or files
+magiah extra --out results                    # list the extra lexicons
+magiah extra --remove modern --out results    # delete one
+magiah book --book "C:\new book.txt" --extra-lexicon modern --out results
+```
+
+Readable: `.txt` (UTF-8, UTF-16 with a BOM, or Windows-1255), `.html` /
+`.htm` / `.xhtml`, `.docx`, `.epub` — standard library only. **PDF is not
+read** (that needs a third-party library): a PDF named on the command line is
+refused, PDFs inside a folder are skipped and counted. The text is tokenized
+exactly like the corpus. Building a name again replaces it; the lexicon is
+`extra_<name>.pkl` in the output folder, with the list of what it was built
+from.
+
+A scan that selects it (`--extra-lexicon NAME`, repeatable; `detect`, `all`
+and `book`) never flags a word the extra lexicon holds at least
+`--extra-min` (3) times — fewer could be a typo in the documents. It is
+**suppression only**, like `--whitelist`: it never creates a finding and is
+never a correction candidate, and the real-word check is unchanged. The
+selection is remembered in `run_config.json` like the whitelist;
+`--no-extra-lexicon` clears it. In the web UI it is the "מילונים נוספים"
+field of the scan panel (one name per line).
+
+**Select it for the books that need it, not always.** Every modern word it
+adds is a word an error can turn into without being seen: measured on
+rabbinic text with injected errors, an extra lexicon built from 1,000 modern
+Hebrew books hid 2.2% of the errors that were caught without it (one built
+from 100 books: 0.2%), while on other modern books it cut the findings per
+1,000 words from 29.3 to 4.3 (11.3 with 100 books). The larger the extra
+lexicon, the more it hides.
+**Check a correction after the fact** (`magiah guard`):
+
+```bash
+magiah guard --before page.ocr.txt --after page.fixed.txt --out results
+```
+
+Lines the two texts up word by word and judges every change by the corpus
+frequencies of `--out`'s lexicon: a common word (>= `common_min`) that
+became a rare or unknown one (<= `rare_max`) is `suspect` — the corrector
+(a person, an OCR post-corrector, a language model) probably broke a good
+word; the reverse is `supported`; anything else `neutral`. A split, join,
+insertion or deletion is one unit, judged by its least frequent word; but
+inside such a unit, words that clearly correspond (the same word with a
+letter or two changed) are paired first and judged one by one, so a real
+`common -> rare` slip is not hidden by a split or join next to it.
+Prints the suspect changes (`--guard-all`: every change) as tab-separated
+`line, verdict, old, new, f_old, f_new`, then a count. Writes nothing (a
+`--out` that does not exist is not created). The exit code is 0 even when
+suspects are found: it is 1 only when the check could not run (a missing,
+empty, corrupt or partial lexicon, an unreadable file, or two texts so
+different and repetitive that comparing them would take unreasonably
+long -- split them). Read the printed list, not the exit code. It
+sees only one kind of damage: a common word turned into another common
+word (a real-word slip) is `neutral`, and `supported` does not mean
+correct.
+
+Two more things to know:
+
+* **`extra_min` masking.** Because a word counts as known once it appears
+  `--extra-min` (3) times, a *typo that appears three or more times in your
+  own documents is hidden too*: the extra lexicon cannot tell a repeated
+  typo from a real word. Raise `--extra-min` (or clean the documents) if the
+  documents are not carefully proofread. Names that differ only by case are
+  one lexicon (`Modern` is `modern`), because Windows file names are
+  case-insensitive.
+* **Trust the output folder.** `extra_<name>.pkl` (like `lexicon.pkl` and
+  the other results) is a Python pickle, and loading a pickle can run code.
+  Only use an output folder, and only copy extra lexicons, that come from
+  you or from someone you trust.
+
+Build limits: a file that yields no Hebrew words (for example a `.docx`
+without `word/document.xml`) is reported with a warning and counted in the
+summary; a build in which no file yields any word writes nothing. A `.docx`
+or `.epub` whose text expands past 200 MB (a decompression bomb) stops the
+build with an error naming the file; nothing is written. `.epub` and `.html`
+content is read in the encoding it declares (`encoding=` / `charset=`),
+falling back to UTF-8 and then Windows-1255.
 
 **Review the findings** in your browser:
 
@@ -412,6 +554,7 @@ titles, references and source-repository names from Otzaria's schema. Use
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
 | `coverage_<stage>.json` | what each stage actually read — a partial read stops the stage and is recorded here; for a partial output accepted under `--allow-unread` also `accepted`, the rows not read and where they are |
+| `extra_<name>.pkl` | an extra lexicon built by `magiah extra` (word counts + what they were built from) |
 | `run_state/` | how the latest runs ended (`scan.json`, `book.json`) — read by the review UI |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |
 

@@ -68,6 +68,34 @@ class Config:
     real_word_rep: int = 3   # ... a word the book uses this often (>= 1),
                              # and more often than the suggestion, is its
                              # own spelling
+    alternatives: int = 0    # book scan: list up to this many corrections
+                             # for each edit-1 / spelling-variant finding,
+                             # ranked by its neighbours (magiah.alternatives;
+                             # the counts come with --book-verify-ctx) or
+                             # else in the detector's order. Adds a field
+                             # only. 0 (or less): off
+    alt_rerank: int = 0      # 1 = on (with alternatives): the finding's
+                             # suggestion becomes the alternative the
+                             # neighbours rank first (by at least
+                             # alternatives.MARGIN)
+    book_domain_max: float = 0.0  # book scan: a book with more than this
+                             # share of its words (3+ letters, not
+                             # abbreviations) rare in the lexicon apart from
+                             # the book itself (<= rare_max) is outside the
+                             # lexicon's domain (modern Hebrew, another
+                             # language or spelling): its frequency-based
+                             # findings (book_scan.DOMAIN_TYPES) are left out
+                             # the result says so. 0 (or less): off
+    book_domain_min_words: int = 200  # ... judged only on books with at
+                             # least this many such word OCCURRENCES ...
+    book_domain_min_types: int = 100  # ... and this many DIFFERENT such
+                             # words (a short repetitive text reaches the
+                             # first without being a sample of a language)
+    book_domain_min_lexicon: int = 1000000  # the gate applies only when the
+                             # lexicon counted at least this many words in
+                             # all (a near-empty lexicon knows no word: every
+                             # book would look foreign) and was not built
+                             # partial (--allow-unread); 0: no size floor
     rw_corpus: int = 0       # corpus scan (1 = on): weigh each edit-1 /
                              # spelling-variant correction against the
                              # original between the same neighbours
@@ -88,6 +116,15 @@ class Config:
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
                              # flagged (suppression only — never creates flags)
+    extra_lexicon: tuple = ()  # names of extra lexicons (magiah.extralex,
+                             # built from the user's own documents); their
+                             # words are never flagged, like the whitelist.
+                             # Suppression only, never a suggestion. Empty:
+                             # off. Measured to hide some real errors in
+                             # rabbinic text: select per book, not always
+    extra_min: int = 3       # ... a word counts as known once an extra
+                             # lexicon holds it this often (rare_max + 1:
+                             # a typo in the documents is not enough)
     allow_unread: int = 0    # unreadable input rows a run may skip; the output
                              # is then marked partial (0: none — stop instead)
 

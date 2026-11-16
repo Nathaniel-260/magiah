@@ -888,9 +888,14 @@ function altList(word, alts) {
   const box = el("div", { class: "alt-list" });
   for (const a of alts) {
     if (!a || typeof a !== "object") continue;
-    const by = a.by === "tanach" ? "נוסח המקרא" : "הגלאי";
+    // context / frequency: the book scan's ranked alternatives
+    const by = a.by === "tanach" ? "נוסח המקרא"
+      : a.by === "context" ? "לפי המילים הסמוכות"
+      : a.by === "frequency" ? "לפי השכיחות" : "הגלאי";
     const parts = [];
-    if (a.by === "tanach") {
+    if (a.ctx_hits != null && (a.by === "context" || a.by === "frequency")) {
+      parts.push("נראתה ליד המילים הסמוכות: " + a.ctx_hits);
+    } else if (a.by === "tanach") {
       if (a.ref) parts.push(a.ref);
       if (a.works != null) parts.push("ספרים: " + a.works);
       if (a.independent_sources != null) parts.push("מקורות בלתי תלויים: " + a.independent_sources);
@@ -2824,7 +2829,7 @@ function renderScanForm() {
     const row = el("div", { class: "scan-field", dataset: { key: f.key, ftype: f.type } });
     row.append(el("span", { class: "sf-label" }, f.hebrew));
     if (f.type === "list") {
-      const ta = el("textarea", { placeholder: "נתיב קובץ בכל שורה…" });
+      const ta = el("textarea", { placeholder: f.key === "extra_lexicon" ? "שם מילון בכל שורה…" : "נתיב קובץ בכל שורה…" });
       ta.value = Array.isArray(f.value) ? f.value.join("\n") : "";
       row.append(el("span"), ta);
     } else {
