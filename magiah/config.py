@@ -62,6 +62,16 @@ class Config:
     real_word_rep: int = 3   # ... a word the book uses this often (>= 1),
                              # and more often than the suggestion, is its
                              # own spelling
+    alternatives: int = 0    # book scan: list up to this many corrections
+                             # for each edit-1 / spelling-variant finding,
+                             # ranked by its neighbours (magiah.alternatives;
+                             # the counts come with --book-verify-ctx) or
+                             # else in the detector's order. Adds a field
+                             # only. 0 (or less): off
+    alt_rerank: int = 0      # 1 = on (with alternatives): the finding's
+                             # suggestion becomes the alternative the
+                             # neighbours rank first (by at least
+                             # alternatives.MARGIN)
     book_domain_max: float = 0.0  # book scan: a book with more than this
                              # share of its words (3+ letters, not
                              # abbreviations) rare in the lexicon apart from

@@ -58,7 +58,7 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core, extralex, rankstats, realword
+from . import alternatives, core, extralex, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
@@ -441,7 +441,9 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     ctx_stats = ReadStats()
     lex, errors, split_cands, present, lsource = detect_in_book(
         book, freq, cfg, out_dir, progress=say)
-    rw_found = None
+    rw_found = alt_counts = None
+    alt_cands = _alt_candidates(lex, errors, freq) \
+        if int(cfg.alternatives or 0) > 0 else None
     if cfg.real_word:
         bad = realword.check_config(cfg)
         if bad:
@@ -476,15 +478,36 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
             n2, n3 = realword.needs(_real_word_items(
                 book, lex, errors, _covered(pre_joins, ())))
             rw_need = (n2, n3, book.doc)
+        if alt_cands is not None:
+            # the alternatives' n-grams, counted in the same pass and, like
+            # the real-word ones, without the book's own rows
+            items = [(prev, w, nxt, [c[0] for c in alt_cands(w)])
+                     for _, _, w, prev, nxt, _ in pre_occ]
+            a2, a3 = alternatives.needs(items)
+            rw_need = ((rw_need[0] | a2, rw_need[1] | a3, book.doc)
+                       if rw_need else (a2, a3, book.doc))
+            if cfg.alt_rerank:
+                # a reranked suggestion is verified like any other
+                for prev, _, nxt, cs in items:
+                    for x in cs:
+                        if prev:
+                            ctx_pairs.add((prev, x))
+                        if nxt:
+                            ctx_pairs.add((x, nxt))
+                        need.add(x)
         say('[book] אימות הקשר מול כל המאגר — זה השלב הארוך בסריקת ספר בודד')
         ctx_counts, lc, seq_counts, rw_counts = verify_context(
             spec, cfg, ctx_pairs, {book.doc: need}, seqs, progress=say,
             stats=ctx_stats, rw_need=rw_need)
         if rw_need is not None:
-            rw_found = realword.Counts(
+            found = realword.Counts(
                 rw_counts[0], rw_counts[1], rw_need[0], rw_need[1],
                 {'corpus': spec, 'built': time.strftime('%Y-%m-%d %H:%M')})
-            realword.save_counts(out_dir, book.doc, rw_found)
+            if cfg.real_word:
+                rw_found = found
+                realword.save_counts(out_dir, book.doc, rw_found)
+            if alt_cands is not None:
+                alt_counts = found
         local_counts = Counter({w: c for (d, w), c in lc.items()
                                 if d == book.doc})
     else:
@@ -516,8 +539,21 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
     base = {'tanach': 0, 'origin': book.origin, 'source': book.title,
             'doc': book.doc}
     rows = []
+    # the lexicon counted the book too, unless it is a file from outside
+    own = present if book.kind != 'file' else None
     for unit, ref, w, prev, nxt, snip in occ:
         fw, errtype, sugg, fs, score = errors[w]
+        ranked = None
+        if alt_cands is not None and alternatives.eligible(errtype):
+            # relative to the suggestion this finding actually carries (no
+            # alternatives if the edit-1 rule would not have offered it)
+            cands = alternatives.anchor(alt_cands(w), sugg)
+            ranked = alternatives.rank(lex, alt_counts, prev, w, nxt, cands,
+                                     cfg.alternatives, own) or None
+            new = (alternatives.reranked(w, cands, ranked, lex)
+                   if cfg.alt_rerank else None)
+            if new is not None:
+                errtype, sugg, fs, score = new
         hits = 0
         if core.uses_context(errtype):
             hits = (ctx_counts.get((prev, sugg), 0)
@@ -541,6 +577,8 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
                                            split_scope=scope),
             'ref': ref, 'unit': unit, 'snippet': snip,
         })
+        if ranked:                  # off: the row is as it always was
+            rows[-1]['alternatives'] = ranked
     for unit, ref, w, fw, sugg, fs, snip in ocr:
         rows.append({
             **base, 'word': w, 'errtype': 'ocr_profile', 'suggestion': sugg,
@@ -672,6 +710,23 @@ def book_domain_message(title, domain):
 # ---------------------------------------------------------------------------
 # optional: real-word errors judged by the neighbouring words
 # ---------------------------------------------------------------------------
+
+def _alt_candidates(lex, errors, freq):
+    """``word -> candidates`` (:func:`magiah.alternatives.candidates`) of
+    the findings that may carry alternatives, computed once per word; no
+    candidates for any other finding."""
+    probe, memo = core.edit1_probe(lex), {}
+
+    def get(w):
+        cs = memo.get(w)
+        if cs is None:
+            cs = memo[w] = (alternatives.candidates(
+                w, freq.get(w, 0), lex, probe)
+                if w in errors and alternatives.eligible(errors[w][1])
+                else [])
+        return cs
+    return get
+
 
 def _covered(joins, ocr):
     """``(unit, word)`` of the tokens an extra-space join or an OCR-profile
