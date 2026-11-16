@@ -10,6 +10,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import time
 import unittest
 
 from magiah import cli, guard
@@ -89,6 +90,55 @@ class TestCompare(unittest.TestCase):
                          [('גבלו', 'לחם', 'neutral')])
 
 
+class TestAdjacentRuns(unittest.TestCase):
+
+    LEX = {'שמר': 900, 'שמד': 1, 'אמר': 800, 'ו': 5000, 'אמרו': 700,
+           'כלב': 3, 'בית': 500, 'בבית': 800, 'הכנסת': 600}
+
+    def test_break_inside_a_longer_unit_is_not_masked(self):
+        rows = guard.compare(self.LEX, 'שמר אמר ו טוב\nכלב בית',
+                             'שמד אמרו טבו\nכלבים בית', Config())
+        self.assertEqual(rows[0]['old'], 'שמר')
+        self.assertEqual(rows[0]['new'], 'שמד')
+        self.assertEqual(rows[0]['verdict'], 'suspect')
+        self.assertEqual(rows[0]['line'], 1)
+        self.assertEqual([r['verdict'] for r in rows[1:]],
+                         ['neutral'] * (len(rows) - 1))
+
+    def test_join_next_to_a_break_keeps_both(self):
+        rows = guard.compare(self.LEX, 'שמר בבית הכנסת', 'שמד בביתהכנסת',
+                             Config())
+        self.assertEqual([(r['old'], r['new'], r['verdict']) for r in rows],
+                         [('שמר', 'שמד', 'suspect'),
+                          ('בבית הכנסת', 'בביתהכנסת', 'suspect')])
+
+    def test_plain_join_still_one_unit(self):
+        lex = dict(self.LEX, בביתהכנסת=0)
+        rows = guard.compare(lex, 'בבית הכנסת', 'בביתהכנסת', Config())
+        self.assertEqual([(r['old'], r['verdict']) for r in rows],
+                         [('בבית הכנסת', 'suspect')])
+
+
+class TestPathological(unittest.TestCase):
+
+    def test_one_extra_token_in_a_huge_repetition_is_fast(self):
+        t = time.time()
+        rows = guard.compare({}, 'אאא ' * 60000, 'אאא ' * 59999 + 'ב',
+                             Config())
+        self.assertLess(time.time() - t, 20)
+        self.assertEqual(len(rows), 1)
+
+    def test_too_repetitive_a_difference_is_refused(self):
+        old = guard.MAX_PAIRS
+        guard.MAX_PAIRS = 100000
+        try:
+            with self.assertRaises(guard.GuardError):
+                guard.compare({}, 'ב ' + 'א ' * 3000, 'א ' * 3000 + 'ב',
+                              Config())
+        finally:
+            guard.MAX_PAIRS = old
+
+
 class TestCommand(unittest.TestCase):
 
     def setUp(self):
@@ -147,6 +197,41 @@ class TestCommand(unittest.TestCase):
                                  '--after', self.after)
         self.assertEqual(code, 1)
         self.assertIn('lexicon.pkl', err)
+        self.assertIn('magiah lexicon', err)
+        self.assertNotIn('סריקת ספר', err)
+
+    def test_empty_lexicon_has_its_own_message(self):
+        open(os.path.join(self.out, 'lexicon.pkl'), 'wb').close()
+        code, _, err = self._run('--before', self.before,
+                                 '--after', self.after)
+        self.assertEqual(code, 1)
+        self.assertIn('ריק', err)
+        self.assertNotIn('לא נמצא', err)
+
+    def test_corrupt_lexicon_is_refused_without_a_traceback(self):
+        with open(os.path.join(self.out, 'lexicon.pkl'), 'wb') as f:
+            f.write(b'this is not a pickle')
+        code, _, err = self._run('--before', self.before,
+                                 '--after', self.after)
+        self.assertEqual(code, 1)
+        self.assertIn('פגום', err)
+        self.assertNotIn('Traceback', err)
+
+    def test_nonexistent_out_is_not_created(self):
+        gone = os.path.join(self.tmp, 'nowhere', 'out')
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(['guard', '--out', gone, '--before',
+                             self.before, '--after', self.after])
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(gone))
+        self.assertFalse(os.path.exists(os.path.dirname(gone)))
+
+    def test_exit_code_is_0_even_with_suspects(self):
+        code, out, _ = self._run('--before', self.before,
+                                 '--after', self.after)
+        self.assertEqual(code, 0)
+        self.assertIn('1 suspect', out)
 
     def test_missing_file_is_refused(self):
         code, _, err = self._run('--before', self.before,

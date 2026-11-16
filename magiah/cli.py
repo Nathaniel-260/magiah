@@ -149,7 +149,7 @@ def _run_guard_cmd(args, prev, out_dir):
     """`magiah guard` -- judge every word a correction changed (magiah.guard).
 
     Reads the lexicon of --out; writes nothing, not even run_config.json."""
-    from . import book_scan, guard
+    from . import guard
     if not args.before or not args.after:
         print('יש לציין את שני הקבצים: --before <לפני התיקון> '
               '--after <אחרי התיקון>', file=sys.stderr, flush=True)
@@ -163,7 +163,7 @@ def _run_guard_cmd(args, prev, out_dir):
     try:
         guard.run(out_dir, args.before, args.after, cfg,
                   show_all=args.guard_all)
-    except book_scan.BookScanError as e:
+    except guard.GuardError as e:
         print(str(e), file=sys.stderr, flush=True)
         return 1
     except OSError as e:
@@ -265,6 +265,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     out_dir = os.path.abspath(args.out)
+    if args.command == 'guard':         # writes nothing: no --out is created
+        return _run_guard_cmd(args, _load_run_config(out_dir), out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     if args.command == 'ui':
@@ -273,8 +275,6 @@ def main(argv=None):
         return
 
     prev = _load_run_config(out_dir)
-    if args.command == 'guard':
-        return _run_guard_cmd(args, prev, out_dir)
     spec = _build_spec(args) or (prev and prev['corpus'])
     if spec is None:
         ap.error('no corpus source: use --otzaria, --sqlite or --textdir')
