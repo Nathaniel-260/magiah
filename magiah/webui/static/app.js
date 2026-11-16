@@ -2829,7 +2829,7 @@ function renderScanForm() {
     const row = el("div", { class: "scan-field", dataset: { key: f.key, ftype: f.type } });
     row.append(el("span", { class: "sf-label" }, f.hebrew));
     if (f.type === "list") {
-      const ta = el("textarea", { placeholder: "נתיב קובץ בכל שורה…" });
+      const ta = el("textarea", { placeholder: f.key === "extra_lexicon" ? "שם מילון בכל שורה…" : "נתיב קובץ בכל שורה…" });
       ta.value = Array.isArray(f.value) ? f.value.join("\n") : "";
       row.append(el("span"), ta);
     } else {
