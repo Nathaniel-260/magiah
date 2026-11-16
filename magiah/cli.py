@@ -145,6 +145,33 @@ def _run_book_cmd(args, spec, cfg, out_dir):
     return 0
 
 
+def _run_guard_cmd(args, prev, out_dir):
+    """`magiah guard` -- judge every word a correction changed (magiah.guard).
+
+    Reads the lexicon of --out; writes nothing, not even run_config.json."""
+    from . import guard
+    if not args.before or not args.after:
+        print('יש לציין את שני הקבצים: --before <לפני התיקון> '
+              '--after <אחרי התיקון>', file=sys.stderr, flush=True)
+        return 1
+    cfg = Config.from_run_config(prev['config']) if prev else Config()
+    cfg.allow_unread = args.allow_unread
+    for f in TUNABLE:
+        v = getattr(args, f)
+        if v is not None:
+            setattr(cfg, f, v)
+    try:
+        guard.run(out_dir, args.before, args.after, cfg,
+                  show_all=args.guard_all)
+    except guard.GuardError as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 1
+    except OSError as e:
+        print(f'לא ניתן לקרוא את הקובץ: {e}', file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
 def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -157,7 +184,8 @@ def main(argv=None):
                     'dictionary.')
     ap.add_argument('command',
                     choices=['lexicon', 'calibrate', 'detect', 'locate',
-                             'report', 'review', 'ui', 'all', 'book'])
+                             'report', 'review', 'ui', 'all', 'book',
+                             'guard'])
     bk = ap.add_argument_group(
         'book: scan a single book against the existing lexicon')
     bk.add_argument('--book', metavar='KEY',
@@ -180,6 +208,14 @@ def main(argv=None):
                          'another existing word, judged by the neighbouring '
                          'words; the corpus counts are made by a '
                          '--book-verify-ctx scan and kept for later scans')
+    gd = ap.add_argument_group(
+        'guard: check a corrected text against the lexicon (changes nothing)')
+    gd.add_argument('--before', metavar='FILE',
+                    help='the text before the correction')
+    gd.add_argument('--after', metavar='FILE',
+                    help='the same text after the correction')
+    gd.add_argument('--guard-all', action='store_true',
+                    help='list every change, not only the suspect ones')
     ap.add_argument('--port', type=int, default=None,
                     help='review/ui: local server port '
                          '(default: review 8765, ui 8766)')
@@ -229,6 +265,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     out_dir = os.path.abspath(args.out)
+    if args.command == 'guard':         # writes nothing: no --out is created
+        return _run_guard_cmd(args, _load_run_config(out_dir), out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     if args.command == 'ui':

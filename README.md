@@ -300,6 +300,32 @@ book-scope scan needs a `--book-verify-ctx` rescan first.
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
+**Check a correction after the fact** (`magiah guard`):
+
+```bash
+magiah guard --before page.ocr.txt --after page.fixed.txt --out results
+```
+
+Lines the two texts up word by word and judges every change by the corpus
+frequencies of `--out`'s lexicon: a common word (>= `common_min`) that
+became a rare or unknown one (<= `rare_max`) is `suspect` — the corrector
+(a person, an OCR post-corrector, a language model) probably broke a good
+word; the reverse is `supported`; anything else `neutral`. A split, join,
+insertion or deletion is one unit, judged by its least frequent word; but
+inside such a unit, words that clearly correspond (the same word with a
+letter or two changed) are paired first and judged one by one, so a real
+`common -> rare` slip is not hidden by a split or join next to it.
+Prints the suspect changes (`--guard-all`: every change) as tab-separated
+`line, verdict, old, new, f_old, f_new`, then a count. Writes nothing (a
+`--out` that does not exist is not created). The exit code is 0 even when
+suspects are found: it is 1 only when the check could not run (a missing,
+empty, corrupt or partial lexicon, an unreadable file, or two texts so
+different and repetitive that comparing them would take unreasonably
+long -- split them). Read the printed list, not the exit code. It
+sees only one kind of damage: a common word turned into another common
+word (a real-word slip) is `neutral`, and `supported` does not mean
+correct.
+
 **Review the findings** in your browser:
 
 ```bash
