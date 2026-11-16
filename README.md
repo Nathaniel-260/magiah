@@ -104,6 +104,11 @@ common failure modes of naive edit-distance flagging:
   well with the [hspell](http://hspell.ivrix.org.il/)-derived inflected word
   lists from [hebrew_wordlists](https://github.com/eyaler/hebrew_wordlists)
   (AGPL-licensed data, hence downloaded separately rather than bundled).
+* **Optional extra lexicon** (`magiah extra`, then `--extra-lexicon NAME`;
+  off by default) — a word count built from your own documents, for a book
+  whose register the corpus does not cover (modern Hebrew, a technical
+  field). Suppression only, like the whitelist; see
+  [Extra lexicons](#extra-lexicons-from-your-own-documents).
 * **Your review decisions** — words you rejected in the review interface are
   automatically excluded from every future scan.
 
@@ -333,6 +338,44 @@ too, and `real_word.hints` counts what is still shown.
 > Requires an existing `lexicon.pkl` — i.e. one prior `magiah lexicon` (or
 > `all`) run.
 
+#### Extra lexicons from your own documents
+
+The corpus is the dictionary, so a book in modern Hebrew (or in a field the
+library does not cover) gets many ordinary words flagged as rare. An **extra
+lexicon** counts the words of documents you choose:
+
+```bash
+magiah extra --name modern --from "C:\modern texts" --out results  # a folder (with subfolders)
+magiah extra --name modern --from a.docx --from b.epub --out results  # or files
+magiah extra --out results                    # list the extra lexicons
+magiah extra --remove modern --out results    # delete one
+magiah book --book "C:\new book.txt" --extra-lexicon modern --out results
+```
+
+Readable: `.txt` (UTF-8, UTF-16 with a BOM, or Windows-1255), `.html` /
+`.htm` / `.xhtml`, `.docx`, `.epub` — standard library only. **PDF is not
+read** (that needs a third-party library): a PDF named on the command line is
+refused, PDFs inside a folder are skipped and counted. The text is tokenized
+exactly like the corpus. Building a name again replaces it; the lexicon is
+`extra_<name>.pkl` in the output folder, with the list of what it was built
+from.
+
+A scan that selects it (`--extra-lexicon NAME`, repeatable; `detect`, `all`
+and `book`) never flags a word the extra lexicon holds at least
+`--extra-min` (3) times — fewer could be a typo in the documents. It is
+**suppression only**, like `--whitelist`: it never creates a finding and is
+never a correction candidate, and the real-word check is unchanged. The
+selection is remembered in `run_config.json` like the whitelist;
+`--no-extra-lexicon` clears it. In the web UI it is the "מילונים נוספים"
+field of the scan panel (one name per line).
+
+**Select it for the books that need it, not always.** Every modern word it
+adds is a word an error can turn into without being seen: measured on
+rabbinic text with injected errors, an extra lexicon built from 1,000 modern
+Hebrew books hid 2.2% of the errors that were caught without it (one built
+from 100 books: 0.2%), while on other modern books it cut the findings per
+1,000 words from 29.3 to 4.3 (11.3 with 100 books). The larger the extra
+lexicon, the more it hides.
 **Check a correction after the fact** (`magiah guard`):
 
 ```bash
@@ -358,6 +401,28 @@ long -- split them). Read the printed list, not the exit code. It
 sees only one kind of damage: a common word turned into another common
 word (a real-word slip) is `neutral`, and `supported` does not mean
 correct.
+
+Two more things to know:
+
+* **`extra_min` masking.** Because a word counts as known once it appears
+  `--extra-min` (3) times, a *typo that appears three or more times in your
+  own documents is hidden too*: the extra lexicon cannot tell a repeated
+  typo from a real word. Raise `--extra-min` (or clean the documents) if the
+  documents are not carefully proofread. Names that differ only by case are
+  one lexicon (`Modern` is `modern`), because Windows file names are
+  case-insensitive.
+* **Trust the output folder.** `extra_<name>.pkl` (like `lexicon.pkl` and
+  the other results) is a Python pickle, and loading a pickle can run code.
+  Only use an output folder, and only copy extra lexicons, that come from
+  you or from someone you trust.
+
+Build limits: a file that yields no Hebrew words (for example a `.docx`
+without `word/document.xml`) is reported with a warning and counted in the
+summary; a build in which no file yields any word writes nothing. A `.docx`
+or `.epub` whose text expands past 200 MB (a decompression bomb) stops the
+build with an error naming the file; nothing is written. `.epub` and `.html`
+content is read in the encoding it declares (`encoding=` / `charset=`),
+falling back to UTF-8 and then Windows-1255.
 
 **Review the findings** in your browser:
 
@@ -470,6 +535,7 @@ titles, references and source-repository names from Otzaria's schema. Use
 | `by_source/<origin>/…` | the same reports split per source repository (Otzaria corpora) |
 | `report.db` | everything as a queryable SQLite database |
 | `coverage_<stage>.json` | what each stage actually read — a partial read stops the stage and is recorded here; for a partial output accepted under `--allow-unread` also `accepted`, the rows not read and where they are |
+| `extra_<name>.pkl` | an extra lexicon built by `magiah extra` (word counts + what they were built from) |
 | `run_state/` | how the latest runs ended (`scan.json`, `book.json`) — read by the review UI |
 | `to_send/` | written by the review interface: approved fixes per source repository, ready to send upstream |
 

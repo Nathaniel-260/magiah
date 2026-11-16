@@ -58,7 +58,7 @@ import tempfile
 import time
 from collections import Counter
 
-from . import core, rankstats, realword
+from . import core, extralex, rankstats, realword
 from .book_source import _rel_within, load_book
 from .config import Config
 from .corpus import OTZARIA_DB
@@ -90,8 +90,9 @@ def load_lexicon(out_dir, allow_unread=0):
         return pickle.load(f)
 
 
-def _load_whitelist(cfg, out_dir):
-    """Whitelist files + words rejected everywhere in review (as detect)."""
+def _load_whitelist(cfg, out_dir, progress=None):
+    """Whitelist files + words rejected everywhere in review (as detect)
+    + the selected extra lexicons."""
     words = set()
     for path in (cfg.whitelist or ()):
         try:
@@ -100,6 +101,10 @@ def _load_whitelist(cfg, out_dir):
         except OSError:
             continue
     words.update(core.load_review_rejections(out_dir))
+    try:
+        words |= extralex.known_words(cfg, out_dir, progress)
+    except extralex.ExtraLexiconError as e:
+        raise BookScanError(str(e)) from e
     return words
 
 
@@ -116,7 +121,7 @@ def detect_in_book(book, freq, cfg, out_dir, progress=None):
     Returns ``(lex, errors, split_cands, present, learned_source)``; splits
     are not yet resolved (that needs spaced-sequence evidence).
     """
-    whitelist = _load_whitelist(cfg, out_dir)
+    whitelist = _load_whitelist(cfg, out_dir, progress)
     learned, lsource = core.load_learned(out_dir)
     present = Counter()
     for toks in _book_tokens(book):

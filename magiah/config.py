@@ -100,6 +100,15 @@ class Config:
     n_chunks: int = 24
     whitelist: tuple = ()    # paths of word-list files; listed words are never
                              # flagged (suppression only — never creates flags)
+    extra_lexicon: tuple = ()  # names of extra lexicons (magiah.extralex,
+                             # built from the user's own documents); their
+                             # words are never flagged, like the whitelist.
+                             # Suppression only, never a suggestion. Empty:
+                             # off. Measured to hide some real errors in
+                             # rabbinic text: select per book, not always
+    extra_min: int = 3       # ... a word counts as known once an extra
+                             # lexicon holds it this often (rare_max + 1:
+                             # a typo in the documents is not enough)
     allow_unread: int = 0    # unreadable input rows a run may skip; the output
                              # is then marked partial (0: none — stop instead)
 
