@@ -21,7 +21,8 @@ PIPELINE = {'all': ('lexicon', 'detect', 'locate', 'report')}
 # run_config.json like every setting)
 TUNABLE = ('rare_max', 'common_min', 'part_min', 'join_min', 'ed1_ratio',
            'workers', 'n_chunks', 'rw_corpus', 'par_corpus', 'rank_model',
-           'rank_model_min', 'extra_min', 'alternatives', 'alt_rerank')
+           'rank_model_min', 'extra_min', 'alternatives', 'alt_rerank',
+           'swapped_quotes')
 
 
 def _build_spec(args):

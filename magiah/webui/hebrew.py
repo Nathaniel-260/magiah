@@ -101,6 +101,15 @@ ERRTYPES = {
             'שהצורה עם גרשיים נפוצה מאוד. לדוגמה: "רמבם" שצריך להיות '
             '"רמב"ם".',
     },
+    'swapped_quotes': {
+        'hebrew': 'גרש במקום גרשיים',
+        'short': 'ראשי תיבות עם גרש במקום גרשיים או להפך (רמב׳ם→רמב"ם)',
+        'explanation':
+            'ראשי תיבות שנכתבו עם גרש במקום גרשיים, או עם גרשיים במקום '
+            'גרש. המערכת מזהה שהצורה שנכתבה נדירה, בעוד שאותה צורה עם '
+            'הסימן השני נפוצה מאוד. לדוגמה: "רמב׳ם" שצריך להיות '
+            '"רמב"ם". פועל כברירת מחדל; מכבים עם swapped_quotes=0.',
+    },
     'ocr_profile': {
         'hebrew': 'שגיאת סריקה (OCR)',
         'short': 'בלבול אותיות שיטתי האופייני לספר סרוק מסוים (למשל ד↔ר)',
@@ -160,8 +169,8 @@ ERRTYPES = {
 ERRTYPE_ORDER = [
     'edit1_sub', 'edit1_ins', 'edit1_del', 'edit1_swap', 'missing_space',
     'extra_space', 'spelling_variant', 'final_midword', 'nonfinal_end',
-    'lost_quotes', 'ocr_profile', 'real_word', 'tanach_edition',
-    'tanach_match', 'tokdiag',
+    'lost_quotes', 'swapped_quotes', 'ocr_profile', 'real_word',
+    'tanach_edition', 'tanach_match', 'tokdiag',
 ]
 
 # ---------------------------------------------------------------------------
@@ -590,6 +599,14 @@ CONFIG_LABELS = {
     'loanword_penalty': {
         'hebrew': 'הנמכת מילה לועזית (loanword_penalty)',
         'explanation': 'בכמה יורד הציון. ברירת מחדל: 1.5.',
+    },
+    'swapped_quotes': {
+        'hebrew': 'גרש במקום גרשיים (swapped_quotes)',
+        'explanation':
+            'ראשי תיבות נדירים שהחלפת הגרש בגרשיים (או להפך) נותנת צורה '
+            'נפוצה מאוד — מדווחים כ"גרש במקום גרשיים" עם הצורה הנפוצה '
+            'כהצעה. אותם ספים כמו "גרשיים חסרים". ברירת מחדל: 1 (פעיל). '
+            '0 = כבוי.',
     },
     'ocr_rare_max': {
         'hebrew': 'נדירות לסריקת OCR (ocr_rare_max)',

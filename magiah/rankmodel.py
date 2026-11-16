@@ -50,7 +50,7 @@ def _et(r):
     return str(r.get('errtype') or '')
 
 
-_STRUCT = ('nonfinal_end', 'final_midword', 'lost_quotes')
+_STRUCT = ('nonfinal_end', 'final_midword', 'lost_quotes', 'swapped_quotes')
 
 # name -> (Python value of a row dict, SQL expression over a report row)
 FEATURES = {
@@ -80,7 +80,7 @@ FEATURES = {
               "CASE WHEN errtype = 'missing_space' THEN 1.0 ELSE 0.0 END"),
     'structural': (lambda r: 1.0 if _et(r) in _STRUCT else 0.0,
                    "CASE WHEN errtype IN ('nonfinal_end', 'final_midword', "
-                   "'lost_quotes') THEN 1.0 ELSE 0.0 END"),
+                   "'lost_quotes', 'swapped_quotes') THEN 1.0 ELSE 0.0 END"),
     'word_len': (lambda r: min(len(str(r.get('word') or '')), 12) / 12.0,
                  "MIN(LENGTH(COALESCE(word, '')), 12) / 12.0"),
 }

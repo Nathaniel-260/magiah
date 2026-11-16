@@ -52,6 +52,12 @@ class Config:
                              # default until measured on a full corpus
     loanword_min_len: int = 6
     loanword_penalty: float = 1.5
+    swapped_quotes: int = 1  # 1 = on (default; 0 = off): an abbreviation typed with a geresh
+                             # for gershayim or the reverse (רמב'ם) whose
+                             # form with that mark swapped is frequent —
+                             # same bar as lost_quotes (written form at most
+                             # rare_max, swapped form common_min and
+                             # ed1_ratio times more). Only ever adds findings
     ocr_rare_max: int = 5    # profiled books: scan words up to this frequency
     ocr_ratio: int = 20      # ... requiring correction/word frequency ratio
     real_word: int = 0       # book scan (1 = on): also judge common words by
