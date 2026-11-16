@@ -402,6 +402,28 @@ sees only one kind of damage: a common word turned into another common
 word (a real-word slip) is `neutral`, and `supported` does not mean
 correct.
 
+Two more things to know:
+
+* **`extra_min` masking.** Because a word counts as known once it appears
+  `--extra-min` (3) times, a *typo that appears three or more times in your
+  own documents is hidden too*: the extra lexicon cannot tell a repeated
+  typo from a real word. Raise `--extra-min` (or clean the documents) if the
+  documents are not carefully proofread. Names that differ only by case are
+  one lexicon (`Modern` is `modern`), because Windows file names are
+  case-insensitive.
+* **Trust the output folder.** `extra_<name>.pkl` (like `lexicon.pkl` and
+  the other results) is a Python pickle, and loading a pickle can run code.
+  Only use an output folder, and only copy extra lexicons, that come from
+  you or from someone you trust.
+
+Build limits: a file that yields no Hebrew words (for example a `.docx`
+without `word/document.xml`) is reported with a warning and counted in the
+summary; a build in which no file yields any word writes nothing. A `.docx`
+or `.epub` whose text expands past 200 MB (a decompression bomb) stops the
+build with an error naming the file; nothing is written. `.epub` and `.html`
+content is read in the encoding it declares (`encoding=` / `charset=`),
+falling back to UTF-8 and then Windows-1255.
+
 **Review the findings** in your browser:
 
 ```bash

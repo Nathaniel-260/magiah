@@ -162,6 +162,17 @@ def _merge_config(outdir, overrides):
     return cfg
 
 
+def _check_extra_lexicons(outdir, cfg):
+    """A selected extra lexicon that is not there is refused before the scan
+    starts (as the CLI does), not inside the worker."""
+    from .. import extralex
+    for name in cfg.extra_lexicon or ():
+        try:
+            extralex.load(outdir, name)
+        except extralex.ExtraLexiconError as e:
+            raise ValueError(str(e))
+
+
 def calibrate_available(outdir):
     """Calibration learns only from human-reviewed findings (approved or
     fixed in ui_review.db); without them the stage has nothing to learn."""
@@ -197,6 +208,8 @@ def start_scan(outdir, stages=None, config_overrides=None,
         if not os.path.isfile(db):
             raise ValueError(hebrew.SCAN_MESSAGES['db_missing'] + str(db))
     cfg = _merge_config(outdir, config_overrides)
+    if 'detect' in stages:
+        _check_extra_lexicons(outdir, cfg)
     with _lock:
         if _state['state'] == 'running':
             raise ValueError(hebrew.SCAN_MESSAGES['already_running'])
@@ -414,6 +427,7 @@ def start_book_scan(outdir, source, key, config_overrides=None,
         raise ValueError(hebrew.SCAN_MESSAGES['book_no_lexicon'])
     spec = _spec_from_corpus(corpus_overrides)
     cfg = _merge_config(outdir, config_overrides)
+    _check_extra_lexicons(outdir, cfg)
     db_path = spec.get('db') if spec['type'] != 'sqlite' else spec.get('path')
     library_dir = spec.get('path') if spec['type'] in ('hybrid', 'library') \
         else None

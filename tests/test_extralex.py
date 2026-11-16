@@ -8,8 +8,10 @@ import os
 import pickle
 import shutil
 import tempfile
+import time
 import unittest
 import zipfile
+from unittest import mock
 
 from magiah import book_scan, cli, core, extralex
 from magiah.config import Config
@@ -211,6 +213,151 @@ class Store(_Tmp):
             extralex.known_words(Config(extra_lexicon=('none',)), self.out)
 
 
+class Hardening(_Tmp):
+    def zip_with(self, name, members):
+        p = os.path.join(self.root, name)
+        with zipfile.ZipFile(p, 'w', zipfile.ZIP_DEFLATED) as z:
+            for n, data in members.items():
+                z.writestr(n, data)
+        return p
+
+    # --- 1. decompression bomb, html regex ---
+    def test_zip_member_cap_names_the_file_and_writes_nothing(self):
+        good = os.path.join(self.root, 'good.txt')
+        write(good, 'שמרפוט וזלנקה\n')
+        big = os.path.join(self.root, 'big.docx')
+        make_docx(big, [['שמרפוט ' * 400]])
+        with mock.patch.object(extralex, 'MAX_BYTES', 2000):
+            with self.assertRaises(extralex.ExtraLexiconError) as cm:
+                extralex.build(self.out, 't', [good, big])
+        self.assertIn(big, str(cm.exception))
+        self.assertIn('document.xml', str(cm.exception))
+        self.assertEqual(extralex.list_names(self.out), [])
+        self.assertEqual(
+            [n for n in os.listdir(self.out) if n.startswith('extra_')], [])
+
+    def test_zip_total_cap_over_members(self):
+        part = '<html><body><p>' + 'שמרפוט ' * 100 + '</p></body></html>'
+        p = self.zip_with('b.epub', {f'c{i}.xhtml': part for i in range(5)})
+        with mock.patch.object(extralex, 'MAX_BYTES', 2500):
+            with self.assertRaises(extralex.ExtraLexiconError) as cm:
+                extralex.read_document(p)
+        self.assertIn(p, str(cm.exception))
+        # under the cap it is read
+        self.assertEqual(len(extralex.read_document(p)), 5)
+
+    def test_plain_file_cap(self):
+        p = os.path.join(self.root, 'a.txt')
+        write(p, 'שמרפוט ' * 1000)
+        with mock.patch.object(extralex, 'MAX_BYTES', 100):
+            with self.assertRaises(extralex.ExtraLexiconError) as cm:
+                extralex.read_document(p)
+        self.assertIn(p, str(cm.exception))
+
+    def test_unclosed_script_is_linear(self):
+        text = '<p>שמרפוט</p>' + '<script>x ' * 200000 + 'וזלנקה'
+        t0 = time.time()
+        out = extralex._html_text(text)
+        self.assertLess(time.time() - t0, 5)
+        self.assertIn('שמרפוט', out)
+        self.assertNotIn('וזלנקה', out)       # runs to the end, like a browser
+        t0 = time.time()
+        extralex._html_text('<!--' * 200000 + 'x')
+        extralex._html_text('<style ' * 200000)
+        self.assertLess(time.time() - t0, 5)
+
+    def test_html_parts_dropped(self):
+        out = extralex._html_text(
+            'א <SCRIPT>ב</script > ג <!-- ד --> ה <style>ו</style>ז '
+            '<head><title>ח</title></head>ט <header>י</header>')
+        for w in 'אגהזטי':
+            self.assertIn(w, out)
+        for w in 'בדוח':
+            self.assertNotIn(w, out)
+
+    # --- 2. empty files ---
+    def test_zero_token_file_warns_and_all_empty_refuses(self):
+        good = os.path.join(self.root, 'good.txt')
+        write(good, 'שמרפוט וזלנקה\n')
+        nodoc = self.zip_with('nodoc.docx', {'[Content_Types].xml': '<Types/>'})
+        latin = os.path.join(self.root, 'latin.txt')
+        write(latin, 'only latin words here\n')
+        msgs = []
+        rec = extralex.build(self.out, 't', [good, nodoc, latin],
+                             progress=msgs.append)
+        self.assertEqual(rec['empty_files'], [nodoc, latin])
+        warn = [m for m in msgs if 'אזהרה' in m]
+        self.assertEqual(len(warn), 2)
+        self.assertIn(nodoc, warn[0])
+        self.assertIn('אזהרה', extralex.summary(rec, 3))
+        self.assertEqual(rec['tokens'], 2)
+        # nothing at all: refused, and an older lexicon of the name survives
+        before = extralex.load(self.out, 't')
+        with self.assertRaises(extralex.ExtraLexiconError) as cm:
+            extralex.build(self.out, 't', [nodoc, latin])
+        self.assertIn('2', str(cm.exception))
+        self.assertEqual(extralex.load(self.out, 't'), before)
+        with self.assertRaises(extralex.ExtraLexiconError):
+            extralex.build(self.out, 'fresh', [latin])
+        self.assertEqual(extralex.list_names(self.out), ['t'])
+
+    # --- 3. case-insensitive names ---
+    def test_names_differing_by_case_are_one_lexicon(self):
+        a = os.path.join(self.root, 'a.txt')
+        b = os.path.join(self.root, 'b.txt')
+        write(a, 'שמרפוט ' * 3)
+        write(b, 'וזלנקה ' * 3)
+        extralex.build(self.out, 'Modern', [a])
+        rec = extralex.build(self.out, 'MODERN', [b])
+        self.assertEqual(rec['name'], 'modern')
+        self.assertEqual(extralex.list_names(self.out), ['modern'])
+        self.assertEqual(
+            [n for n in os.listdir(self.out) if n.startswith('extra_')],
+            ['extra_modern.pkl'])
+        self.assertEqual(set(extralex.load(self.out, 'mOdErN')['counts']),
+                         {'וזלנקה'})
+        words = extralex.known_words(
+            Config(extra_lexicon=('Modern',)), self.out)
+        self.assertEqual(words, {'וזלנקה'})
+        extralex.remove(self.out, 'MODERN')
+        self.assertEqual(extralex.list_names(self.out), [])
+
+    # --- 4. encodings ---
+    def test_epub_declared_encodings(self):
+        def page(decl, word, enc):
+            return (decl + '<html><body><p>' + word + '</p></body></html>'
+                    ).encode(enc)
+        p = self.zip_with('e.epub', {
+            'a.xhtml': page('<?xml version="1.0" encoding="windows-1255"?>',
+                            'שמרפוט', 'cp1255'),
+            'b.html': page('<head><meta charset="iso-8859-8"></head>',
+                           'וזלנקה', 'iso-8859-8'),
+            'c.xhtml': page('', 'קנדו', 'utf-8'),
+            # declares UTF-8 but is Windows-1255: falls back, not garbage
+            'd.xhtml': page('<?xml version="1.0" encoding="utf-8"?>',
+                            'טרבל', 'cp1255'),
+            'e.xhtml': page('<?xml version="1.0" encoding="no-such-enc"?>',
+                            'גלפרון', 'utf-8'),
+        })
+        c = self.counts(p)
+        for w in ('שמרפוט', 'וזלנקה', 'קנדו', 'טרבל', 'גלפרון'):
+            self.assertEqual(c.get(w), 1, w)
+
+    def test_html_file_declared_encoding(self):
+        p = os.path.join(self.root, 'a.html')
+        with open(p, 'wb') as f:
+            f.write('<meta http-equiv="Content-Type" content="text/html; '
+                    'charset=windows-1255"><p>שמרפוט</p>'.encode('cp1255'))
+        self.assertEqual(self.counts(p).get('שמרפוט'), 1)
+
+    def test_broken_zip_members_are_a_hebrew_error(self):
+        p = os.path.join(self.root, 'bad.docx')
+        with open(p, 'wb') as f:
+            f.write(b'PK\x03\x04 not really a zip')
+        with self.assertRaises(extralex.ExtraLexiconError):
+            extralex.read_document(p)
+
+
 class Pipeline(unittest.TestCase):
     """The full scan and the single-book scan, with and without one."""
 
@@ -338,6 +485,46 @@ class Pipeline(unittest.TestCase):
                                '--extra-lexicon', 'modern', '--out', self.out)
         self.assertEqual(rc, 0, err)
         self.assertIn('modern', out)
+
+    def test_book_command_hides_the_word_and_reports_it(self):
+        self.build()
+        base, _, _ = run_cli('book', '--book', self.book, '--out', self.out)
+        rc, out, err = run_cli('book', '--book', self.book,
+                               '--extra-lexicon', 'MODERN', '--out',
+                               self.out)
+        self.assertEqual((base, rc), (0, 0), err)
+        self.assertEqual(self.run_config()['extra_lexicon'], ['MODERN'])
+        self.assertIn('נוספו 0 ממצאים', out)
+        rc, _, err = run_cli('book', '--book', self.book,
+                             '--extra-lexicon', 'none', '--out', self.out)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('Traceback', err)
+
+    def test_ui_book_scan_uses_the_field(self):
+        self.build()
+        corpus = {'mode': 'library', 'library_dir': self.lib}
+
+        def run(over):
+            scanner.start_book_scan(self.out, 'file', self.book,
+                                    config_overrides=over,
+                                    corpus_overrides=corpus)
+            scanner._thread.join(120)
+            st = scanner.get_status()
+            self.assertEqual(st['state'], 'done', st)
+            return st['book']['result']['added']
+        plain = run({})
+        self.assertGreaterEqual(plain, 1)
+        self.assertEqual(run({'extra_lexicon': 'modern'}), plain - 1)
+        with self.assertRaises(ValueError) as cm:
+            scanner.start_book_scan(
+                self.out, 'file', self.book,
+                config_overrides={'extra_lexicon': 'none'},
+                corpus_overrides=corpus)
+        self.assertIn('none', str(cm.exception))
+        with self.assertRaises(ValueError):
+            scanner.start_scan(self.out, ['detect'],
+                               config_overrides={'extra_lexicon': 'none'},
+                               corpus_overrides=corpus)
 
 
 class WebUI(unittest.TestCase):

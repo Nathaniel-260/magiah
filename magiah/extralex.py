@@ -23,12 +23,14 @@ The text goes through :func:`magiah.normalize.tokenize`, the tokenizer of
 the corpus passes, so a word in an extra lexicon matches the same word in a
 scanned book.
 """
+import codecs
 import os
 import pickle
 import re
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from collections import Counter
 
 from .normalize import tokenize
@@ -42,12 +44,27 @@ HTML_EXTS = ('.html', '.htm', '.xhtml')
 ZIP_EXTS = ('.docx', '.epub')
 EXTS = TEXT_EXTS + HTML_EXTS + ZIP_EXTS
 
+# Decompression-bomb guard: the most bytes read from one file. For a zip
+# (.docx/.epub) it is the total of all the members read from it, so it is
+# also the cap on one member. Real books are a few MB of text.
+MAX_BYTES = 200 * 1024 * 1024
+
 # a name is part of a file name: letters (any script), digits, '-' and '_'
 _NAME_RE = re.compile(r'[^\W][\w-]{0,63}')
 # html parts that are not text; everything else goes to normalize.clean,
-# which already drops tags and decodes entities the way the corpus does
-_DROP_RE = re.compile(r'<(script|style|head)\b.*?</\1\s*>|<!--.*?-->',
-                      re.DOTALL | re.IGNORECASE)
+# which already drops tags and decodes entities the way the corpus does.
+# Found by a forward scan (see _html_text), not one lazy regex: an unclosed
+# <script made that regex quadratic.
+_HTML_START_RE = re.compile(r'<!--|<(script|style|head)\b', re.IGNORECASE)
+_HTML_CLOSE_RE = {t: re.compile(r'</' + t + r'\s*>', re.IGNORECASE)
+                  for t in ('script', 'style', 'head')}
+# the encoding an xml/html document declares about itself
+_DECL_RE = re.compile(
+    rb"""<\?xml[^>]{0,200}?encoding\s*=\s*["']([A-Za-z0-9._:-]+)"""
+    rb"""|<meta[^>]{0,300}?charset\s*=\s*["']?([A-Za-z0-9._:-]+)""",
+    re.IGNORECASE)
+_BOMS = ((b'\xef\xbb\xbf', 'utf-8-sig'), (b'\xff\xfe', 'utf-16'),
+         (b'\xfe\xff', 'utf-16'))
 _W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _DOCX_PARTS = ('word/document.xml', 'word/footnotes.xml',
                'word/endnotes.xml')
@@ -56,6 +73,13 @@ _DOCX_PARTS = ('word/document.xml', 'word/footnotes.xml',
 class ExtraLexiconError(Exception):
     """A user error: bad name, missing lexicon, unreadable or unsupported
     file. The message is Hebrew and meant to be shown as it is."""
+
+
+def norm_name(name):
+    """The name as it is stored. Windows file names are case-insensitive,
+    so "Modern" and "modern" would be one file: names are lower-cased, and
+    they are one lexicon everywhere (build, scan, remove, list)."""
+    return check_name(name).lower()
 
 
 def check_name(name):
@@ -67,7 +91,7 @@ def check_name(name):
 
 
 def extra_path(out_dir, name):
-    return os.path.join(out_dir, EXTRA_PREFIX + check_name(name)
+    return os.path.join(out_dir, EXTRA_PREFIX + norm_name(name)
                         + EXTRA_SUFFIX)
 
 
@@ -76,8 +100,7 @@ def extra_path(out_dir, name):
 def decode_text(data):
     """Text of a plain-text file: a BOM decides, then strict UTF-8, then
     Windows-1255 (Hebrew text saved by older Windows editors)."""
-    for bom, enc in ((b'\xef\xbb\xbf', 'utf-8-sig'), (b'\xff\xfe', 'utf-16'),
-                     (b'\xfe\xff', 'utf-16')):
+    for bom, enc in _BOMS:
         if data.startswith(bom):
             return data.decode(enc, errors='replace')
     try:
@@ -90,8 +113,61 @@ def decode_text(data):
         return data.decode('utf-8', errors='replace')
 
 
+def decode_markup(data):
+    """Text of an html/xhtml document: the encoding the document declares
+    (<?xml encoding=...?> or <meta charset=...>) when it decodes the bytes,
+    otherwise as :func:`decode_text` (BOM, UTF-8, Windows-1255)."""
+    if not any(data.startswith(b) for b, _ in _BOMS):
+        m = _DECL_RE.search(data[:2048])
+        if m:
+            label = (m.group(1) or m.group(2)).decode('ascii')
+            try:
+                name = codecs.lookup(label).name
+            except LookupError:
+                name = None
+            # without a BOM a declared UTF-16/32 is a wrong declaration
+            if name and not name.startswith(('utf-16', 'utf-32')):
+                try:
+                    return data.decode(name)
+                except (UnicodeDecodeError, LookupError):
+                    pass
+    return decode_text(data)
+
+
 def _html_text(text):
-    return _DROP_RE.sub(' ', text)
+    """`text` without script/style/head elements and comments, in one
+    forward pass (linear time). An element or comment that is never closed
+    runs to the end of the text, as a browser reads it."""
+    out, pos = [], 0
+    while True:
+        m = _HTML_START_RE.search(text, pos)
+        if not m:
+            out.append(text[pos:])
+            return ''.join(out)
+        out.append(text[pos:m.start()])
+        out.append(' ')
+        if m.group(1) is None:
+            end = text.find('-->', m.end())
+            pos = end + 3 if end >= 0 else len(text)
+        else:
+            c = _HTML_CLOSE_RE[m.group(1).lower()].search(text, m.end())
+            pos = c.end() if c else len(text)
+
+
+def _too_big(path, member=None):
+    mb = MAX_BYTES // (1024 * 1024)
+    return ExtraLexiconError(
+        f'הקובץ גדול מדי לקריאה: {path}'
+        + (f' (החלק {member})' if member else '') + '\n'
+        f'המגבלה היא {mb:,} מ"ב של טקסט לכל קובץ (הגנה מפני קובץ דחוס '
+        'בצורה חשודה). שום דבר לא נשמר. יש להוציא את הקובץ ולבנות שוב.')
+
+
+def _read_capped(f, path):
+    data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise _too_big(path)
+    return data
 
 
 def _docx_lines(xml_bytes):
@@ -133,18 +209,35 @@ def read_document(path):
     try:
         if ext in TEXT_EXTS or ext in HTML_EXTS:
             with open(path, 'rb') as f:
-                text = decode_text(f.read())
-            return [_html_text(text) if ext in HTML_EXTS else text]
+                data = _read_capped(f, path)
+            if ext in HTML_EXTS:
+                return [_html_text(decode_markup(data))]
+            return [decode_text(data)]
         with zipfile.ZipFile(path) as z:
+            remaining = MAX_BYTES
+
+            def member(n):
+                # the declared size can lie: read at most what is left
+                nonlocal remaining
+                if z.getinfo(n).file_size > remaining:
+                    raise _too_big(path, n)
+                with z.open(n) as f:
+                    data = f.read(remaining + 1)
+                if len(data) > remaining:
+                    raise _too_big(path, n)
+                remaining -= len(data)
+                return data
+
             names = z.namelist()
             if ext == '.docx':
-                return ['\n'.join(_docx_lines(z.read(n)))
+                return ['\n'.join(_docx_lines(member(n)))
                         for n in _DOCX_PARTS if n in names]
             # epub: every (x)html content document; order does not matter
-            # for a word count
-            return [_html_text(z.read(n).decode('utf-8', errors='replace'))
+            # for a word count. Each is decoded as it declares itself.
+            return [_html_text(decode_markup(member(n)))
                     for n in sorted(names) if n.lower().endswith(HTML_EXTS)]
-    except (OSError, zipfile.BadZipFile, ET.ParseError, KeyError) as e:
+    except (OSError, zipfile.BadZipFile, ET.ParseError, KeyError,
+            zlib.error, EOFError, NotImplementedError, RuntimeError) as e:
         raise ExtraLexiconError(
             f'לא ניתן לקרוא את הקובץ: {path} ({e})\n'
             'שום דבר לא נשמר. יש לתקן או להוציא את הקובץ ולבנות שוב.') from e
@@ -193,14 +286,26 @@ def build(out_dir, name, paths, progress=None):
             + (f'; דולגו {skipped_pdf:,} קובצי PDF' if skipped_pdf else '')
             + '.')
     counts = Counter()
+    empty = []
     for n, fp in enumerate(files, 1):
+        found = 0
         for text in read_document(fp):
-            counts.update(tokenize(text))
+            toks = tokenize(text)
+            found += len(toks)
+            counts.update(toks)
+        if not found:
+            empty.append(fp)
+            say(f'[extra] אזהרה: לא נמצאו מילים בעברית בקובץ: {fp}')
         if n % 100 == 0:
             say(f'[extra] {n:,}/{len(files):,} קבצים')
+    if not counts:
+        raise ExtraLexiconError(
+            f'לא נמצאו מילים בעברית באף אחד מ-{len(files):,} הקבצים, ולכן '
+            'לא נבנה מילון נוסף. שום דבר לא נשמר.')
     rec = {
         'format': FORMAT,
-        'name': name,
+        'name': norm_name(name),
+        'empty_files': empty,
         'built': time.strftime('%Y-%m-%d %H:%M'),
         'sources': [os.path.abspath(p) for p in paths],
         'files': len(files),
@@ -249,8 +354,9 @@ def list_names(out_dir):
         names = os.listdir(out_dir)
     except OSError:
         return []
-    return sorted(n[len(EXTRA_PREFIX):-len(EXTRA_SUFFIX)] for n in names
-                  if n.startswith(EXTRA_PREFIX) and n.endswith(EXTRA_SUFFIX))
+    found = (n[len(EXTRA_PREFIX):-len(EXTRA_SUFFIX)] for n in names
+             if n.startswith(EXTRA_PREFIX) and n.endswith(EXTRA_SUFFIX))
+    return sorted(n for n in found if n == n.lower())
 
 
 def remove(out_dir, name):
@@ -266,7 +372,9 @@ def summary(rec, min_count):
             f"מילים, {len(rec['counts']):,} צורות שונות ({known:,} מהן "
             f"לפחות {min_count} פעמים) — נבנה {rec['built']}"
             + (f", דולגו {rec['skipped_pdf']:,} קובצי PDF"
-               if rec.get('skipped_pdf') else ''))
+               if rec.get('skipped_pdf') else '')
+            + (f", אזהרה: {len(rec['empty_files']):,} קבצים בלי מילים "
+               'בעברית' if rec.get('empty_files') else ''))
 
 
 # --- use in a scan ---------------------------------------------------------
