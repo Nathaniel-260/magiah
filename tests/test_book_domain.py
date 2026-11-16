@@ -144,9 +144,10 @@ class Measure(unittest.TestCase):
                 freq, Config(book_domain_min_lexicon=0), 'x'), 'partial')
 
     def test_hebrew_strings_are_not_mojibake(self):
-        # the bytes are UTF-8 Hebrew: no C1 controls, no geresh-mojibake
-        bad = [chr(c) for c in range(0x80, 0xa0)] + ['\u05f3', '\u05b2',
-                                                      '\u20ac']
+        # the bytes are UTF-8 Hebrew: no C1 controls, no mojibake marks (the
+        # Hebrew geresh U+05F3 is legitimate: hebrew.py's swapped-quotes
+        # texts name it)
+        bad = [chr(c) for c in range(0x80, 0xa0)] + ['\u05b2', '\u20ac']
         import magiah.book_scan as bs
         import magiah.config as cf
         for mod in (bs, cf, hebrew):
