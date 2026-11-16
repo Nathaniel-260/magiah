@@ -93,6 +93,27 @@ def _hits(counts, prev, x, nxt):
             + (counts.bi(x, nxt) if nxt else 0))
 
 
+def scores(lex, counts, prev, w, nxt, cands, own=None):
+    """Natural-log score of each of `cands`: the context posterior plus the
+    detector's bonus as the channel (its score less the frequency ratio the
+    context model already weighs)."""
+    _, sc = posterior(lex, counts, prev, w, nxt, [c[0] for c in cands], own)
+    fw1 = max(lex.freq.get(w, 0), 1)
+    return [sc[i + 1] + _LN10 * (c[1] - math.log10(lex.freq[c[0]] / fw1))
+            for i, c in enumerate(cands)]
+
+
+def anchor(cands, sugg):
+    """`cands` with the finding's own suggestion `sugg` first (the rest in
+    the detector's order), or [] when `sugg` is not among them: the
+    ranking is only defined relative to the suggestion actually made, so a
+    finding whose candidates do not contain it gets no alternatives."""
+    for i, c in enumerate(cands):
+        if c[0] == sugg:
+            return [c] + cands[:i] + cands[i + 1:]
+    return []
+
+
 def rank(lex, counts, prev, w, nxt, cands, show, own=None):
     """Up to `show` of `cands` (:func:`candidates`) for one occurrence of
     `w` between `prev` and `nxt` ('' — no neighbour), best first:
@@ -111,12 +132,7 @@ def rank(lex, counts, prev, w, nxt, cands, show, own=None):
             and counts.covers(prev, nxt, [w] + words):
         hits = [_hits(counts, prev, x, nxt) for x in words]
         if any(hits):
-            _, sc = posterior(lex, counts, prev, w, nxt, words, own)
-            fw1 = max(lex.freq.get(w, 0), 1)
-            # channel: the detector's bonus, i.e. its score less the
-            # frequency ratio the context model already weighs
-            sc = [sc[i + 1] + _LN10 * (c[1] - math.log10(
-                lex.freq[c[0]] / fw1)) for i, c in enumerate(cands)]
+            sc = scores(lex, counts, prev, w, nxt, cands, own)
             order = sorted(order, key=lambda i: (-sc[i], words[i]))
             if order[0] and sc[order[0]] - sc[0] < MARGIN * _LN10:
                 # not sure enough to pass the detector's own choice
@@ -130,9 +146,9 @@ def rank(lex, counts, prev, w, nxt, cands, show, own=None):
 def reranked(w, cands, alts, lex):
     """The finding ``(errtype, suggestion, sugg_freq, score)`` of the
     context's first choice, when the context put another candidate than
-    the detector's first; else None (``cfg.alt_rerank``)."""
-    if not alts or alts[0]['by'] != BY_CONTEXT \
-            or alts[0]['suggestion'] == cands[0][0]:
+    the detector's first (`cands`[0], see :func:`anchor`); else None
+    (``cfg.alt_rerank``)."""
+    if not alts or not cands or alts[0]['by'] != BY_CONTEXT             or alts[0]['suggestion'] == cands[0][0]:
         return None
-    best = next(c for c in cands if c[0] == alts[0]['suggestion'])
-    return edit1_record(w, best, lex)
+    best = next((c for c in cands if c[0] == alts[0]['suggestion']), None)
+    return edit1_record(w, best, lex) if best else None

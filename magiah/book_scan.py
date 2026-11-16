@@ -545,7 +545,9 @@ def scan_loaded_book(book, freq, cfg, out_dir, verify_ctx=False, spec=None,
         fw, errtype, sugg, fs, score = errors[w]
         ranked = None
         if alt_cands is not None and alternatives.eligible(errtype):
-            cands = alt_cands(w)
+            # relative to the suggestion this finding actually carries (no
+            # alternatives if the edit-1 rule would not have offered it)
+            cands = alternatives.anchor(alt_cands(w), sugg)
             ranked = alternatives.rank(lex, alt_counts, prev, w, nxt, cands,
                                      cfg.alternatives, own) or None
             new = (alternatives.reranked(w, cands, ranked, lex)

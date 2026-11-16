@@ -311,7 +311,15 @@ without the book's own rows (`by: context`); with no counts, no neighbour,
 or no candidate ever seen beside these neighbours, they keep the detector's
 order (`by: frequency`). The finding's suggestion does not change unless
 `--alt-rerank 1` is also given: the suggestion then becomes the alternative
-the context ranks first.
+the context ranks first, but only where the context prefers it to the
+detector's own choice by at least 2 (log10 odds, `alternatives.MARGIN`);
+otherwise the suggestion stays, and a finding whose candidates do not include
+its suggestion gets no alternatives. The reranked suggestion is verified like
+any other, so `--alt-rerank` also asks the context pass to count the
+neighbour pairs of every candidate (on a synthetic book about 1.9x the
+pairs of a plain scan; the pass reads the corpus once either way, so the
+added time was within noise there).
+
 `--book-domain-max SHARE` (off by default; 0.05 is a measured value) is a
 **domain gate** for the whole book. The lexicon knows the language most of
 the library is written in; a book in modern Hebrew, another language or another spelling
