@@ -3,6 +3,7 @@
 the very lexicon a full count gives."""
 import contextlib
 import io
+import json
 import os
 import pickle
 import shutil
@@ -238,38 +239,245 @@ class Interrupted(Base):
         self.assertEqual(self.update(), 'incremental')
         self.assertSameAsFull()
 
-    def test_cut_while_moving_files_into_place(self):
-        # stop at every move of the swap: whatever is left, the lexicon is
-        # readable and the next update gives the full lexicon
-        for k in range(len(lu.VERSION_FILES) * 2):
-            with self.subTest(k=k):
-                shutil.rmtree(self.out)
-                os.makedirs(self.out)
-                write_book(self.lib, 'Src/b.txt', BOOKS['Src/b.txt'])
-                self.update()
-                write_book(self.lib, 'Src/b.txt', [f'שמעתי דבר {k}'])
-                real, calls = os.replace, []
+    # -- crash safety of the swap -----------------------------------------
 
-                def flaky(src, dst):
-                    if os.path.dirname(os.path.abspath(dst)) == \
-                            os.path.abspath(self.out) or \
-                            os.path.basename(os.path.dirname(dst)) == \
-                            lu.PREV_DIR:
-                        calls.append(dst)
-                        if len(calls) > k:
-                            raise OSError('cut')
-                    return real(src, dst)
-                with mock.patch.object(lu.os, 'replace', flaky):
+    def side(self, folder):
+        """Bytes of the version files in `folder` (a missing one: absent)."""
+        out = {}
+        for n in lu.VERSION_FILES:
+            p = os.path.join(folder, n)
+            if os.path.exists(p):
+                with open(p, 'rb') as f:
+                    out[n] = f.read()
+        return out
+
+    def assertConsistent(self, folder=None):
+        """The folder holds one whole version: its files name one lexicon."""
+        folder = folder or self.out
+        lex = os.path.join(folder, core.LEXICON_F)
+        self.assertTrue(os.path.isfile(lex))
+        with open(lex, 'rb') as f:
+            self.assertIsInstance(pickle.load(f), dict)
+        with open(os.path.join(folder, 'coverage_lexicon.json'),
+                  encoding='utf-8') as f:
+            ident = json.load(f)['lexicon_id']
+        self.assertEqual(core.load_names(folder)['lexicon_id'], ident)
+        side = os.path.join(folder, lu.BOOKS_F)
+        if os.path.exists(side):
+            head, _ = lu._read_books(folder)
+            self.assertEqual(head['lexicon_id'], ident)
+
+    def assertNoDebris(self):
+        for n in (lu.TXN_F, lu.OLD_DIR, lu.TRASH_DIR):
+            self.assertFalse(os.path.exists(os.path.join(self.out, n)), n)
+
+    def versions(self):
+        """Two updates: the folder holds v2 and lexicon_prev holds v1."""
+        write_book(self.lib, 'Src/b.txt', BOOKS['Src/b.txt'])
+        self.update()
+        v1 = lexicon_of(self.out)
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר חדש'])
+        self.update()
+        return v1, lexicon_of(self.out)
+
+    def cut_replace(self, k, persistent):
+        """os.replace inside the output folder: the k-th call fails (with
+        `persistent`, it and every later one, like a killed process)."""
+        real, calls = os.replace, []
+        root = os.path.abspath(self.out)
+
+        def flaky(src, dst):
+            if os.path.abspath(str(dst)).startswith(root):
+                calls.append(dst)
+                if len(calls) - 1 == k or (persistent and len(calls) > k):
+                    raise OSError('cut')
+            return real(src, dst)
+        return mock.patch.object(lu.os, 'replace', flaky), calls
+
+    def count_replaces(self, action):
+        patch, calls = self.cut_replace(10 ** 9, False)
+        with patch:
+            action()
+        return len(calls)
+
+    def reset(self):
+        shutil.rmtree(self.out)
+        os.makedirs(self.out)
+        for rel, lines in BOOKS.items():
+            write_book(self.lib, rel, lines)
+
+    def test_update_cut_at_every_move_keeps_the_folder_whole(self):
+        v1, v2 = self.versions()
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר שלישי'])
+        n = self.count_replaces(self.update)
+        self.assertGreater(n, 8)
+        for k in range(n):
+            with self.subTest(k=k):
+                self.reset()
+                v1, v2 = self.versions()
+                before, prev = self.side(self.out), self.side(
+                    os.path.join(self.out, lu.PREV_DIR))
+                write_book(self.lib, 'Src/b.txt', ['שמעתי דבר שלישי'])
+                patch, _ = self.cut_replace(k, False)
+                with patch:
                     try:
                         self.update()
+                    except core.StageError:
+                        pass            # (a cut after the commit is retried)
                     except OSError:
-                        pass
-                lex = os.path.join(self.out, core.LEXICON_F)
-                if os.path.exists(lex):
-                    with open(lex, 'rb') as f:
-                        self.assertIsInstance(pickle.load(f), dict)
+                        self.fail('a raw OSError escaped')
+                self.assertConsistent()
+                self.assertConsistent(os.path.join(self.out, lu.PREV_DIR))
+                committed = self.side(self.out) != before
+                if not committed:
+                    self.assertEqual(self.side(self.out), before)
+                    self.assertEqual(self.side(
+                        os.path.join(self.out, lu.PREV_DIR)), prev)
+                # the next update works and equals a full count
                 self.update()
                 self.assertSameAsFull()
+                self.assertNoDebris()
+                # ... and so does a rollback, to the version before it
+                quiet(lu.rollback, self.out)
+                self.assertConsistent()
+                self.assertIn(lexicon_of(self.out), (v2, lexicon_of(
+                    os.path.join(self.out, lu.PREV_DIR))))
+                quiet(lu.rollback, self.out)
+                self.assertSameAsFull()
+
+    def test_update_killed_at_every_move_is_repaired_next_time(self):
+        v1, v2 = self.versions()
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר שלישי'])
+        n = self.count_replaces(self.update)
+        for k in range(n):
+            with self.subTest(k=k):
+                self.reset()
+                v1, v2 = self.versions()
+                before = self.side(self.out)
+                write_book(self.lib, 'Src/b.txt', ['שמעתי דבר שלישי'])
+                patch, _ = self.cut_replace(k, True)
+                with patch:
+                    with self.assertRaises(core.StageError):
+                        self.update()
+                # the next run repairs, then counts
+                quiet(lu.recover, self.out)
+                self.assertConsistent()
+                self.assertNoDebris()
+                if self.side(self.out) != before:     # was past the commit
+                    self.assertConsistent(os.path.join(self.out,
+                                                       lu.PREV_DIR))
+                self.update()
+                self.assertSameAsFull()
+
+    def test_rollback_cut_at_every_move_keeps_the_folder_whole(self):
+        v1, v2 = self.versions()
+        n = self.count_replaces(lambda: quiet(lu.rollback, self.out))
+        quiet(lu.rollback, self.out)           # that run really swapped
+        for persistent in (False, True):
+            for k in range(n):
+                with self.subTest(k=k, persistent=persistent):
+                    self.reset()
+                    v1, v2 = self.versions()
+                    patch, _ = self.cut_replace(k, persistent)
+                    with patch:
+                        try:
+                            quiet(lu.rollback, self.out)
+                        except core.StageError:
+                            pass        # (a cut after the commit is retried)
+                        except OSError:
+                            self.fail('a raw OSError escaped')
+                    quiet(lu.recover, self.out)
+                    self.assertConsistent()
+                    self.assertNoDebris()
+                    self.assertIn(lexicon_of(self.out), (v1, v2))
+                    # the previous version is still there to roll back to
+                    self.assertConsistent(os.path.join(self.out,
+                                                       lu.PREV_DIR))
+                    quiet(lu.rollback, self.out)
+                    self.assertConsistent()
+                    self.update()
+                    self.assertSameAsFull()
+
+    # -- file errors are StageErrors ---------------------------------------
+
+    def test_a_leftover_new_dir_is_cleaned_up(self):
+        self.update()
+        new = os.path.join(self.out, lu.NEW_DIR)
+        os.makedirs(os.path.join(new, 'sub'))
+        with open(os.path.join(new, core.LEXICON_F), 'w') as f:
+            f.write('half written')
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר'])
+        self.assertEqual(self.update(), 'incremental')
+        self.assertSameAsFull()
+        self.assertFalse(os.path.exists(new))
+        # a plain file in its place too
+        with open(new, 'w') as f:
+            f.write('x')
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר אחר'])
+        self.assertEqual(self.update(), 'incremental')
+        self.assertSameAsFull()
+        self.assertFalse(os.path.exists(new))
+
+    def test_a_leftover_that_cannot_be_removed_is_a_stage_error(self):
+        self.update()
+        before = self.side(self.out)
+        new = os.path.join(self.out, lu.NEW_DIR)
+        os.makedirs(new)
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר'])
+        real = shutil.rmtree
+
+        def stuck(path, *a, **kw):
+            if os.path.basename(str(path)) == lu.NEW_DIR:
+                if kw.get('ignore_errors'):
+                    return              # a locked folder stays
+                raise PermissionError('in use')
+            return real(path, *a, **kw)
+        with mock.patch.object(shutil, 'rmtree', stuck):
+            with self.assertRaises(core.StageError) as cm:
+                self.update()
+        self.assertIn('התיקייה הזמנית', str(cm.exception))
+        self.assertEqual(self.side(self.out), before)
+
+    def test_a_write_error_is_a_stage_error_and_changes_nothing(self):
+        self.update()
+        before = self.side(self.out)
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר'])
+        with mock.patch.object(lu.pickle, 'dump',
+                               side_effect=OSError('disk full')):
+            with self.assertRaises(core.StageError) as cm:
+                self.update()
+        self.assertIn('disk full', str(cm.exception))
+        self.assertEqual(self.side(self.out), before)
+        self.assertEqual(self.update(), 'incremental')
+        self.assertSameAsFull()
+
+    def test_the_cli_prints_the_error_without_a_traceback(self):
+        args = ('--library', self.lib, '--workers', '1', '--n-chunks', '2')
+        code, _, _ = Cli.run_cli(self, 'lexicon', '--update', *args)
+        self.assertFalse(code)
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר'])
+        patch, _ = self.cut_replace(2, False)
+        with patch:
+            code, _, err = Cli.run_cli(self, 'lexicon', '--update', *args)
+        self.assertEqual(code, 1)
+        self.assertIn('שגיאת קבצים', err)
+        self.assertNotIn('Traceback', err)
+        self.assertConsistent()
+
+    def test_a_plain_lexicon_run_repairs_a_killed_swap_first(self):
+        args = ('--library', self.lib, '--workers', '1', '--n-chunks', '2')
+        self.versions()
+        write_book(self.lib, 'Src/b.txt', ['שמעתי דבר שלישי'])
+        patch, _ = self.cut_replace(4, True)
+        with patch:
+            with self.assertRaises(core.StageError):
+                self.update()
+        self.assertFalse(Cli.run_cli(self, 'lexicon', *args)[0])
+        self.assertNoDebris()
+        self.assertEqual(lexicon_of(self.out), self.full())
+        # the repaired journal cannot undo the plain run later
+        self.assertEqual(self.update(), 'full')
+        self.assertSameAsFull()
 
 
 class Rollback(Base):

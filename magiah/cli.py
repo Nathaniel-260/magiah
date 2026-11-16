@@ -377,6 +377,7 @@ def main(argv=None):
         try:
             if args.status:
                 return lexicon_update.print_status(spec, out_dir)
+            lexicon_update.recover(out_dir)
             # nothing to roll back to is not a failed lexicon run
             problem = lexicon_update.rollback_problem(out_dir)
             if problem:
@@ -422,6 +423,8 @@ def main(argv=None):
             from . import lexicon_update
             lexicon_update.update(spec, cfg, out_dir)
         else:
+            from . import lexicon_update
+            lexicon_update.recover(out_dir)   # a cut-short swap, if any
             core.build_lexicon(spec, cfg, out_dir)
 
     steps = {

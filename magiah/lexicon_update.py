@@ -42,12 +42,29 @@ of that lexicon, and a complete lexicon (no ``--allow-unread`` gaps).
 Otherwise — a plain ``magiah lexicon`` ran since, a copied or older folder —
 the update makes a full count, and says why.
 
-Safety: the new files are written to ``lexicon_new/`` first and moved into
-place only when all are complete; the replaced ones go to ``lexicon_prev/``
-(the previous version for ``--rollback``). The side file is moved last, and
-it names the lexicon it belongs to, so an update cut short at any point
-leaves either the old or the new lexicon, never a mix that a later update
-would trust.
+Safety (``_exchange``, used by ``--update`` and ``--rollback`` alike): the
+new version is first written completely to ``lexicon_new/`` (same folder,
+so the same volume). It is then put in place in two phases, with a journal
+(``lexicon_txn.json``, written atomically before the first move): the
+current files go one by one to ``lexicon_old/``, then the new ones go one by
+one into the folder. The journal is deleted after the last move: that is
+the commit. A failure before the commit (an OSError, Ctrl-C) puts every
+file back where it was, so the folder holds the previous version complete;
+a process killed before the commit is repaired the same way by the next
+``--update``, ``--rollback`` or ``magiah lexicon`` (``recover``). After the
+commit ``lexicon_old/`` becomes ``lexicon_prev/`` by renames, the former
+``lexicon_prev/`` set aside first, so ``lexicon_prev/`` is always a whole
+version or absent (a cut there is completed by ``recover``).
+
+The guarantee: the lexicon folder is always a complete, consistent set of
+the old version or of the new one, never a mix, except for the moments
+between two renames of a killed process, which ``recover`` repairs before
+anything reads or writes the set again. Single renames are atomic
+(os.replace); the set as a whole is not, which is why the journal exists.
+The files are not fsync-ed except the journal: a power loss (not just a
+crash of the process) can still lose data the OS had not yet flushed. Any
+OSError of an update or rollback is reported as a core.StageError, in
+Hebrew.
 """
 import json
 import os
@@ -66,6 +83,9 @@ from .textsource import OtzariaDB, ReadStats, db_read_errors
 BOOKS_F = 'lexicon_books.pkl'
 NEW_DIR = 'lexicon_new'
 PREV_DIR = 'lexicon_prev'
+OLD_DIR = 'lexicon_old'              # the set being replaced, during a swap
+TRASH_DIR = 'lexicon_trash'          # the dropped older version
+TXN_F = 'lexicon_txn.json'           # the journal of a swap in progress
 # bump when the side file's layout or the per-book counting changes
 FORMAT = 1
 
@@ -336,7 +356,11 @@ def status(spec, out_dir):
 
 
 def print_status(spec, out_dir):
-    st = status(spec, out_dir)
+    try:
+        st = status(spec, out_dir)
+    except OSError as e:
+        raise core.StageError(
+            f'קריאת מצב המילון נכשלה בגלל שגיאת קבצים: {e}') from e
     if st['mode'] == 'none':
         print(f'[lexicon] המילון מעודכן: אף ספר לא נוסף, השתנה או נמחק '
               f'({st["unchanged"]:,} ספרים).', flush=True)
@@ -389,9 +413,26 @@ def _counts_from(out_dir, added, changed, removed, spec, cfg):
     return lex, names, seen, packed, stats
 
 
+def _file_error(e, what, out_dir):
+    return core.StageError(
+        f'{what} נכשל בגלל שגיאת קבצים: {e}\n'
+        f'המילון בתיקייה {out_dir} נשאר שלם (אם הפעולה נקטעה באמצע, ההרצה '
+        f'הבאה של ‎magiah lexicon --update‎ או ‎--rollback‎ תשחזר אותו). '
+        f'אפשר להריץ שוב.')
+
+
 def update(spec, cfg, out_dir):
     """``magiah lexicon --update``: recount the books that changed (a full
-    count when the side file cannot be used). Returns the mode."""
+    count when the side file cannot be used). Returns the mode. A file
+    error (OSError) is raised as core.StageError."""
+    try:
+        return _update(spec, cfg, out_dir)
+    except OSError as e:
+        raise _file_error(e, 'עדכון המילון', out_dir) from e
+
+
+def _update(spec, cfg, out_dir):
+    recover(out_dir)
     t0 = time.time()
     stamps = doc_stamps(spec)           # before reading: a change made
     if stamps is None:                  # meanwhile is seen next time
@@ -452,8 +493,7 @@ def _save(spec, cfg, out_dir, lex, names, seen, packed, stamps, stats,
         core._require_text('lexicon', ReadStats())
     info = core._coverage_info('lexicon', stats, extra, policy=policy)
     new = os.path.join(out_dir, NEW_DIR)
-    shutil.rmtree(new, ignore_errors=True)
-    os.makedirs(new)
+    _fresh_dir(new)                     # a leftover of a failed update
     with open(os.path.join(new, core.LEXICON_F), 'wb') as f:
         pickle.dump(dict(lex), f, protocol=4)
     with open(os.path.join(new, core.NAMES_F), 'wb') as f:
@@ -476,7 +516,7 @@ def _save(spec, cfg, out_dir, lex, names, seen, packed, stamps, stats,
         with open(os.path.join(new, BOOKS_F), 'wb') as f:
             pickle.dump(head, f, protocol=4)
             pickle.dump(packed, f, protocol=4)
-    _swap_in(out_dir, new)
+    _exchange(out_dir, new)
     shutil.rmtree(new, ignore_errors=True)
     print(core.coverage_line(info), flush=True)
     if info.get('accepted'):
@@ -484,26 +524,115 @@ def _save(spec, cfg, out_dir, lex, names, seen, packed, stamps, stats,
             info, os.path.join(out_dir, _coverage_f())), flush=True)
 
 
-def _swap_in(out_dir, new):
-    """Move the version in `new` into place, the current one to PREV_DIR
-    (which keeps one version: the one before it is dropped)."""
-    prev = os.path.join(out_dir, PREV_DIR)
-    if os.path.isfile(os.path.join(out_dir, core.LEXICON_F)):
-        shutil.rmtree(prev, ignore_errors=True)
-        os.makedirs(prev)
+def _fresh_dir(path):
+    """An empty directory at `path`; whatever was there is removed."""
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        elif os.path.lexists(path):
+            os.remove(path)
+        os.makedirs(path)
+    except OSError as e:
+        raise core.StageError(
+            f'לא ניתן לנקות את התיקייה הזמנית {path}: {e}\n'
+            f'סגרו תוכנה שמחזיקה בה קבצים או מחקו אותה ידנית, והריצו שוב. '
+            f'המילון הקיים לא שונה.') from e
+
+
+def _write_json_atomic(path, obj):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _undo(out_dir, incoming, had):
+    """Put the set that was in the folder (`had`, now in OLD_DIR) back, and
+    the files of `incoming` that were already moved into the folder back to
+    `incoming`. Safe to repeat after being cut at any point."""
+    old = os.path.join(out_dir, OLD_DIR)
+    inc = os.path.join(out_dir, incoming)
     for name in VERSION_FILES:
         cur = os.path.join(out_dir, name)
-        if os.path.exists(cur):
-            if os.path.isdir(prev):
-                os.replace(cur, os.path.join(prev, name))
-            else:
-                os.remove(cur)
-        src = os.path.join(new, name)
-        if name != BOOKS_F and os.path.exists(src):
-            os.replace(src, cur)
-    src = os.path.join(new, BOOKS_F)
-    if os.path.exists(src):
-        os.replace(src, os.path.join(out_dir, BOOKS_F))
+        saved = os.path.join(old, name)
+        if os.path.exists(saved) or name not in had:
+            if os.path.exists(cur):     # a file of the incoming version
+                os.makedirs(inc, exist_ok=True)
+                os.replace(cur, os.path.join(inc, name))
+        if os.path.exists(saved):
+            os.replace(saved, cur)
+
+
+def _exchange(out_dir, incoming):
+    """Make the version in the folder `incoming` (NEW_DIR, or PREV_DIR for a
+    rollback) the current one, and the current one the previous one
+    (PREV_DIR), crash-safely; see the module docstring."""
+    old = os.path.join(out_dir, OLD_DIR)
+    txn = os.path.join(out_dir, TXN_F)
+    had = [n for n in VERSION_FILES
+           if os.path.exists(os.path.join(out_dir, n))]
+    name_in = os.path.basename(incoming)
+    _fresh_dir(old)
+    try:
+        _write_json_atomic(txn, {'incoming': name_in, 'had': had})
+        for name in had:                # current -> aside
+            os.replace(os.path.join(out_dir, name), os.path.join(old, name))
+        for name in VERSION_FILES:      # incoming -> current
+            src = os.path.join(incoming, name)
+            if os.path.exists(src):
+                os.replace(src, os.path.join(out_dir, name))
+    except BaseException:
+        _undo(out_dir, name_in, had)    # a failure here leaves the journal
+        shutil.rmtree(old, ignore_errors=True)
+        for p in (txn, txn + '.tmp'):
+            if os.path.exists(p):
+                os.remove(p)
+        raise
+    os.remove(txn)                      # the commit
+    try:
+        _finish(out_dir)
+    except OSError:
+        _finish(out_dir)                # once more; then recover() does it
+
+
+def _finish(out_dir):
+    """After the commit: OLD_DIR becomes PREV_DIR (the dropped one goes via
+    TRASH_DIR, so PREV_DIR is whole or absent at every moment)."""
+    old = os.path.join(out_dir, OLD_DIR)
+    prev = os.path.join(out_dir, PREV_DIR)
+    trash = os.path.join(out_dir, TRASH_DIR)
+    if os.path.isfile(os.path.join(old, core.LEXICON_F)):
+        shutil.rmtree(trash, ignore_errors=True)
+        if os.path.isdir(prev):
+            os.replace(prev, trash)
+        os.replace(old, prev)
+    shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(trash, ignore_errors=True)
+
+
+def recover(out_dir):
+    """Repair what a swap killed half way left: before its commit, put the
+    previous version back; after it, finish moving OLD_DIR to PREV_DIR. Also
+    drops a leftover NEW_DIR. Called before any lexicon write; does nothing
+    on a clean folder."""
+    txn = os.path.join(out_dir, TXN_F)
+    old = os.path.join(out_dir, OLD_DIR)
+    if os.path.exists(txn + '.tmp'):
+        os.remove(txn + '.tmp')
+    if os.path.isfile(txn):
+        with open(txn, encoding='utf-8') as f:
+            rec = json.load(f)
+        _undo(out_dir, rec['incoming'], rec['had'])
+        shutil.rmtree(old, ignore_errors=True)
+        os.remove(txn)
+        print('[lexicon] עדכון קודם נקטע באמצע: הגרסה השלמה שהייתה לפניו '
+              'שוחזרה.', flush=True)
+    elif os.path.isdir(old) or os.path.isdir(
+            os.path.join(out_dir, TRASH_DIR)):
+        _finish(out_dir)
+    shutil.rmtree(os.path.join(out_dir, NEW_DIR), ignore_errors=True)
 
 
 def rollback_problem(out_dir):
@@ -518,28 +647,21 @@ def rollback_problem(out_dir):
 
 def rollback(out_dir):
     """``magiah lexicon --rollback``: swap the lexicon with the version the
-    last update replaced (again: swap back). Raises core.StageError when
-    there is none."""
+    last update replaced (again: swap back), crash-safely (``_exchange``).
+    Raises core.StageError when there is none or on a file error."""
+    try:
+        _rollback(out_dir)
+    except OSError as e:
+        raise _file_error(e, 'החזרת הגרסה הקודמת', out_dir) from e
+
+
+def _rollback(out_dir):
+    recover(out_dir)
     problem = rollback_problem(out_dir)
     if problem:
         raise core.StageError(problem)
     prev = os.path.join(out_dir, PREV_DIR)
-    tmp = os.path.join(out_dir, NEW_DIR)
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
-    for name in VERSION_FILES:            # current -> aside
-        cur = os.path.join(out_dir, name)
-        if os.path.exists(cur):
-            os.replace(cur, os.path.join(tmp, name))
-    for name in VERSION_FILES:            # previous -> current
-        src = os.path.join(prev, name)
-        if os.path.exists(src):
-            os.replace(src, os.path.join(out_dir, name))
-    for name in VERSION_FILES:            # aside -> previous
-        src = os.path.join(tmp, name)
-        if os.path.exists(src):
-            os.replace(src, os.path.join(prev, name))
-    shutil.rmtree(tmp, ignore_errors=True)
+    _exchange(out_dir, prev)
     info = {}
     try:
         with open(os.path.join(out_dir, _coverage_f()), encoding='utf-8') as f:
